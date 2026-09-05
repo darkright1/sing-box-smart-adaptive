@@ -132,3 +132,22 @@ data_end 校验,与 v3 parser 同模式,verifier 安全。无缺陷。
 至此 4 个内核程序(v1 token、v2 socket_assign、v3 TC、splice)全部完成人工深审;smart 侧 4 份评分副本已钉死,dns/verdict/promote 生命周期已治理。
 
 **验证**:go test ./... 全绿、race 3 包、smart_zig cgo conformance 绿、GOOS=linux with_ebpf 构建绿。满足停止条件,无新提交。
+
+## 2026-09-06 运行 #7(定时任务)
+
+### 一、codex 任务检测
+- HEAD=15825d8e,干净;无活跃 codex 会话 → 无需续跑。
+
+### 二、审查循环(无新发现)
+
+**第 19 轮**:Module A connect_prog.c(3111 行)关键路径——verdict 查找的
+世代匹配 + expire 判断在两个 emit 位置(799/937 起)逻辑一致;内核
+ktime_get_ns 与用户态 monotonicExpireNs 时钟源对齐(A1/F-2 契约)。
+本地 pending 修复(sweepIdle 竞态、mac_source_policy promote 治理)仍在,
+等待用户指示推送部署。
+
+**线上健康只读检查**(未做任何修改):VM115/VM107 singbox 均 started,
+经代理 generate_204 均返回 204,部署 8 小时无异常。
+
+**验证**:go test ./... 全绿、race 3 包、smart_zig cgo conformance 绿、
+linux with_ebpf 构建绿。满足停止条件,无新提交。
