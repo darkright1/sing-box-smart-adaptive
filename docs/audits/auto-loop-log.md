@@ -94,3 +94,26 @@ GOOS=linux with_ebpf 全仓构建 OK。共 3 个提交(ed144ac4、0baafef7 及�
 **第 13 轮**:udp_state——锁序 t.access(R/W)→clientState→redirectAccess 一致无死锁;bindings 由会话引用计数管理,最后一个 UDP 会话关闭即整体清理,无泄漏;redirect 引用计数防共享地址误删。无缺陷。
 
 **验证**:go test ./... 全绿、race 3 包绿、linux with_ebpf vet+构建绿。1 个修复提交。
+
+## 2026-09-06 运行 #5(定时任务)
+
+### 一、codex 任务检测
+- HEAD=a804d5e3,干净;无活跃 codex 会话 → 无需续跑。
+
+### 二、审查 → 修复循环
+
+**第 14 轮**:splice_bridge.go 全量审查——共享 watcher 优先、per-pair 仅兜底;epoll 生命周期(fired/stop/done 三通道)与 Release 幂等正确;fallback 路径的每-pair epoll goroutine 可接受。无缺陷。
+
+**第 15 轮**(commit 本轮)— 身份盲 promote 治理
+- 发现 bypass_miss gap 自愈(ObserveTCP)与 NoteRoutedDirect 两条 /32 promote
+  路径在 mac_source_policy 启用时仍然生效,违反 v3-control-plane-integrity
+  审计设定的安全边界(DNS/FakeIP promote 已被禁用,但这两条漏网)。
+  影响:无 MAC 行的客户端会继承全局 kernel DIRECT,即使其自身路由判 PROXY。
+- 修复:两条路径统一走 dnsPrefillIdentitySafe 门;exact-flow 发布保留
+  (携带完整 client/dest 五元组,源感知)。
+
+**第 16 轮**:v2 内核解析头(dataplane_v2_parser.h)——有界展开 + 逐段
+data_end 校验,与 v3 parser 同模式,verifier 安全。无缺陷。
+
+**验证**:go test ./... 全绿、race 3 包、GOOS=linux with_ebpf vet+构建绿。
+1 个修复提交。
