@@ -172,3 +172,18 @@ manual_failure)、每次 Choose 前重配 mode 的语义、128 上下文上限 +
 
 **验证**:go test ./... 全绿、race 3 包、smart_zig cgo 绿、linux with_ebpf
 构建绿。无新提交。
+
+## 2026-09-06 运行 #9(定时任务)
+
+### 一、codex 任务检测
+- HEAD=d19c56dd,干净;无活跃 codex 会话 → 无需续跑。
+
+### 二、审查循环(无新发现)
+
+**第 21 轮**:object_loader.c ELF/BTF 加载器全量——object_range_valid 全面
+边界防护、.BTF.ext core_relo 严格拒绝(防 CO-RE 静默)、重定位 R_BPF_64_64
+(map fd,校验 insn+1)与 R_BPF_64_32(call 相对偏移 target-pc-1 正确)、
+未知重定位类型拒绝。无缺陷。至此 native/*.c 全部 11 个文件完成深审。
+
+**验证**:go test ./... 全绿、race 3 包、linux with_ebpf 构建绿。
+满足停止条件,无新提交。
