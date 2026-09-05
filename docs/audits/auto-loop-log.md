@@ -202,3 +202,18 @@ promote/loader)审查完毕,连续三轮零新发现。
 
 **验证**:go test ./... 全绿、race 3 包、linux with_ebpf 构建绿。
 满足停止条件,无新提交。
+
+## 2026-09-06 运行 #11(定时任务)
+
+### 一、codex 任务检测
+- HEAD=5259666d,干净;无活跃 codex 会话 → 无需续跑。
+
+### 二、审查循环(无新发现)
+
+**第 23 轮**:quarantine → candidateDead → Zig state=4 链路——站点级隔离
+只写 CircuitUntil、不升级全局 ledger(与 observeDial 的端点级熔断刻意分离);
+跨站点爆发由 failureBursts 独立计数;与 Zig 候选过滤(state=4)衔接正确。
+无缺陷。连续第四轮零发现。
+
+**验证**:go test ./... 全绿、race 3 包、linux with_ebpf 构建绿。
+满足停止条件,无新提交。
