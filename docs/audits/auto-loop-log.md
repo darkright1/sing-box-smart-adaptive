@@ -187,3 +187,18 @@ manual_failure)、每次 Choose 前重配 mode 的语义、128 上下文上限 +
 
 **验证**:go test ./... 全绿、race 3 包、linux with_ebpf 构建绿。
 满足停止条件,无新提交。
+
+## 2026-09-06 运行 #10(定时任务)
+
+### 一、codex 任务检测
+- HEAD=555a19af,干净;无活跃 codex 会话 → 无需续跑。
+
+### 二、审查循环(无新发现)
+
+**第 22 轮**:shared_network_loader.c——map 表项数(12/15)与数组容量(15)
+匹配、v2 无 egress 有文档依据、程序符号名与内核源一致。无缺陷。
+至此 native/ 全部 11 个 C 文件 + 全部 Go 面(smart/adaptive/dns/verdict/
+promote/loader)审查完毕,连续三轮零新发现。
+
+**验证**:go test ./... 全绿、race 3 包、linux with_ebpf 构建绿。
+满足停止条件,无新提交。
