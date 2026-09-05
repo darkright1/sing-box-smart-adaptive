@@ -117,3 +117,18 @@ data_end 校验,与 v3 parser 同模式,verifier 安全。无缺陷。
 
 **验证**:go test ./... 全绿、race 3 包、GOOS=linux with_ebpf vet+构建绿。
 1 个修复提交。
+
+## 2026-09-06 运行 #6(定时任务)
+
+### 一、codex 任务检测
+- HEAD=acd75081,干净;无活跃 codex 会话 → 无需续跑。
+
+### 二、审查循环(无新发现)
+
+**第 17 轮**:v2 内核 shared_network_v2.bpf.c 全量——established 检查在 bypass 之前(v2 简化设计,与 v3 有意不同)、listener miss / assign 失败路径均 forget_original 清理、SOCKMAP ref 释放覆盖所有出口、mark 只在 assign 成功后写。无缺陷。
+
+**第 18 轮**:splice.bpf.c 内核全量——LE 假设以 #error 硬守卫(remote_port 高半字节怪癖)、SK_SKB ctx 的 verifier 限制(禁 16B memcpy、标量索引)均有注释与 selftests 惯例依据、stats 为 sync 原子加。无缺陷。
+
+至此 4 个内核程序(v1 token、v2 socket_assign、v3 TC、splice)全部完成人工深审;smart 侧 4 份评分副本已钉死,dns/verdict/promote 生命周期已治理。
+
+**验证**:go test ./... 全绿、race 3 包、smart_zig cgo conformance 绿、GOOS=linux with_ebpf 构建绿。满足停止条件,无新提交。
