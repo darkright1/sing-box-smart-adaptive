@@ -231,3 +231,17 @@ promote/loader)审查完毕,连续三轮零新发现。
 
 **验证**:go test ./... 全绿、race 3 包、linux with_ebpf 构建绿。
 满足停止条件,无新提交。
+
+## 2026-09-06 运行 #13(定时任务)
+
+### 一、codex 任务检测
+- HEAD=2f213f1a,干净;无活跃 codex 会话 → 无需续跑。
+
+### 二、收敛态维持(无新发现,无新审查面)
+
+- Zig 25/25 通过;libsmart_engine.a 完好。
+- 一次假警报:同一命令单元里 zig test(重写 .a)与 go test 并发链接导致
+  "setup failed";顺序重跑全绿,非代码问题。教训:zig test 与 go test
+  (smart_zig)不得并发执行,守护后续运行按顺序跑。
+- 全量验证:go test ./...、race、smart_zig cgo conformance、linux with_ebpf
+  构建全绿。满足停止条件,无新提交。
