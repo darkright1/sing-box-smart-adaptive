@@ -71,7 +71,10 @@ func (s *bypassMissSampler) ObserveTCP(i *Inbound, dest netip.Addr) {
 	s.userspace.Add(1)
 	// If route would choose DIRECT for this IP, static LPM/geoip is incomplete —
 	// self-heal with a temporary /32 promote so subsequent packets skip userspace.
-	if i.dnsPrefillRouter != nil && i.dnsPrefillOutbounds != nil {
+	// The promote is identity-blind (no client/source in the sampler ABI), so it
+	// must respect the same mac_source_policy boundary as the DNS prefill path:
+	// a source-sensitive policy makes any global /32 DIRECT hint unsafe.
+	if i.dnsPrefillIdentitySafe() && i.dnsPrefillRouter != nil && i.dnsPrefillOutbounds != nil {
 		if dnsPrefillIsStableDirect(i.dnsPrefillRouter, i.dnsPrefillOutbounds, i.Tag(), "", dest) {
 			if i.promoteLearnedBypass(dest, i.directPromoteTTL()) {
 				s.gapHeal.Add(1)

@@ -806,8 +806,18 @@ func (i *Inbound) NoteRoutedDirect(metadata adapter.InboundContext, outbound ada
 	if len(addrs) == 0 {
 		return
 	}
+	// The /32 promote lands in the shared static bank, so after this call it
+	// applies to every client, not just the one whose route produced DIRECT.
+	// With mac_source_policy the kernel consults source identity before the
+	// static bank, but clients without a MAC row would silently inherit this
+	// bypass even when their own route says proxy — the same identity-blind
+	// hazard that disables DNS/FakeIP promotion (v3-control-plane-integrity).
+	// Exact-flow publication below stays: it carries the full client tuple.
 	ttl := i.directPromoteTTL()
 	for _, addr := range addrs {
+		if !i.dnsPrefillIdentitySafe() {
+			break
+		}
 		if i.promoteLearnedBypass(addr, ttl) {
 			i.routeDirectPromotes.Add(1)
 		}
