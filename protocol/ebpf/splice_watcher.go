@@ -243,9 +243,17 @@ func (w *spliceWatcher) sweepIdle() {
 			}
 			continue
 		}
+		// Bytes() is a syscall snapshot; only the st bookkeeping needs the
+		// lock — removeLocked reads the same fields concurrently.
 		up, down, err := s.pair.Bytes()
 		if err != nil {
 			dead = append(dead, s.pair)
+			continue
+		}
+		w.access.Lock()
+		if _, ok := w.pairs[s.pair]; !ok {
+			// Removed (and likely released) while we were sampling.
+			w.access.Unlock()
 			continue
 		}
 		if up == s.st.lastUp && down == s.st.lastDown {
@@ -257,6 +265,7 @@ func (w *spliceWatcher) sweepIdle() {
 			s.st.stale = 0
 			s.st.lastUp, s.st.lastDown = up, down
 		}
+		w.access.Unlock()
 	}
 	if len(dead) == 0 {
 		return
