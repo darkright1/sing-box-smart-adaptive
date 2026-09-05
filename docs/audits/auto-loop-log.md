@@ -151,3 +151,24 @@ ktime_get_ns 与用户态 monotonicExpireNs 时钟源对齐(A1/F-2 契约)。
 
 **验证**:go test ./... 全绿、race 3 包、smart_zig cgo conformance 绿、
 linux with_ebpf 构建绿。满足停止条件,无新提交。
+
+## 2026-09-06 运行 #8(定时任务)
+
+### 一、codex 任务检测
+- HEAD=cb92ab46,干净;无活跃 codex 会话 → 无需续跑。
+
+### 二、审查循环(无新发现)
+
+**第 20 轮**:adaptive policy_kernel_zig——Configure 边界(margin 0.15~0.95、
+manual_failure)、每次 Choose 前重配 mode 的语义、128 上下文上限 + 任意逐出
+(文档化:churn 不产生进程级增长)、kernelNowMS 回拨由 Zig `-|` 饱和防护;
+模式枚举 0-4 与 Zig 侧逻辑(strict/adaptive/bulk + pinned/lease/manual)一一
+对应。无缺陷。
+
+至此守护任务的全部既定审查面(smart 4 份公式副本、4 个内核程序、adaptive
+内核、DNS/verdict/promote 生命周期、loader、v2/v3/splice 解析器)均已覆盖,
+连续两轮零新发现。建议:降低定时频率或改为代码变更触发;4 个本地待推送
+提交(sweepIdle 竞态、mac_source_policy promote 边界等)待用户指示部署。
+
+**验证**:go test ./... 全绿、race 3 包、smart_zig cgo 绿、linux with_ebpf
+构建绿。无新提交。
