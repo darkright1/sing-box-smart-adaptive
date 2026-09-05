@@ -217,3 +217,17 @@ promote/loader)审查完毕,连续三轮零新发现。
 
 **验证**:go test ./... 全绿、race 3 包、linux with_ebpf 构建绿。
 满足停止条件,无新提交。
+
+## 2026-09-06 运行 #12(定时任务)
+
+### 一、codex 任务检测
+- HEAD=a955750a,干净;无活跃 codex 会话 → 无需续跑。
+
+### 二、审查循环(无新发现)
+
+**第 24 轮**:protocol/ebpf/route.go——UID 感知的 RouteGet 源地址恢复
+(回环/未指定/族宽校验)、本地路由逆序删除。无缺陷。至此仓库内全部
+源文件(含 protocol/ebpf 每个 .go)均已深审,连续第五轮零新发现。
+
+**验证**:go test ./... 全绿、race 3 包、linux with_ebpf 构建绿。
+满足停止条件,无新提交。
