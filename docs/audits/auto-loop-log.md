@@ -75,3 +75,22 @@ GOOS=linux with_ebpf 全仓构建 OK。共 3 个提交(ed144ac4、0baafef7 及�
 **验证中发现并解决**(非代码缺陷):smart-engine/zig-out/lib/libsmart_engine.a 曾被 `-Dtarget=x86_64-linux-musl` 覆盖(部署准备),导致本机 `smart_zig cgo` 链接失败;按 host 目标重建后恢复。注意:在同一 worktree 切 zig 交叉目标会破坏本机 smart_zig 测试链路,交叉产物应使用独立 build root(zig build --prefix)。
 
 **结论**:本轮审查(dns_hint / dns_prefill / verdict_learn / store / adaptive 解码)无新发现,全部测试绿:go test ./... 、race 4 包、smart_zig cgo conformance、GOOS=linux with_ebpf 构建。满足停止条件,无新提交。
+
+## 2026-09-06 运行 #4(定时任务)
+
+### 一、codex 任务检测
+- HEAD=3e757b1c,干净,无活跃 codex 会话 → 无需续跑。
+
+### 二、审查 → 修复循环
+
+**第 12 轮**(commit 本轮)— splice_watcher 泄漏/竞态审查
+- 发现真实数据竞争:sweepIdle 在 w.access 锁外读写 watchPairState 的
+  lastUp/lastDown/stale,而 removeLocked 在锁内读同字段并可能并发删除
+  pair。修复:记账段持锁,并跳过采样期间已被移除的 pair。该文件
+  linux-gated,race 检测器从未覆盖——纯审查发现。
+- Add 的回滚路径(EpollCtl ADD 右端失败时 DEL 左端)、Close 的 epfd
+  关闭唤醒、FD 复用防护(Remove 先于 Release)均正确。
+
+**第 13 轮**:udp_state——锁序 t.access(R/W)→clientState→redirectAccess 一致无死锁;bindings 由会话引用计数管理,最后一个 UDP 会话关闭即整体清理,无泄漏;redirect 引用计数防共享地址误删。无缺陷。
+
+**验证**:go test ./... 全绿、race 3 包绿、linux with_ebpf vet+构建绿。1 个修复提交。
