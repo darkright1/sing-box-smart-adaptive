@@ -50,15 +50,18 @@ func TestDNSPrefillRejectsSourceSensitiveGlobalPromotion(t *testing.T) {
 }
 
 func TestV3DNSHintDoesNotImplicitlyFollowFakeIP(t *testing.T) {
-	base := Inbound{
-		sharedNetwork: &sharedNetwork{engineV3: true},
-		sharedOptions: option.EBPFSharedNetworkOptions{PolicyOffload: option.EBPFPolicyOffloadOptions{Enabled: true}},
+	newInbound := func() *Inbound {
+		return &Inbound{
+			sharedNetwork: &sharedNetwork{engineV3: true},
+			sharedOptions: option.EBPFSharedNetworkOptions{PolicyOffload: option.EBPFPolicyOffloadOptions{Enabled: true}},
+		}
 	}
+	base := newInbound()
 	if base.v3DNSHintEnabled() {
 		t.Fatal("dns_ip_hint=off must not enable real-DNS observation")
 	}
 
-	fakeOnly := base
+	fakeOnly := newInbound()
 	fakeOnly.sharedOptions.PolicyOffload.FakeIP = true
 	if fakeOnly.v3DNSHintEnabled() {
 		t.Fatal("FakeIP-only mode must not enable real-DNS observation")
@@ -67,7 +70,7 @@ func TestV3DNSHintDoesNotImplicitlyFollowFakeIP(t *testing.T) {
 		t.Fatal("FakeIP-only mode should keep the authoritative FakeIP path enabled")
 	}
 
-	strong := base
+	strong := newInbound()
 	strong.sharedOptions.PolicyOffload.DNSIPHint = "strong"
 	if !strong.v3DNSHintEnabled() {
 		t.Fatal("dns_ip_hint=strong should enable real-DNS observation")
