@@ -353,3 +353,15 @@ promote/loader)审查完毕,连续三轮零新发现。
 - 实测:VM115 HK 组测 2 → 32 entries;VM107 16 entries。urltest/loadbalance
   重构零改动(证据:git diff ecd690a3..HEAD 对上述文件为空)。
 - 发布 v1.14.12(run 34008676139),VM115/107 已部署验证,备份保留。
+
+## 2026-09-06 load-balance Surge 对标修复 + v1.14.13 部署(用户指示)
+- 对标审查发现并修复 5 处:
+  1. 策略函数每次拨号复制成员快照 → 缓存共享切片(replaceOutbounds 重建);
+  2. AliveForTestUrl 不看历史时效 → 信任窗口收窄到检查间隔(零值时间豁免);
+  3. 默认策略 random → consistent-hashing(对齐 Surge 按目的主机粘性默认);
+  4. nextFallback 起始索引跳过第一个成员 → 从 0 开始;
+  5. 一致性哈希重试 key+1 可能反复命中同槽 → 黄金比例步长。
+- LoadBalance.Now() 返回最近使用成员(面板不再空白)。
+- v1.14.13 部署 VM115/VM107(备份 bak-1.14.12-*);VM107 部署中发现根盘
+  100% 满(708MB),已清理旧二进制备份+apk 缓存至 61%。
+- 验证:VM107 HK 组测 16 entries、代理 302/0.14s;VM115 全绿。
