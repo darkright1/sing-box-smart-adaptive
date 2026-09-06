@@ -333,3 +333,10 @@ promote/loader)审查完毕,连续三轮零新发现。
 ## 2026-09-06 运行 #30(定时任务)
 - HEAD=216ffea8,干净且与 origin 同步;线上 VM115/107 = v1.14.11。
 - 收敛态维持:全量验证全绿。无新提交(除本日志)。
+
+## 2026-09-06 GitHub 仓库清理(用户指示)
+- Release:58 → 3(保留 v1.14.9/10/11,删除全部 adaptive rc/v3.x 实验版与 beta 系列)
+- 分支:21 → 4(保留 active/main/beta17/v1.15 alpha,删除 17 个陈旧分支)
+- 默认分支:adaptive/official-beta17 → adaptive/official-v1.14.0-smart-ebpf;仓库描述更新
+- 教训:清理脚本的条件优先级 (A||B&&C||D) 打印误导,幸未误删;批量删除
+  必须先显式排除清单再执行,不得依赖内联条件短路。
