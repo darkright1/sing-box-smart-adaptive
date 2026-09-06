@@ -217,6 +217,7 @@ struct sb_ebpf_v3_runtime {
 	int host6_map_fd;
 	int flow_map_fd;
 	int dns_hint_map_fd;
+	int dns_observe_map_fd;
 	int source_mac_map_fd;
 	int redirect_map_fd;
 	int listener_map_fd;

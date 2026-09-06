@@ -35,6 +35,32 @@ func TestSharedNetworkABI(t *testing.T) {
 	}
 }
 
+func TestNormalizeDNSObservationName(t *testing.T) {
+	valid := map[string]string{
+		"Example.COM.":            "example.com",
+		"_acme-challenge.Example": "_acme-challenge.example",
+		"service-name.example":    "service-name.example",
+	}
+	for input, want := range valid {
+		if got := normalizeDNSObservationName(input); got != want {
+			t.Fatalf("normalizeDNSObservationName(%q)=%q, want %q", input, got, want)
+		}
+	}
+	invalid := []string{
+		"",
+		".",
+		"-leading.example",
+		"trailing-.example",
+		"bad label.example",
+		"bad/.example",
+	}
+	for _, input := range invalid {
+		if got := normalizeDNSObservationName(input); got != "" {
+			t.Fatalf("normalizeDNSObservationName(%q)=%q, want rejection", input, got)
+		}
+	}
+}
+
 func TestMakeSharedNetworkRedirectKey(t *testing.T) {
 	client := netip.MustParseAddrPort("192.168.43.10:53000")
 	redirect := netip.MustParseAddrPort("127.200.1.2:65531")

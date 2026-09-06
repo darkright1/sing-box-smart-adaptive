@@ -35,6 +35,7 @@ import (
 	_ "embed"
 	"errors"
 	"net/netip"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -154,6 +155,18 @@ type v3DNSValue struct {
 	Reserved2  uint32
 }
 
+type v3DNSObservationKey struct {
+	QnameHash uint64
+	Family    uint8
+	Reserved0 uint8
+	Reserved1 uint16
+	Addr      [16]byte
+}
+
+type v3DNSObservationValue struct {
+	Qname [ebpfv3.DNSObservationNameMax]byte
+}
+
 type v3RedirectKey struct {
 	Family     uint8
 	Protocol   uint8
@@ -215,6 +228,7 @@ const (
 	v3FlagFakeIP       = 1 << 10
 	v3FlagMACSource    = 1 << 11
 	v3FlagFailureProxy = 1 << 12
+	v3FlagDNSSniff     = 1 << 13
 )
 
 const (
@@ -284,9 +298,9 @@ func PrepareSharedNetworkV3(
 		statsPossibleCPUs: statsCPUs,
 		statsScratch:      make([]v3StatsValue, statsCPUs),
 	}
-	// Must match SB_V3_ABI_VERSION in v3/kern/abi.h. The version bump covers
-	// the PERCPU stats-vector map layout.
-	b.control.ABIVersion = 2
+	// Must match SB_V3_ABI_VERSION in v3/kern/abi.h. The version covers the
+	// PERCPU stats vector and the DNS observation map contract.
+	b.control.ABIVersion = ebpfv3.ABIVersion
 	b.control.PolicyGeneration = 1
 	b.control.ActiveBank = 0
 	b.control.RoutingMark = routingMark
@@ -317,6 +331,9 @@ func PrepareSharedNetworkV3(
 	}
 	if policyOffloadDNS {
 		b.control.Flags |= v3FlagDNSHint
+		// The sniffer is advisory and only enabled with the same explicit DNS
+		// offload opt-in. It never changes a packet verdict by itself.
+		b.control.Flags |= v3FlagDNSSniff
 	}
 	if policyOffloadFakeIP {
 		b.control.Flags |= v3FlagFakeIP
@@ -1251,6 +1268,96 @@ func (b *V3Backend) PublishDNSHint(addr netip.Addr, direct bool, evidence uint8,
 	return updateMap(int(b.runtime.dns_hint_map_fd), unsafe.Pointer(&key), unsafe.Pointer(&cur))
 }
 
+// DrainDNSObservations consumes a bounded batch from the optional v3 kernel
+// DNS-response observation map.  The map is advisory: a disappearing entry or
+// malformed name is dropped, never turned into a routing decision.  We first
+// snapshot keys and only then delete them because deleting during
+// BPF_MAP_GET_NEXT_KEY iteration can skip the next entry on LRU maps.
+func (b *V3Backend) DrainDNSObservations(max int) ([]ebpfv3.DNSObservation, error) {
+	if b == nil {
+		return nil, osErrClosed
+	}
+	if max <= 0 || max > ebpfv3.MaxDNSObservations {
+		max = 128
+	}
+	b.access.RLock()
+	defer b.access.RUnlock()
+	b.mapAccess.Lock()
+	defer b.mapAccess.Unlock()
+	if b.runtime == nil || b.runtime.dns_observe_map_fd < 0 {
+		return nil, osErrClosed
+	}
+	mapFD := int(b.runtime.dns_observe_map_fd)
+	keys := make([]v3DNSObservationKey, 0, max)
+	var previous v3DNSObservationKey
+	havePrevious := false
+	for len(keys) < max {
+		var next v3DNSObservationKey
+		var keyPtr unsafe.Pointer
+		if havePrevious {
+			keyCopy := previous
+			keyPtr = unsafe.Pointer(&keyCopy)
+		}
+		if err := getNextKeyMap(mapFD, keyPtr, unsafe.Pointer(&next)); err != nil {
+			if errors.Is(err, unix.ENOENT) {
+				break
+			}
+			return nil, E.Cause(err, "iterate v3 dns observations")
+		}
+		keys = append(keys, next)
+		previous = next
+		havePrevious = true
+	}
+	observations := make([]ebpfv3.DNSObservation, 0, len(keys))
+	for _, key := range keys {
+		var value v3DNSObservationValue
+		err := lookupMap(mapFD, unsafe.Pointer(&key), unsafe.Pointer(&value))
+		// Always consume the row.  A malformed producer must not pin the same
+		// bad value in the LRU map and repeatedly waste the drainer budget.
+		_ = deleteMap(mapFD, unsafe.Pointer(&key))
+		if errors.Is(err, unix.ENOENT) {
+			continue
+		}
+		if err != nil {
+			return observations, E.Cause(err, "read v3 dns observation")
+		}
+		name := string(value.Qname[:])
+		if nul := strings.IndexByte(name, 0); nul >= 0 {
+			name = name[:nul]
+		}
+		name = normalizeDNSObservationName(name)
+		if name == "" {
+			continue
+		}
+		addr, addrErr := addrFromFamily(key.Family, key.Addr)
+		if addrErr != nil || !addr.IsValid() || addr.IsUnspecified() || addr.IsLoopback() || addr.IsMulticast() {
+			continue
+		}
+		observations = append(observations, ebpfv3.DNSObservation{Name: name, Address: addr})
+	}
+	return observations, nil
+}
+
+func normalizeDNSObservationName(name string) string {
+	name = strings.TrimSuffix(strings.ToLower(strings.TrimSpace(name)), ".")
+	if len(name) == 0 || len(name) > 253 {
+		return ""
+	}
+	labels := strings.Split(name, ".")
+	for _, label := range labels {
+		if len(label) == 0 || len(label) > 63 {
+			return ""
+		}
+		for index, r := range label {
+			if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '_' || (r == '-' && index > 0 && index < len(label)-1) {
+				continue
+			}
+			return ""
+		}
+	}
+	return name
+}
+
 func (b *V3Backend) Close() error {
 	if b == nil {
 		return nil
@@ -1287,6 +1394,9 @@ func (b *SharedNetworkBackend) PublishStaticDirect(prefixes []netip.Prefix, gene
 func (b *SharedNetworkBackend) MergeStaticDirect(prefix netip.Prefix) error { return nil }
 func (b *SharedNetworkBackend) PublishDNSHint(addr netip.Addr, direct bool, evidence uint8, generation uint32, ttl time.Duration) error {
 	return nil
+}
+func (b *SharedNetworkBackend) DrainDNSObservations(int) ([]ebpfv3.DNSObservation, error) {
+	return nil, nil
 }
 func (b *SharedNetworkBackend) WriteControlV3(enabled bool, flags uint32, activeBank, generation, routingMark uint32) error {
 	return nil

@@ -137,6 +137,7 @@ enum sb_v3_verdict {
 | `v3_source_policy` | HASH/LPM | ifindex + source CIDR/MAC → policy id |
 | `v3_flow_verdict` | LRU_HASH | 双向 exact five-tuple verdict |
 | `v3_dns_ip_hint` | LRU_HASH | DNS/FakeIP 弱关联、冲突数和 TTL |
+| `v3_dns_observe` | LRU_HASH (4096) | TC 仅观察明文 DNS 应答；用户态限量排空并按完整域名规则决定是否晋升 |
 | `v3_listener_sockets` | SOCKMAP | TCP4/UDP4/TCP6/UDP6 透明 listener |
 | `v3_socket_identity` | LRU_HASH | cookie → UID/cgroup/process class，仅本机 |
 | `v3_stats` | PERCPU_ARRAY[1] | one 32-counter vector per possible CPU; userspace aggregates |

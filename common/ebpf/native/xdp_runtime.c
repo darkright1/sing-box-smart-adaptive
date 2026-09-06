@@ -377,6 +377,7 @@ int sb_ebpf_xdp_prepare(
 	entries[n++] = (struct sb_ebpf_object_map_entry){"v3_host6", v3->host6_map_fd};
 	entries[n++] = (struct sb_ebpf_object_map_entry){"v3_flow_verdict", v3->flow_map_fd};
 	entries[n++] = (struct sb_ebpf_object_map_entry){"v3_dns_ip_hint", v3->dns_hint_map_fd};
+	entries[n++] = (struct sb_ebpf_object_map_entry){"v3_dns_observe", v3->dns_observe_map_fd};
 	entries[n++] = (struct sb_ebpf_object_map_entry){"v3_source_mac", v3->source_mac_map_fd};
 	entries[n++] = (struct sb_ebpf_object_map_entry){"v3_redirect", v3->redirect_map_fd};
 	entries[n++] = (struct sb_ebpf_object_map_entry){"v3_listener_sockets", v3->listener_map_fd};

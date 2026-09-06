@@ -124,6 +124,9 @@ func ControlFlags(options option.EBPFSharedNetworkOptions, enableIPv4, enableIPv
 		switch po.DNSIPHint {
 		case "safe", "strong":
 			flags |= ebpfv3.FlagDNSHint
+			// Capture hard-coded plaintext DNS replies as advisory observations;
+			// userspace still evaluates the complete domain rule set.
+			flags |= ebpfv3.FlagDNSSniff
 		}
 		if po.FakeIP {
 			flags |= ebpfv3.FlagFakeIP

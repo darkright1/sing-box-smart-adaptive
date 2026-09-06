@@ -84,6 +84,8 @@ type Inbound struct {
 	closeAccess        sync.Mutex
 	statsCancel        context.CancelFunc
 	statsDone          chan struct{}
+	dnsObserveCancel   context.CancelFunc
+	dnsObserveDone     chan struct{}
 	udpCleanupInterval time.Duration
 	udpCleanupCancel   context.CancelFunc
 	udpCleanupDone     chan struct{}
@@ -546,6 +548,7 @@ func (i *Inbound) Start(stage adapter.StartStage) error {
 			service.MustRegister[adapter.DirectOffload](i.ctx, i)
 		}
 		i.wireDNSPrefill()
+		i.startDNSObservationMonitor()
 		i.startRuntimeStatsMonitor(backend)
 		i.startUDPNATCleanup()
 		bypassIPv4Count, bypassIPv6Count := backend.BypassCIDRCount()
@@ -623,6 +626,7 @@ func (i *Inbound) cleanupStartFailure() error {
 // hub slots live across restarts and hurts HA.
 func (i *Inbound) closeLocked() error {
 	i.stopDNSPrefill()
+	i.stopDNSObservationMonitor()
 	i.stopRuntimeStatsMonitor()
 	i.stopUDPNATCleanup()
 	i.udpNat.Purge()

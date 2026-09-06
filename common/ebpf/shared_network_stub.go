@@ -85,6 +85,9 @@ func (b *SharedNetworkBackend) MergeStaticDirect(netip.Prefix) error {
 func (b *SharedNetworkBackend) PublishDNSHint(netip.Addr, bool, uint8, uint32, time.Duration) error {
 	return unsupportedSharedNetworkError()
 }
+func (b *SharedNetworkBackend) DrainDNSObservations(int) ([]ebpfv3.DNSObservation, error) {
+	return nil, unsupportedSharedNetworkError()
+}
 func (b *SharedNetworkBackend) PublishMACPolicies([]ebpfv3.MACPolicyEntry) error {
 	return unsupportedSharedNetworkError()
 }

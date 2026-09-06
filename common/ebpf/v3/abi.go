@@ -3,10 +3,13 @@
 // Linux/cgo-only.
 package v3
 
-import "fmt"
+import (
+	"fmt"
+	"net/netip"
+)
 
 // ABIVersion must match SB_V3_ABI_VERSION in abi.h.
-const ABIVersion = 2
+const ABIVersion = 3
 
 const (
 	AFInet  = 2
@@ -95,17 +98,20 @@ const (
 	FlagFakeIP       uint32 = 1 << 10
 	FlagMACSource    uint32 = 1 << 11
 	FlagFailureProxy uint32 = 1 << 12
+	FlagDNSSniff     uint32 = 1 << 13
 )
 
 const (
-	DefaultFlowEntries = 8192
-	DefaultDNSHints    = 8192
-	DefaultPolicyLPM   = 16384
-	MaxFlowEntries     = 65536
-	MaxDNSHints        = 32768
-	MaxPolicyLPM       = 65536
-	StatsCount         = 32
-	ListenerCount      = 4
+	DefaultFlowEntries    = 8192
+	DefaultDNSHints       = 8192
+	DefaultPolicyLPM      = 16384
+	MaxFlowEntries        = 65536
+	MaxDNSHints           = 32768
+	MaxDNSObservations    = 4096
+	DNSObservationNameMax = 128
+	MaxPolicyLPM          = 65536
+	StatsCount            = 32
+	ListenerCount         = 4
 )
 
 // StatsValue mirrors the per-CPU telemetry vector used by the kernel ABI.
@@ -185,6 +191,15 @@ type DNSIPValue struct {
 	Reserved2  uint32
 }
 
+// DNSObservation is a bounded plaintext UDP DNS response captured by the
+// TC v3 sniffer.  The kernel only records the qname and one A/AAAA address;
+// userspace remains the sole authority for applying domain rules and deciding
+// whether that address may be promoted to the DIRECT fast path.
+type DNSObservation struct {
+	Name    string
+	Address netip.Addr
+}
+
 // LPM4Key / LPM6Key for static policy banks.
 type LPM4Key struct {
 	PrefixLen uint32
@@ -198,18 +213,19 @@ type LPM6Key struct {
 
 // Packet is the Go model of a parsed frame for decision-order unit tests.
 type Packet struct {
-	Family     uint8
-	Protocol   uint8
-	Fragmented bool
-	VLANDepth  uint8
-	SPort      uint16
-	DPort      uint16
-	SAddr      [16]byte
-	DAddr      [16]byte
-	SMAC       [6]byte
-	DMAC       [6]byte
-	IfIndex    uint32
-	Mark       uint32
+	Family        uint8
+	Protocol      uint8
+	Fragmented    bool
+	VLANDepth     uint8
+	SPort         uint16
+	DPort         uint16
+	SAddr         [16]byte
+	DAddr         [16]byte
+	SMAC          [6]byte
+	DMAC          [6]byte
+	IfIndex       uint32
+	Mark          uint32
+	PayloadOffset uint16
 	// ParseRC: 0 ok, 1 ARP-like L2, -1 unclassifiable/truncated frame. Parse
 	// failures are passed to the kernel without a mark because no safe tuple
 	// exists for socket assignment.

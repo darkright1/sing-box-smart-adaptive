@@ -20,7 +20,7 @@ permissions:
 
 jobs:
   ebpf-provenance:
-    name: Regenerate committed v2 eBPF object on Linux
+    name: Generate and validate eBPF v2/v3 objects on Linux
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -29,7 +29,7 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq clang llvm make linux-libc-dev
-      - name: Generate and verify v2 object
+      - name: Verify committed v2 provenance before generation
         working-directory: common/ebpf
         run: |
           set -euo pipefail
@@ -38,9 +38,18 @@ jobs:
           # gate; running it after `make generate` only proves compiler
           # determinism and would miss a committed artifact drift.
           make check-v2-source
+      - name: Generate and validate v2/v3 objects
+        working-directory: common/ebpf
+        run: |
+          set -euo pipefail
           make generate
           make check-v2-source
           test -s native/shared_network_v2.bpf.o
+          test -s v3/kern/tc.bpf.o
+          readelf -S v3/kern/tc.bpf.o | grep -E '(\.maps|\.BTF|\.BTF\.ext|classifier/ingress|\.sb\.source)'
+          # The DNS observation map must be present in the generated object;
+          # otherwise the userspace drain path would be a silent no-op.
+          readelf -s v3/kern/tc.bpf.o | grep -F 'v3_dns_observe'
       - name: Publish regenerated object
         uses: actions/upload-artifact@v4
         with:

@@ -10,7 +10,7 @@
 #include <linux/types.h>
 
 /* Bump only on incompatible layout changes. Hot take-over must refuse mismatch. */
-#define SB_V3_ABI_VERSION 2U
+#define SB_V3_ABI_VERSION 3U
 
 #define SB_V3_AF_INET 2U
 #define SB_V3_AF_INET6 10U
@@ -20,6 +20,8 @@
 #define SB_V3_MAX_SOURCE_POLICY 8192U
 #define SB_V3_MAX_FLOW_ENTRIES 65536U
 #define SB_V3_MAX_DNS_HINTS 32768U
+#define SB_V3_MAX_DNS_OBSERVATIONS 4096U
+#define SB_V3_DNS_OBSERVATION_NAME_MAX 128U
 #define SB_V3_LISTENER_COUNT 4U
 #define SB_V3_STATS_COUNT 32U
 #define SB_V3_EVENT_RING_ENTRIES 4096U
@@ -132,6 +134,7 @@ enum sb_v3_listener_key {
 #define SB_V3_FLAG_FAKEIP (1U << 10)
 #define SB_V3_FLAG_MAC_SOURCE (1U << 11)
 #define SB_V3_FLAG_FAILURE_PROXY (1U << 12) /* failure_mode=proxy (default) */
+#define SB_V3_FLAG_DNS_SNIFF (1U << 13) /* kernel plaintext DNS response sniffer */
 
 /* XDP control is intentionally a separate ABI.  TC readers must not infer
  * AF_XDP state from the TC control block, and an XDP attach must be able to
@@ -272,6 +275,25 @@ struct sb_v3_source_policy_value {
 
 _Static_assert(sizeof(struct sb_v3_source_policy_value) == 16U, "sb_v3_source_policy_value size");
 
+/* Kernel-side plaintext DNS response observation (design §7.4): the TC
+ * sniffer extracts qname + first A/AAAA from responses and parks them here;
+ * userspace drains the map, applies full domain rules and publishes hints.
+ * Covers clients with hardcoded DNS whose responses never transit the
+ * sing-box DNS module. */
+struct sb_v3_dns_obs_key {
+	__u64 qname_hash;
+	__u8 family;
+	__u8 reserved0;
+	__u16 reserved1;
+	__u8 addr[16];
+};
+
+_Static_assert(sizeof(struct sb_v3_dns_obs_key) == 32U, "sb_v3_dns_obs_key size");
+
+struct sb_v3_dns_obs_value {
+	char qname[SB_V3_DNS_OBSERVATION_NAME_MAX]; /* lowercase, no trailing dot */
+};
+
 /* Host-to-kernel snapshot row for v3_source_mac (design §7.3). */
 struct sb_v3_mac_policy_entry {
 	struct sb_v3_mac_key key;
@@ -323,7 +345,11 @@ struct sb_v3_packet {
 	 * only to avoid redirecting established TCP; TC keeps the field purely
 	 * observational and does not change its ABI-visible decisions. */
 	__u8 tcp_flags;
-	__u8 reserved3[3];
+	/* Offset from frame start to the L4 header (parser). Observational
+	 * extensions (e.g. the DNS response sniffer) use it to reach the
+	 * payload without re-walking the frame. */
+	__u16 payload_offset;
+	__u8 reserved3[1];
 };
 
 _Static_assert(sizeof(struct sb_v3_packet) == 64U, "sb_v3_packet size");

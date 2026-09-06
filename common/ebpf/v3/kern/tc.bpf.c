@@ -72,6 +72,146 @@ static __attribute__((always_inline)) bool policy_port_match(const struct sb_v3_
 	return packet->dport >= policy->match_dport_min && packet->dport <= policy->match_dport_max;
 }
 
+/* ── Plaintext DNS response sniffer (design §7.4) ─────────────────────────
+ * Gated by SB_V3_FLAG_DNS_SNIFF. Parses UDP responses from src port 53:
+ * extracts the qname (lowercase, labels joined with dots, trailing dot
+ * removed) and the first A/AAAA answer address, and parks the pair in
+ * v3_dns_observe for the userspace drainer, which applies the full domain
+ * rule set (regex included) and publishes direct hints. Never changes the
+ * packet verdict. Bound-checked label walk; compression pointers are
+ * followed at most twice per name with a hard tail limit. */
+
+static __attribute__((always_inline)) int dns_sniff_name(const __u8 *cursor, const __u8 *payload,
+								 const __u8 *payload_end, __u8 *out,
+								 int out_len, const __u8 **next_out) {
+	const __u8 *p = cursor;
+	int written = 0, hops = 0;
+	bool jumped = false;
+	for (int steps = 0; steps < 32; steps++) {
+		if (p >= payload_end)
+			return -1;
+		__u8 len = *p;
+		if (len == 0) {
+			if (!jumped && next_out)
+				*next_out = p + 1;
+			if (out) {
+				if (written >= out_len)
+					return -1;
+				out[written] = 0;
+			}
+			return written > 0 ? written : -1;
+		}
+		if ((len & 0xc0) == 0xc0) { /* RFC 1035 compression pointer */
+			if (hops >= 2 || p + 2 > payload_end)
+				return -1;
+			__u16 off = (__u16)((len & 0x3f) << 8) | p[1];
+			if ((__u64)off >= (__u64)(payload_end - payload) || payload + off >= p)
+				return -1;
+			if (!jumped && next_out)
+				*next_out = p + 2;
+			p = payload + off;
+			jumped = true;
+			hops++;
+			continue;
+		}
+		if ((len & 0xc0) != 0 || p + 1 + len > payload_end)
+			return -1;
+		if (out) {
+			if (written != 0) {
+				if (written + 1 >= out_len)
+					return -1;
+				out[written++] = '.';
+			}
+			if (written + len >= out_len)
+				return -1;
+			for (int i = 0; i < len; i++) {
+				__u8 c = p[1 + i];
+				out[written++] = (c >= 'A' && c <= 'Z') ? c + 32 : c;
+			}
+		} else {
+			/* The answer owner name is only skipped, not copied. */
+			written += len + (written != 0 ? 1 : 0);
+		}
+		p += 1 + len;
+	}
+	return -1;
+}
+
+static __attribute__((always_inline)) void dns_response_sniff(const __u8 *udp_payload,
+							      const __u8 *payload_end) {
+	const __u8 *dns = udp_payload;
+	if (dns + 12 > payload_end)
+		return;
+	__u16 flags = (__u16)(dns[2] << 8) | dns[3];
+	if ((flags & 0x8000) == 0)
+		return; /* not a response */
+	if ((flags & 0x000f) != 0)
+		return; /* error response */
+	__u16 qdcount = (__u16)(dns[4] << 8) | dns[5];
+	__u16 ancount = (__u16)(dns[6] << 8) | dns[7];
+	/* Multiple-question replies need a full section walk to find the answer
+	 * offset.  Reject them conservatively rather than interpreting the second
+	 * question as an answer header; this path is advisory and fail-open. */
+	if (qdcount != 1 || ancount == 0)
+		return;
+
+	/* Zero-fill so the fixed-size map copy below is verifier-safe and cannot
+	 * expose uninitialised stack bytes when the name is shorter than 128. */
+	__u8 qname[SB_V3_DNS_OBSERVATION_NAME_MAX] = {};
+	const __u8 *question_end;
+	int qlen = dns_sniff_name(dns + 12, dns, payload_end, qname, sizeof(qname), &question_end);
+	if (qlen <= 0)
+		return;
+	/* skip to end of question section */
+	const __u8 *p = question_end;
+	if (p + 4 > payload_end)
+		return;
+	__u16 qtype = (__u16)(p[0] << 8) | p[1];
+	__u16 qclass = (__u16)(p[2] << 8) | p[3];
+	p += 4;
+
+	if ((qtype != 1 && qtype != 28) || qclass != 1)
+		return; /* want A/AAAA answers only */
+
+	__u64 hash = 1469598103934665603ULL;
+	for (int i = 0; i < qlen; i++) {
+		hash ^= qname[i];
+		hash *= 1099511628211ULL;
+	}
+
+#pragma clang loop unroll(disable)
+	for (int a = 0; a < 16; a++) {
+		const __u8 *record_fields;
+		if (dns_sniff_name(p, dns, payload_end, 0, 0, &record_fields) <= 0)
+			return;
+		p = record_fields;
+		if (p + 10 > payload_end)
+			return;
+		__u16 rtype = (__u16)(p[0] << 8) | p[1];
+		__u16 rclass = (__u16)(p[2] << 8) | p[3];
+		__u16 rdlen = (__u16)(p[8] << 8) | p[9];
+		const __u8 *rdata = p + 10;
+		if (rdata + rdlen > payload_end)
+			return;
+		if (rclass == 1 && rtype == qtype &&
+		    ((rtype == 1 && rdlen == 4) || (rtype == 28 && rdlen == 16))) {
+			struct sb_v3_dns_obs_key key = {};
+			key.qname_hash = hash;
+			key.family = rtype == 1 ? SB_V3_AF_INET : SB_V3_AF_INET6;
+			if (rtype == 1)
+				__builtin_memcpy(key.addr, rdata, 4);
+			else
+				__builtin_memcpy(key.addr, rdata, 16);
+			/* sb_v3_dns_obs_value is exactly the zero-filled qname array; use it
+			 * directly to keep the ingress stack frame below the 512-byte BPF
+			 * limit instead of allocating a second 128-byte temporary. */
+			map_update(&v3_dns_observe, &key, qname, BPF_ANY);
+			return;
+		}
+		p = rdata + rdlen;
+	}
+}
+
 /* Source-MAC identity policy (design §7.3). The host publishes MAC-keyed
  * verdicts for LAN devices whose route rules are pure source-MAC matches.
  * An exact ifindex entry wins over the wildcard (ifindex 0 = any interface).
@@ -381,6 +521,24 @@ int sb_v3_ingress(struct __sk_buff *skb) {
 		 * no mark. Calling handoff_proxy here would manufacture a redirect key
 		 * from zeroed fields and cannot select a listener safely. */
 		return TC_ACT_OK;
+	}
+
+	/* Observe plaintext DNS replies without changing their verdict. This is
+	 * deliberately before host/security bypass so replies addressed to the
+	 * gateway are still visible to userspace. The bounded parser only accepts
+	 * UDP source port 53 and stores at most one A/AAAA answer in the LRU map. */
+	if (parse_rc == 0 && !packet.fragmented &&
+	    (control->flags & SB_V3_FLAG_DNS_SNIFF) != 0 &&
+	    packet.protocol == IPPROTO_UDP && packet.sport == 53) {
+		struct udphdr *udp = data + packet.payload_offset;
+		if ((void *)(udp + 1) <= data_end) {
+			/* Bound the DNS walk to the UDP datagram rather than any skb padding
+			 * that may follow it.  Invalid/truncated UDP lengths are simply
+			 * ignored; the packet verdict remains unchanged. */
+			__u32 udp_len = __builtin_bswap16(udp->len);
+			if (udp_len >= sizeof(*udp) && (void *)udp + udp_len <= data_end)
+				dns_response_sniff((const __u8 *)(udp + 1), (const __u8 *)udp + udp_len);
+		}
 	}
 
 	/* DNS interception must precede host-address bypass.  PBR deployments send

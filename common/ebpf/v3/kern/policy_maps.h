@@ -44,6 +44,9 @@ SB_V3_MAP(v3_dns_ip_hint, BPF_MAP_TYPE_LRU_HASH, struct sb_v3_dns_ip_key, struct
 SB_V3_MAP(v3_source_mac, BPF_MAP_TYPE_HASH, struct sb_v3_mac_key, struct sb_v3_source_policy_value,
 	  SB_V3_MAX_SOURCE_POLICY, 0U);
 
+SB_V3_MAP(v3_dns_observe, BPF_MAP_TYPE_LRU_HASH, struct sb_v3_dns_obs_key,
+	  struct sb_v3_dns_obs_value, SB_V3_MAX_DNS_OBSERVATIONS, 0U);
+
 SB_V3_MAP(v3_redirect, BPF_MAP_TYPE_LRU_HASH, struct sb_v3_redirect_key, struct sb_v3_redirect_value,
 	  SB_V3_DEFAULT_FLOW_ENTRIES, 0U);
 

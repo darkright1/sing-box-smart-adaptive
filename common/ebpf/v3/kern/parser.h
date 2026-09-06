@@ -112,6 +112,11 @@ static __attribute__((always_inline)) int sb_v3_parse(void *data, void *data_end
 	} else {
 		return -1;
 	}
+	/* The IPv6 extension walk may have advanced the transport header. Keep the
+	 * final offset, not the pre-extension value, for observational parsers. */
+	if (transport_offset > 0xffffU)
+		return -1;
+	packet->payload_offset = (__u16)transport_offset;
 
 	if (packet->fragmented)
 		return 0;

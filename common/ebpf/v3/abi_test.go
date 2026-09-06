@@ -16,6 +16,18 @@ func TestABISizes(t *testing.T) {
 	assertSize(t, "LPM4Key", unsafe.Sizeof(LPM4Key{}), 8)
 	assertSize(t, "LPM6Key", unsafe.Sizeof(LPM6Key{}), 20)
 	assertSize(t, "StatsValue", unsafe.Sizeof(StatsValue{}), 32*8)
+	// DNS observations are consumed through the native map ABI; keep the
+	// value layout pinned even though the public observation exposes strings.
+	type dnsObservationKey struct {
+		QnameHash uint64
+		Family    uint8
+		Reserved0 uint8
+		Reserved1 uint16
+		Addr      [16]byte
+	}
+	type dnsObservationValue [DNSObservationNameMax]byte
+	assertSize(t, "DNSObservationKey", unsafe.Sizeof(dnsObservationKey{}), 32)
+	assertSize(t, "DNSObservationValue", unsafe.Sizeof(dnsObservationValue{}), DNSObservationNameMax)
 }
 
 func assertSize(t *testing.T, name string, got, want uintptr) {
@@ -129,6 +141,7 @@ func TestABIEnumValues(t *testing.T) {
 		"FlagFakeIP":       {FlagFakeIP, 1 << 10},
 		"FlagMACSource":    {FlagMACSource, 1 << 11},
 		"FlagFailureProxy": {FlagFailureProxy, 1 << 12},
+		"FlagDNSSniff":     {FlagDNSSniff, 1 << 13},
 	}
 	for name, pair := range flagPairs {
 		if pair[0] != pair[1] {

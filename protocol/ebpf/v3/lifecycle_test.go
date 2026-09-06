@@ -308,6 +308,30 @@ func TestControlFlagsNoDefaultQUICDrop(t *testing.T) {
 	}
 }
 
+func TestControlFlagsDNSSniffFollowsDNSHintOnly(t *testing.T) {
+	base := option.EBPFSharedNetworkOptions{
+		DataPlane: "socket_assign",
+		PolicyOffload: option.EBPFPolicyOffloadOptions{
+			Enabled: true,
+		},
+	}
+	if flags := ControlFlags(base, true, true, true, true, true, 0); flags&ebpfv3.FlagDNSSniff != 0 {
+		t.Fatalf("dns_ip_hint=off must not set DNS sniffer flag: %#x", flags)
+	}
+
+	fakeOnly := base
+	fakeOnly.PolicyOffload.FakeIP = true
+	if flags := ControlFlags(fakeOnly, true, true, true, true, true, 0); flags&ebpfv3.FlagDNSSniff != 0 {
+		t.Fatalf("FakeIP-only mode must not set DNS sniffer flag: %#x", flags)
+	}
+
+	strong := base
+	strong.PolicyOffload.DNSIPHint = "strong"
+	if flags := ControlFlags(strong, true, true, true, true, true, 0); flags&ebpfv3.FlagDNSSniff == 0 {
+		t.Fatalf("dns_ip_hint=strong must set DNS sniffer flag: %#x", flags)
+	}
+}
+
 func TestLifecyclePublishMACSourcePolicies(t *testing.T) {
 	drop := false
 	newLifecycle := func(macSource bool) *Lifecycle {

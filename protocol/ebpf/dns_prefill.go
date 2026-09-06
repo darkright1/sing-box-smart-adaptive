@@ -3,6 +3,7 @@
 package ebpf
 
 import (
+	"context"
 	"net/netip"
 	"time"
 
@@ -149,12 +150,9 @@ func (i *Inbound) v3DNSHintEnabled() bool {
 	if !po.Enabled {
 		return false
 	}
-	switch po.DNSIPHint {
-	case "safe", "strong":
-		return true
-	default:
-		return po.FakeIP
-	}
+	// FakeIP is a separate authoritative path.  It must not implicitly turn
+	// on real-DNS observation/promotion when dns_ip_hint is off.
+	return po.DNSIPHint == "safe" || po.DNSIPHint == "strong"
 }
 
 func (i *Inbound) v3FakeIPEnabled() bool {
@@ -335,6 +333,65 @@ func (i *Inbound) stopDNSPrefill() {
 	// No new callbacks can enter after unregistering; wait for admitted work so
 	// a restart cannot retain route/outbound references from the old lifecycle.
 	i.dnsPrefillWorkers.Wait()
+}
+
+// startDNSObservationMonitor drains the optional v3 TC DNS-response map. The
+// kernel only observes and queues answers; this bounded userspace loop remains
+// the authority for domain matching and DIRECT promotion. It is enabled only
+// when v3 DNS offload is explicitly active, so v2 and ordinary DNS paths pay
+// no extra goroutine or syscall cost.
+func (i *Inbound) startDNSObservationMonitor() {
+	if i == nil || i.dnsObserveCancel != nil || i.sharedNetwork == nil || !i.sharedNetwork.engineV3 || !i.v3DNSHintEnabled() {
+		return
+	}
+	if i.dnsPrefillRouter == nil || i.dnsPrefillOutbounds == nil || i.sharedNetwork.backend == nil {
+		return
+	}
+	parentCtx := i.ctx
+	if parentCtx == nil {
+		parentCtx = context.Background()
+	}
+	ctx, cancel := context.WithCancel(parentCtx)
+	done := make(chan struct{})
+	i.dnsObserveCancel = cancel
+	i.dnsObserveDone = done
+	go func() {
+		defer close(done)
+		ticker := time.NewTicker(3 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				observations, err := i.sharedNetwork.backend.DrainDNSObservations(128)
+				if err != nil {
+					if i.logger != nil {
+						i.logger.Debug("eBPF v3 DNS observation drain: ", err)
+					}
+					continue
+				}
+				for _, observation := range observations {
+					if i.dnsPrefillClosed.Load() {
+						return
+					}
+					i.dnsPrefillApply(i.Tag(), observation.Name, []netip.Addr{observation.Address}, i.directPromoteTTL(), i.dnsPrefillRouter, i.dnsPrefillOutbounds)
+				}
+			}
+		}
+	}()
+}
+
+func (i *Inbound) stopDNSObservationMonitor() {
+	if i == nil || i.dnsObserveCancel == nil {
+		return
+	}
+	i.dnsObserveCancel()
+	if i.dnsObserveDone != nil {
+		<-i.dnsObserveDone
+	}
+	i.dnsObserveCancel = nil
+	i.dnsObserveDone = nil
 }
 
 // filterPrefillAddresses drops invalid/private/dupes. Preserves first-seen order.

@@ -60,6 +60,10 @@ type SharedDataplane interface {
 	// bumping generation (incremental promote / dns_prefill).
 	MergeStaticDirect(prefix netip.Prefix) error
 	PublishDNSHint(addr netip.Addr, direct bool, evidence uint8, generation uint32, ttl time.Duration) error
+	// DrainDNSObservations removes a bounded batch of plaintext DNS answers
+	// captured by the v3 TC sniffer. v2 returns an empty batch. Domain policy
+	// evaluation and any DIRECT promotion remain in userspace.
+	DrainDNSObservations(max int) ([]ebpfv3.DNSObservation, error)
 	// PublishMACPolicies replaces the source-MAC identity snapshot (v3 only).
 	PublishMACPolicies(entries []ebpfv3.MACPolicyEntry) error
 	// DeleteMergedStaticDirect revokes one promote-sourced DIRECT prefix (v3 only).

@@ -52,7 +52,7 @@ static int v3_load_programs(
 	const uint8_t *object,
 	size_t object_size,
 	struct sb_ebpf_v3_runtime *runtime) {
-	struct sb_ebpf_object_map_entry entries[19];
+	struct sb_ebpf_object_map_entry entries[20];
 	struct sb_ebpf_object_map_table maps;
 	size_t n = 0;
 	entries[n++] = (struct sb_ebpf_object_map_entry){"v3_control", runtime->control_map_fd};
@@ -64,6 +64,7 @@ static int v3_load_programs(
 	entries[n++] = (struct sb_ebpf_object_map_entry){"v3_host6", runtime->host6_map_fd};
 	entries[n++] = (struct sb_ebpf_object_map_entry){"v3_flow_verdict", runtime->flow_map_fd};
 	entries[n++] = (struct sb_ebpf_object_map_entry){"v3_dns_ip_hint", runtime->dns_hint_map_fd};
+	entries[n++] = (struct sb_ebpf_object_map_entry){"v3_dns_observe", runtime->dns_observe_map_fd};
 	entries[n++] = (struct sb_ebpf_object_map_entry){"v3_source_mac", runtime->source_mac_map_fd};
 	entries[n++] = (struct sb_ebpf_object_map_entry){"v3_redirect", runtime->redirect_map_fd};
 	entries[n++] = (struct sb_ebpf_object_map_entry){"v3_listener_sockets", runtime->listener_map_fd};
@@ -145,6 +146,13 @@ int sb_ebpf_v3_prepare(
 		sizeof(struct sb_v3_dns_ip_value),
 		dns_hint_entries,
 		0U);
+	stage = "create dns observation map";
+	runtime->dns_observe_map_fd = sb_ebpf_create_map(
+		BPF_MAP_TYPE_LRU_HASH,
+		sizeof(struct sb_v3_dns_obs_key),
+		sizeof(struct sb_v3_dns_obs_value),
+		SB_V3_MAX_DNS_OBSERVATIONS,
+		0U);
 	stage = "create source mac map";
 	runtime->source_mac_map_fd = sb_ebpf_create_map(
 		BPF_MAP_TYPE_HASH,
@@ -178,7 +186,7 @@ int sb_ebpf_v3_prepare(
 	    runtime->policy4_bank1_fd < 0 || runtime->policy6_bank0_fd < 0 ||
 	    runtime->policy6_bank1_fd < 0 || runtime->host4_map_fd < 0 ||
 	    runtime->host6_map_fd < 0 || runtime->flow_map_fd < 0 ||
-	    runtime->dns_hint_map_fd < 0 || runtime->source_mac_map_fd < 0 ||
+	    runtime->dns_hint_map_fd < 0 || runtime->dns_observe_map_fd < 0 || runtime->source_mac_map_fd < 0 ||
 	    runtime->redirect_map_fd < 0 || runtime->listener_map_fd < 0 ||
 	    runtime->stats_map_fd < 0) {
 		goto fail;
@@ -214,6 +222,7 @@ int sb_ebpf_v3_close(struct sb_ebpf_v3_runtime *runtime) {
 	CLOSE_V3(runtime->redirect_map_fd);
 	CLOSE_V3(runtime->source_mac_map_fd);
 	CLOSE_V3(runtime->dns_hint_map_fd);
+	CLOSE_V3(runtime->dns_observe_map_fd);
 	CLOSE_V3(runtime->flow_map_fd);
 	CLOSE_V3(runtime->host6_map_fd);
 	CLOSE_V3(runtime->host4_map_fd);
