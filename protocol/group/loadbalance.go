@@ -44,8 +44,10 @@ var (
 )
 
 const (
-	// StrategyRandom is the Surge-compatible default: choose uniformly from
-	// the currently available members for each new connection.
+	// StrategyRandom picks uniformly from the currently available members per
+	// connection. The Surge-compatible default is StrategyConsistentHashing
+	// (per-destination host affinity); StrategyRandom must be requested
+	// explicitly.
 	StrategyRandom            = "random"
 	StrategyRoundRobin        = "round-robin"
 	StrategyConsistentHashing = "consistent-hashing"
@@ -83,7 +85,9 @@ type LoadBalance struct {
 func NewLoadBalance(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.LoadBalanceOutboundOptions) (adapter.Outbound, error) {
 	strategy := options.Strategy
 	if strategy == "" {
-		strategy = StrategyRandom
+		// Surge's load-balance default is per-destination host affinity (the
+		// same target host keeps the same outbound), not per-connection random.
+		strategy = StrategyConsistentHashing
 	}
 	switch strategy {
 	case StrategyRandom, StrategyRoundRobin, StrategyConsistentHashing, StrategyStickySessions:
@@ -174,7 +178,10 @@ func (s *LoadBalance) Close() error {
 }
 
 func (s *LoadBalance) Now() string {
-	return ""
+	if s.group == nil {
+		return ""
+	}
+	return s.group.LastUsedTag()
 }
 
 func (s *LoadBalance) All() []string {
@@ -368,6 +375,19 @@ type LoadBalanceGroup struct {
 	started                      bool
 	lastActive                   common.TypedValue[time.Time]
 	strategyFn                   strategyFn
+	// snapshotCache is rebuilt only in replaceOutbounds; strategy functions
+	// read it per dial without paying a slice copy.
+	snapshotCache []adapter.Outbound
+	lastUsedTag   atomic.Pointer[string]
+}
+
+// LastUsedTag reports the member the strategy last handed out, for the
+// dashboard "now" view of a group that has no single selected outbound.
+func (g *LoadBalanceGroup) LastUsedTag() string {
+	if tag := g.lastUsedTag.Load(); tag != nil {
+		return *tag
+	}
+	return ""
 }
 
 func NewLoadBalanceGroup(ctx context.Context, outboundManager adapter.OutboundManager, logger log.Logger, outbounds []adapter.Outbound, link string, interval time.Duration, idleTimeout time.Duration, ttl time.Duration, interruptExternalConnections bool, strategy string, persistent bool) (*LoadBalanceGroup, error) {
@@ -395,6 +415,7 @@ func NewLoadBalanceGroup(ctx context.Context, outboundManager adapter.OutboundMa
 		outbound:                     outboundManager,
 		logger:                       logger,
 		outbounds:                    outbounds,
+		snapshotCache:                append([]adapter.Outbound(nil), outbounds...),
 		link:                         link,
 		interval:                     interval,
 		idleTimeout:                  idleTimeout,
@@ -552,31 +573,56 @@ func (g *LoadBalanceGroup) urlTest(ctx context.Context, force bool) (map[string]
 	return result, nil
 }
 
+// outboundsSnapshot returns the cached member list. Callers must treat it as
+// read-only; the slice is shared and only replaced wholesale in
+// replaceOutbounds.
 func (g *LoadBalanceGroup) outboundsSnapshot() []adapter.Outbound {
 	g.outboundsAccess.RLock()
 	defer g.outboundsAccess.RUnlock()
-	return append([]adapter.Outbound(nil), g.outbounds...)
+	if g.snapshotCache != nil {
+		return g.snapshotCache
+	}
+	return g.outbounds
 }
 
 func (g *LoadBalanceGroup) replaceOutbounds(outbounds []adapter.Outbound) {
 	g.outboundsAccess.Lock()
-	g.outbounds = append([]adapter.Outbound(nil), outbounds...)
+	g.snapshotCache = append([]adapter.Outbound(nil), outbounds...)
+	g.outbounds = g.snapshotCache
 	g.outboundsAccess.Unlock()
 }
 
 func (g *LoadBalanceGroup) Unwrap(metadata *adapter.InboundContext, touch bool) adapter.Outbound {
-	return g.strategyFn(metadata, touch, nil)
+	outbound := g.strategyFn(metadata, touch, nil)
+	if outbound != nil {
+		tag := outbound.Tag()
+		g.lastUsedTag.Store(&tag)
+	}
+	return outbound
 }
 
 func (g *LoadBalanceGroup) UnwrapPreMatch(metadata *adapter.InboundContext, matcher outboundMatcher) adapter.Outbound {
 	return g.strategyFn(metadata, true, matcher)
 }
 
+// AliveForTestUrl trusts a member only while its last benchmark is fresh
+// (within the check interval). A stale entry describes a node that may have
+// died since; Surge re-benchmarks before trusting it again. Untested members
+// are not alive here — strategies keep their own recovery fallbacks.
 func (g *LoadBalanceGroup) AliveForTestUrl(proxy adapter.Outbound) bool {
 	if history := g.history.LoadURLTestHistory(RealTag(g.outbound, proxy)); history != nil {
-		return true
+		// A zero Time never occurs in production (StoreURLTestHistory stamps
+		// now); treat it as plain tested for hand-built storages.
+		return history.Time.IsZero() || time.Since(history.Time) < g.alivenessWindow()
 	}
 	return false
+}
+
+func (g *LoadBalanceGroup) alivenessWindow() time.Duration {
+	if g.interval > 0 {
+		return g.interval
+	}
+	return C.DefaultURLTestInterval
 }
 
 func (g *LoadBalanceGroup) nextFallback(touch bool, matcher outboundMatcher) adapter.Outbound {
@@ -587,13 +633,13 @@ func (g *LoadBalanceGroup) nextFallback(touch bool, matcher outboundMatcher) ada
 	if length == 0 {
 		return nil
 	}
-	nextIndex := g.fallbackIdx.Load() + 1
+	nextIndex := g.fallbackIdx.Load()
+	if matcher == nil || touch {
+		g.fallbackIdx.Store(nextIndex + 1)
+	}
 	outbound := outbounds[int(nextIndex)%length]
 	if matcher != nil && !matcher(outbound) {
 		return nil
-	}
-	if matcher == nil || touch {
-		g.fallbackIdx.Store(nextIndex)
 	}
 	return outbound
 }
@@ -779,7 +825,9 @@ func strategyHashing(g *LoadBalanceGroup, url string, fullHost bool) strategyFn 
 				}
 				return proxy
 			}
-			key++
+			// A golden-ratio stride guarantees a different probe sequence per
+			// retry; key+1 can re-select the same dead bucket.
+			key += uint64(i+1) * 0x9e3779b97f4a7c15
 		}
 
 		// when availability is poor, traverse the entire list to get the available nodes
