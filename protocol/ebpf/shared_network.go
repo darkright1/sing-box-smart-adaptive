@@ -720,6 +720,7 @@ func (s *sharedNetwork) revokeV3Promotion(addr netip.Addr) {
 	if !s.engineV3 || s.v3 == nil || !addr.IsValid() {
 		return
 	}
+	addr = addr.Unmap()
 	s.v3PromoteAccess.Lock()
 	defer s.v3PromoteAccess.Unlock()
 	_, tracked := s.v3Promoted[addr]
