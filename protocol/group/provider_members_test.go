@@ -45,6 +45,7 @@ func (p *fakeProvider) UnregisterCallback(element *blist.Element[adapter.Provide
 
 type fakeProviderManager struct {
 	providers []adapter.Provider
+	callbacks blist.List[adapter.ProviderManagerUpdateCallback]
 }
 
 func (m *fakeProviderManager) Providers() []adapter.Provider        { return m.providers }
@@ -63,6 +64,24 @@ func (m *fakeProviderManager) Get(tag string) (adapter.Provider, bool) {
 		}
 	}
 	return nil, false
+}
+
+func (m *fakeProviderManager) RegisterProviderCallback(callback adapter.ProviderManagerUpdateCallback) *blist.Element[adapter.ProviderManagerUpdateCallback] {
+	return m.callbacks.PushBack(callback)
+}
+
+func (m *fakeProviderManager) UnregisterProviderCallback(element *blist.Element[adapter.ProviderManagerUpdateCallback]) {
+	m.callbacks.Remove(element)
+}
+
+func (m *fakeProviderManager) notifyProviderUpdate() {
+	callbacks := make([]adapter.ProviderManagerUpdateCallback, 0, m.callbacks.Len())
+	for element := m.callbacks.Front(); element != nil; element = element.Next() {
+		callbacks = append(callbacks, element.Value)
+	}
+	for _, callback := range callbacks {
+		callback()
+	}
 }
 
 type providerTestNode struct {
@@ -165,6 +184,39 @@ func TestGroupProviderSourceCloseUnregistersCallbacks(t *testing.T) {
 		if got := provider.(*fakeProvider).callbacks.Len(); got != 0 {
 			t.Fatalf("callbacks after close=%d, want 0", got)
 		}
+	}
+}
+
+func TestGroupProviderSourceTracksUseAllProviderChanges(t *testing.T) {
+	source, manager := newTestProviderSource(t, option.GroupCommonOption{UseAllProviders: true})
+	var updates int
+	if err := source.register(func(string) error {
+		updates++
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, members := source.memberOutbounds(""); len(members) != 4 {
+		t.Fatalf("initial members=%d, want 4", len(members))
+	}
+	manager.providers = append(manager.providers, &fakeProvider{tag: "prov-c", nodes: []adapter.Outbound{
+		&providerTestNode{tag: "SG-新加坡 01"},
+	}})
+	manager.notifyProviderUpdate()
+	if _, members := source.memberOutbounds(""); len(members) != 5 {
+		t.Fatalf("members after provider add=%d, want 5", len(members))
+	}
+	if updates != 1 {
+		t.Fatalf("group updates=%d, want 1", updates)
+	}
+	manager.providers = manager.providers[:2]
+	manager.notifyProviderUpdate()
+	if _, members := source.memberOutbounds(""); len(members) != 4 {
+		t.Fatalf("members after provider removal=%d, want 4", len(members))
+	}
+	source.close()
+	if manager.callbacks.Len() != 0 {
+		t.Fatalf("manager callbacks after close=%d, want 0", manager.callbacks.Len())
 	}
 }
 

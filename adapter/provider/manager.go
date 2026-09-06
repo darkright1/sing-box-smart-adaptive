@@ -13,9 +13,11 @@ import (
 	"github.com/sagernet/sing/common"
 	E "github.com/sagernet/sing/common/exceptions"
 	"github.com/sagernet/sing/common/logger"
+	"github.com/sagernet/sing/common/x/list"
 )
 
 var _ adapter.ProviderManager = (*Manager)(nil)
+var _ adapter.ProviderManagerObserver = (*Manager)(nil)
 
 type Manager struct {
 	ctx           context.Context
@@ -26,6 +28,7 @@ type Manager struct {
 	stage         adapter.StartStage
 	providers     []adapter.Provider
 	providerByTag map[string]adapter.Provider
+	callbacks     list.List[adapter.ProviderManagerUpdateCallback]
 }
 
 func NewManager(ctx context.Context, logger logger.ContextLogger, registry adapter.ProviderRegistry) *Manager {
@@ -94,7 +97,31 @@ func (m *Manager) Close() error {
 func (m *Manager) Providers() []adapter.Provider {
 	m.access.Lock()
 	defer m.access.Unlock()
-	return m.providers
+	return append([]adapter.Provider(nil), m.providers...)
+}
+
+func (m *Manager) RegisterProviderCallback(callback adapter.ProviderManagerUpdateCallback) *list.Element[adapter.ProviderManagerUpdateCallback] {
+	m.access.Lock()
+	defer m.access.Unlock()
+	return m.callbacks.PushBack(callback)
+}
+
+func (m *Manager) UnregisterProviderCallback(element *list.Element[adapter.ProviderManagerUpdateCallback]) {
+	m.access.Lock()
+	defer m.access.Unlock()
+	m.callbacks.Remove(element)
+}
+
+func (m *Manager) notifyProviderCallbacks() {
+	m.access.Lock()
+	callbacks := make([]adapter.ProviderManagerUpdateCallback, 0, m.callbacks.Len())
+	for element := m.callbacks.Front(); element != nil; element = element.Next() {
+		callbacks = append(callbacks, element.Value)
+	}
+	m.access.Unlock()
+	for _, callback := range callbacks {
+		callback()
+	}
 }
 
 func (m *Manager) Get(tag string) (adapter.Provider, bool) {
@@ -121,6 +148,7 @@ func (m *Manager) Remove(tag string) error {
 	m.providers = append(m.providers[:index], m.providers[index+1:]...)
 	started := m.started
 	m.access.Unlock()
+	m.notifyProviderCallbacks()
 	if started {
 		return common.Close(provider)
 	}
@@ -137,7 +165,6 @@ func (m *Manager) Create(ctx context.Context, router adapter.Router, logFactory 
 		return err
 	}
 	m.access.Lock()
-	defer m.access.Unlock()
 	if m.started {
 		if m.stage >= adapter.StartStateStart {
 			if contextStarter, ok := provider.(interface {
@@ -147,6 +174,8 @@ func (m *Manager) Create(ctx context.Context, router adapter.Router, logFactory 
 				err = contextStarter.StartContext(m.ctx, startContext)
 				startContext.Close()
 				if err != nil {
+					m.access.Unlock()
+					_ = common.Close(provider)
 					return E.Cause(err, "start provider/", provider.Type(), "[", provider.Tag(), "]")
 				}
 			}
@@ -156,6 +185,8 @@ func (m *Manager) Create(ctx context.Context, router adapter.Router, logFactory 
 		if m.started {
 			err = common.Close(existsProvider)
 			if err != nil {
+				m.access.Unlock()
+				_ = common.Close(provider)
 				return E.Cause(err, "close provider", provider.Type(), "[", existsProvider.Tag(), "]")
 			}
 		}
@@ -169,5 +200,7 @@ func (m *Manager) Create(ctx context.Context, router adapter.Router, logFactory 
 	}
 	m.providers = append(m.providers, provider)
 	m.providerByTag[tag] = provider
+	m.access.Unlock()
+	m.notifyProviderCallbacks()
 	return nil
 }

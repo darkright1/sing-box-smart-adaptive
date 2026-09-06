@@ -76,6 +76,19 @@ type ProviderManager interface {
 	Create(ctx context.Context, router Router, logFactory log.Factory, tag string, providerType string, options any) error
 }
 
+// ProviderManagerUpdateCallback is emitted after the provider set changes
+// (create, replace, or remove). It is intentionally separate from
+// ProviderUpdateCallback, which reports an existing provider's outbound list.
+type ProviderManagerUpdateCallback func()
+
+// ProviderManagerObserver is an optional extension implemented by managers
+// that can report provider-set changes. Consumers must treat it as optional so
+// test doubles and external managers remain source-compatible.
+type ProviderManagerObserver interface {
+	RegisterProviderCallback(callback ProviderManagerUpdateCallback) *list.Element[ProviderManagerUpdateCallback]
+	UnregisterProviderCallback(element *list.Element[ProviderManagerUpdateCallback])
+}
+
 type SubscriptionInfo struct {
 	Upload   int64
 	Download int64

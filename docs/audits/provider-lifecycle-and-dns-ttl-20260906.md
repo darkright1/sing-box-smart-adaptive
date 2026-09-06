@@ -21,11 +21,12 @@
 
 ## Deliberate boundaries
 
-`use_all_providers` observes providers present when the group is reconciled.
-The current ProviderManager interface has no provider-created callback, so a
-new provider is picked up on the next group reconciliation/update rather than
-through an invented polling goroutine. Domain matching remains userspace
-authoritative; the TC sniffer is advisory and fail-open.
+`use_all_providers` subscribes to the optional ProviderManager observer when
+available, so create/replace/remove is reconciled without a polling goroutine.
+External managers that do not implement the optional observer retain their
+snapshot semantics and are refreshed on the next group reconciliation. Domain
+matching remains userspace authoritative; the TC sniffer is advisory and
+fail-open.
 
 ## Verification
 

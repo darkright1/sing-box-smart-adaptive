@@ -52,6 +52,9 @@ type groupProviderSource struct {
 	include         *regexp.Regexp
 	outboundsCache  map[string][]adapter.Outbound
 	handles         map[string]*list.Element[adapter.ProviderUpdateCallback]
+	managerObserver adapter.ProviderManagerObserver
+	managerHandle   *list.Element[adapter.ProviderManagerUpdateCallback]
+	callback        adapter.ProviderUpdateCallback
 	access          sync.Mutex
 	registered      bool
 	closed          bool
@@ -132,8 +135,77 @@ func (s *groupProviderSource) register(callback adapter.ProviderUpdateCallback) 
 		s.handles[tag] = provider.RegisterCallback(callback)
 	}
 	s.providerTags = providerTags
+	s.callback = callback
+	if s.useAllProviders {
+		if observer, ok := s.manager.(adapter.ProviderManagerObserver); ok {
+			s.managerObserver = observer
+			s.managerHandle = observer.RegisterProviderCallback(s.onProviderManagerUpdated)
+		}
+	}
 	s.registered = true
 	return nil
+}
+
+// onProviderManagerUpdated reconciles use_all_providers without polling. The
+// manager callback only reports a set change; outbound-list changes continue
+// to use each provider's existing callback.
+func (s *groupProviderSource) onProviderManagerUpdated() {
+	if s == nil {
+		return
+	}
+	s.access.Lock()
+	if s.closed || !s.registered || !s.useAllProviders || s.manager == nil {
+		s.access.Unlock()
+		return
+	}
+	desired := make(map[string]adapter.Provider)
+	var providerTags []string
+	for _, provider := range s.manager.Providers() {
+		if provider == nil || provider.Tag() == "" {
+			continue
+		}
+		tag := provider.Tag()
+		if _, exists := desired[tag]; exists {
+			continue
+		}
+		desired[tag] = provider
+		providerTags = append(providerTags, tag)
+	}
+	var removedProviders []adapter.Provider
+	var removedHandles []*list.Element[adapter.ProviderUpdateCallback]
+	changed := false
+	for tag, provider := range s.providers {
+		desiredProvider, exists := desired[tag]
+		if exists && desiredProvider == provider {
+			continue
+		}
+		removedProviders = append(removedProviders, provider)
+		removedHandles = append(removedHandles, s.handles[tag])
+		delete(s.providers, tag)
+		delete(s.handles, tag)
+		delete(s.outboundsCache, tag)
+		changed = true
+	}
+	for _, tag := range providerTags {
+		if _, exists := s.providers[tag]; exists {
+			continue
+		}
+		provider := desired[tag]
+		s.providers[tag] = provider
+		s.handles[tag] = provider.RegisterCallback(s.callback)
+		changed = true
+	}
+	s.providerTags = providerTags
+	callback := s.callback
+	s.access.Unlock()
+	for index, provider := range removedProviders {
+		if provider != nil && removedHandles[index] != nil {
+			provider.UnregisterCallback(removedHandles[index])
+		}
+	}
+	if changed && callback != nil {
+		_ = callback("")
+	}
 }
 
 func (s *groupProviderSource) hasProvider(tag string) bool {
@@ -161,6 +233,8 @@ func (s *groupProviderSource) close() {
 	s.registered = false
 	providers := make(map[string]adapter.Provider, len(s.providers))
 	handles := make(map[string]*list.Element[adapter.ProviderUpdateCallback], len(s.handles))
+	managerObserver := s.managerObserver
+	managerHandle := s.managerHandle
 	for tag, provider := range s.providers {
 		providers[tag] = provider
 	}
@@ -168,7 +242,13 @@ func (s *groupProviderSource) close() {
 		handles[tag] = handle
 	}
 	clear(s.handles)
+	s.managerObserver = nil
+	s.managerHandle = nil
+	s.callback = nil
 	s.access.Unlock()
+	if managerObserver != nil && managerHandle != nil {
+		managerObserver.UnregisterProviderCallback(managerHandle)
+	}
 	for tag, handle := range handles {
 		if provider := providers[tag]; provider != nil && handle != nil {
 			provider.UnregisterCallback(handle)
