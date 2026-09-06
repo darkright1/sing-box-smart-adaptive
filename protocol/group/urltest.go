@@ -4,6 +4,7 @@ import (
 	"context"
 	"maps"
 	"net"
+	"slices"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -52,6 +53,8 @@ type URLTest struct {
 	connection                   adapter.ConnectionManager
 	logger                       log.ContextLogger
 	tags                         []string
+	baseTags                     []string
+	providerSource               *groupProviderSource
 	link                         string
 	interval                     time.Duration
 	tolerance                    uint16
@@ -69,6 +72,8 @@ func NewURLTest(ctx context.Context, router adapter.Router, logger log.ContextLo
 		connection:                   service.FromContext[adapter.ConnectionManager](ctx),
 		logger:                       logger,
 		tags:                         options.Outbounds,
+		baseTags:                     options.Outbounds,
+		providerSource:               newGroupProviderSource(ctx, options.GroupCommonOption),
 		link:                         options.URL,
 		interval:                     time.Duration(options.Interval),
 		tolerance:                    options.Tolerance,
@@ -83,12 +88,24 @@ func NewURLTest(ctx context.Context, router adapter.Router, logger log.ContextLo
 
 func (s *URLTest) Start() error {
 	outbounds := make([]adapter.Outbound, 0, len(s.tags))
-	for i, tag := range s.tags {
+	for i, tag := range s.baseTags {
 		detour, loaded := s.outbound.Outbound(tag)
 		if !loaded {
 			return E.New("outbound ", i, " not found: ", tag)
 		}
 		outbounds = append(outbounds, detour)
+	}
+	if s.providerSource.has() {
+		if err := s.providerSource.register(s.onProviderUpdated); err != nil {
+			return err
+		}
+		_, providerMembers := s.providerSource.memberOutbounds("")
+		for _, member := range providerMembers {
+			if !slices.Contains(s.tags, member.Tag()) {
+				s.tags = append(s.tags, member.Tag())
+			}
+		}
+		outbounds = append(outbounds, providerMembers...)
 	}
 	group, err := NewURLTestGroup(s.ctx, s.outbound, s.logger, outbounds, s.link, s.interval, s.tolerance, s.idleTimeout, s.interruptExternalConnections)
 	if err != nil {
@@ -172,6 +189,27 @@ func (s *URLTest) DashboardURLTest(ctx context.Context) (map[string]uint16, erro
 
 func (s *URLTest) CheckOutbounds() {
 	s.group.CheckOutbounds(s.ctx, true)
+}
+
+func (s *URLTest) onProviderUpdated(tag string) error {
+	if !s.providerSource.has() {
+		return E.New("outbound provider not found: ", tag)
+	}
+	if _, ok := s.providerSource.providers[tag]; !ok {
+		return E.New("outbound provider not found: ", tag)
+	}
+	_, members := s.providerSource.memberOutbounds(tag)
+	s.tags = common.Uniq(append(append([]string(nil), s.baseTags...), common.Map(members, func(m adapter.Outbound) string { return m.Tag() })...))
+	outbounds := make([]adapter.Outbound, 0, len(s.baseTags)+len(members))
+	for _, baseTag := range s.baseTags {
+		if detour, loaded := s.outbound.Outbound(baseTag); loaded {
+			outbounds = append(outbounds, detour)
+		}
+	}
+	outbounds = append(outbounds, members...)
+	s.group.replaceOutbounds(outbounds)
+	go s.group.CheckOutbounds(s.ctx, true)
+	return nil
 }
 
 func (s *URLTest) InterfaceUpdated(ctx context.Context) {
@@ -703,6 +741,12 @@ func (b *urlTestBatch) test(outbounds []adapter.Outbound, link string, interval 
 			})
 		}
 	}
+}
+
+func (g *URLTestGroup) replaceOutbounds(outbounds []adapter.Outbound) {
+	g.access.Lock()
+	defer g.access.Unlock()
+	g.outbounds = append([]adapter.Outbound(nil), outbounds...)
 }
 
 func (g *URLTestGroup) performUpdateCheck() {

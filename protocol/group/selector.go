@@ -38,8 +38,10 @@ type Selector struct {
 	connection                   adapter.ConnectionManager
 	logger                       logger.ContextLogger
 	tags                         []string
+	baseTags                     []string
 	defaultTag                   string
 	outbounds                    map[string]adapter.Outbound
+	providerSource               *groupProviderSource
 	selected                     common.TypedValue[adapter.Outbound]
 	history                      *urltest.HistoryStorage
 	interruptGroup               *interrupt.Group
@@ -54,7 +56,9 @@ func NewSelector(ctx context.Context, router adapter.Router, logger log.ContextL
 		connection:                   service.FromContext[adapter.ConnectionManager](ctx),
 		logger:                       logger,
 		tags:                         options.Outbounds,
+		baseTags:                     options.Outbounds,
 		defaultTag:                   options.Default,
+		providerSource:               newGroupProviderSource(ctx, options.GroupCommonOption),
 		outbounds:                    make(map[string]adapter.Outbound),
 		history:                      service.PtrFromContext[urltest.HistoryStorage](ctx),
 		interruptGroup:               interrupt.NewGroup(),
@@ -75,12 +79,18 @@ func (s *Selector) Network() []string {
 }
 
 func (s *Selector) Start() error {
-	for i, tag := range s.tags {
+	for i, tag := range s.baseTags {
 		detour, loaded := s.outbound.Outbound(tag)
 		if !loaded {
 			return E.New("outbound ", i, " not found: ", tag)
 		}
 		s.outbounds[tag] = detour
+	}
+	if s.providerSource.has() {
+		if err := s.providerSource.register(s.onProviderUpdated); err != nil {
+			return err
+		}
+		s.tags = appendProviderMembers(s.baseTags, s.outbounds, s.providerSource, "")
 	}
 
 	if s.Tag() != "" {
@@ -107,6 +117,26 @@ func (s *Selector) Start() error {
 	}
 
 	s.selected.Store(s.outbounds[s.tags[0]])
+	return nil
+}
+
+func (s *Selector) onProviderUpdated(tag string) error {
+	if !s.providerSource.has() {
+		return E.New("outbound provider not found: ", tag)
+	}
+	if _, ok := s.providerSource.providers[tag]; !ok {
+		return E.New("outbound provider not found: ", tag)
+	}
+	s.tags = appendProviderMembers(s.baseTags, s.outbounds, s.providerSource, tag)
+	// A provider refresh may remove the selected node; fall back to the
+	// default/first member in that case.
+	if s.selected.Load() == nil {
+		if len(s.tags) > 0 {
+			if detour, loaded := s.outbounds[s.tags[0]]; loaded {
+				s.selected.Store(detour)
+			}
+		}
+	}
 	return nil
 }
 
