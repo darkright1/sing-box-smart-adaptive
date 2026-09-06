@@ -1,13 +1,13 @@
 # sing-box-smart-adaptive
 
-基于 **[SagerNet/sing-box](https://github.com/SagerNet/sing-box)** 官方 `v1.14.0-beta.17` 的定制核心。
+基于 **[SagerNet/sing-box](https://github.com/SagerNet/sing-box)** 官方 1.14 稳定线(基线 `v1.14.9` 之后,当前发布 `v1.14.x`)的定制核心。
 
 **策略：纯官方基底 + 自有一等公民能力，不做 reF1nd 整树覆盖。**
 
 | | |
 |--|--|
-| **当前线** | `adaptive/official-beta17` |
-| **版本串** | `1.14.0-beta.17-official-smart-ebpf-perf` |
+| **当前线** | `adaptive/official-v1.14.0-smart-ebpf`(官方 1.14 稳定线) |
+| **版本串** | `1.14.x-official-smart-ebpf`(当前 v1.14.15) |
 | **上游** | [SagerNet/sing-box](https://github.com/SagerNet/sing-box) |
 | **许可** | GPL-3.0（同上游） |
 
@@ -85,7 +85,7 @@ PBR 场景下：**进进程的几乎全是代理**；CN 靠 **TC 静态 bypass +
 TAGS="with_gvisor,with_quic,with_dhcp,with_wireguard,with_utls,with_acme,with_clash_api,with_connection_history,with_tailscale,with_ccm,with_ocm,with_cloudflared,with_usbip,with_openvpn,with_openconnect,with_ebpf"
 
 CGO_ENABLED=1 go build -tags "$TAGS" -trimpath \
-  -ldflags "-s -w -X github.com/sagernet/sing-box/constant.Version=1.14.0-beta.17-official-smart-ebpf-perf" \
+  -ldflags "-s -w -X github.com/sagernet/sing-box/constant.Version=1.14.15" \
   -o sing-box ./cmd/sing-box
 ```
 
@@ -123,7 +123,7 @@ git clone --depth 1 https://github.com/luange/sing-box-smart-adaptive.git
 
 | 分支 | 说明 |
 |------|------|
-| `adaptive/official-beta17` | **当前推荐**（纯 beta.17 + 自有能力） |
+| `adaptive/official-v1.14.0-smart-ebpf` | **当前推荐**（官方 1.14 稳定线 + 自有能力） |
 | `main` | 与推荐线同步（推送后） |
 
 ---

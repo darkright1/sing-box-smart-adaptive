@@ -89,7 +89,9 @@ Expiry unlinks immutable segments, so deleted history immediately returns disk s
 
 ### eBPF splice (proxy zero-copy)
 Requires kernel sockmap. Config on eBPF inbound `outbound_offload.splice`.
-Default on 115 keeps splice disabled for stability; path is fully wired when enabled
+Default on 115 keeps splice disabled for stability; path is fully wired when enabled.
+(Baseline note: this branch has since moved to the official 1.14 stable line,
+post-v1.14.9; current release is v1.14.15.)
 (ConnectionManager → SplicerHub → inbound coordinator).
 
 ### loadbalance / pass / adaptive_pool
