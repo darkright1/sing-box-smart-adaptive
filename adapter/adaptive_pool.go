@@ -12,46 +12,46 @@ var (
 )
 
 type AdaptiveCandidateStatus struct {
-	NodeID                string                    `json:"node_id"`
-	EndpointID            string                    `json:"endpoint_id,omitempty"`
-	EndpointConflictCount int                       `json:"endpoint_conflict_count,omitempty"`
-	NodeSlot              uint64                    `json:"node_slot"`
-	NodeVersion           uint64                    `json:"node_version"`
-	Tag                   string                    `json:"tag"`
-	Weight                float64                   `json:"weight,omitempty"`
-	WeightRule            string                    `json:"weight_rule,omitempty"`
-	WeightRuleExact       bool                      `json:"weight_rule_exact,omitempty"`
-	Aliases               []string                  `json:"aliases,omitempty"`
-	IdentityStable        bool                      `json:"identity_stable"`
-	State                 string                    `json:"state"`
-	Health                string                    `json:"health"`
-	Breaker               string                    `json:"breaker"`
-	LastProbeAt           time.Time                 `json:"last_probe_at,omitempty"`
-	LastProbeDelay        uint32                    `json:"last_probe_delay,omitempty"`
-	SmoothedDelay         uint32                    `json:"smoothed_delay,omitempty"`
-	DelaySamples          int                       `json:"delay_samples,omitempty"`
-	BackoffMs             uint32                    `json:"backoff_ms,omitempty"`
-	ConsecutiveFailures   int                       `json:"consecutive_failures,omitempty"`
-	ThroughputBPS         float64                   `json:"throughput_bps,omitempty"`
-	ThroughputSamples     uint64                    `json:"throughput_samples,omitempty"`
-	Successes             uint64                    `json:"successes,omitempty"`
-	Failures              uint64                    `json:"failures,omitempty"`
-	RecoverySuccesses     int                       `json:"recovery_successes,omitempty"`
-	EvidenceWeight        float64                   `json:"evidence_weight,omitempty"`
-	OpenUntil             time.Time                 `json:"open_until,omitempty"`
-	Reason                string                    `json:"reason,omitempty"`
-	HealthPriority        int                       `json:"health_priority,omitempty"`
-	ObservedDelay         uint32                    `json:"observed_delay,omitempty"`
-	WeightedDelay         uint32                    `json:"weighted_delay,omitempty"`
-	SelectionScore        uint64                    `json:"selection_score,omitempty"`
-	DominantEvidence      string                    `json:"dominant_evidence,omitempty"`
-	FilterReason          string                    `json:"filter_reason,omitempty"`
-	FilterReasons         []string                  `json:"filter_reasons,omitempty"`
-	LastFailure           string                    `json:"last_failure,omitempty"`
-	LastFailureService    string                    `json:"last_failure_service,omitempty"`
-	LastFailurePath       string                    `json:"last_failure_path,omitempty"`
-	LastSelectionReason   string                    `json:"last_selection_reason,omitempty"`
-	LastSelectionService  string                    `json:"last_selection_service,omitempty"`
+	NodeID                string    `json:"node_id"`
+	EndpointID            string    `json:"endpoint_id,omitempty"`
+	EndpointConflictCount int       `json:"endpoint_conflict_count,omitempty"`
+	NodeSlot              uint64    `json:"node_slot"`
+	NodeVersion           uint64    `json:"node_version"`
+	Tag                   string    `json:"tag"`
+	Weight                float64   `json:"weight,omitempty"`
+	WeightRule            string    `json:"weight_rule,omitempty"`
+	WeightRuleExact       bool      `json:"weight_rule_exact,omitempty"`
+	Aliases               []string  `json:"aliases,omitempty"`
+	IdentityStable        bool      `json:"identity_stable"`
+	State                 string    `json:"state"`
+	Health                string    `json:"health"`
+	Breaker               string    `json:"breaker"`
+	LastProbeAt           time.Time `json:"last_probe_at,omitempty"`
+	LastProbeDelay        uint32    `json:"last_probe_delay,omitempty"`
+	SmoothedDelay         uint32    `json:"smoothed_delay,omitempty"`
+	DelaySamples          int       `json:"delay_samples,omitempty"`
+	BackoffMs             uint32    `json:"backoff_ms,omitempty"`
+	ConsecutiveFailures   int       `json:"consecutive_failures,omitempty"`
+	ThroughputBPS         float64   `json:"throughput_bps,omitempty"`
+	ThroughputSamples     uint64    `json:"throughput_samples,omitempty"`
+	Successes             uint64    `json:"successes,omitempty"`
+	Failures              uint64    `json:"failures,omitempty"`
+	RecoverySuccesses     int       `json:"recovery_successes,omitempty"`
+	EvidenceWeight        float64   `json:"evidence_weight,omitempty"`
+	OpenUntil             time.Time `json:"open_until,omitempty"`
+	Reason                string    `json:"reason,omitempty"`
+	HealthPriority        int       `json:"health_priority,omitempty"`
+	ObservedDelay         uint32    `json:"observed_delay,omitempty"`
+	WeightedDelay         uint32    `json:"weighted_delay,omitempty"`
+	SelectionScore        uint64    `json:"selection_score,omitempty"`
+	DominantEvidence      string    `json:"dominant_evidence,omitempty"`
+	FilterReason          string    `json:"filter_reason,omitempty"`
+	FilterReasons         []string  `json:"filter_reasons,omitempty"`
+	LastFailure           string    `json:"last_failure,omitempty"`
+	LastFailureService    string    `json:"last_failure_service,omitempty"`
+	LastFailurePath       string    `json:"last_failure_path,omitempty"`
+	LastSelectionReason   string    `json:"last_selection_reason,omitempty"`
+	LastSelectionService  string    `json:"last_selection_service,omitempty"`
 	// ServiceMemories keeps recent per-service selection/failure notes so one
 	// service cannot erase another service's last outcome in the UI.
 	ServiceMemories []AdaptiveServiceMemory   `json:"service_memories,omitempty"`
@@ -61,12 +61,12 @@ type AdaptiveCandidateStatus struct {
 
 // AdaptiveServiceMemory is a per-service selection or failure snapshot.
 type AdaptiveServiceMemory struct {
-	ServiceID        string    `json:"service_id,omitempty"`
-	Path             string    `json:"path,omitempty"`
-	SelectionReason  string    `json:"selection_reason,omitempty"`
-	Failure          string    `json:"failure,omitempty"`
-	SelectedAt       time.Time `json:"selected_at,omitempty"`
-	FailedAt         time.Time `json:"failed_at,omitempty"`
+	ServiceID       string    `json:"service_id,omitempty"`
+	Path            string    `json:"path,omitempty"`
+	SelectionReason string    `json:"selection_reason,omitempty"`
+	Failure         string    `json:"failure,omitempty"`
+	SelectedAt      time.Time `json:"selected_at,omitempty"`
+	FailedAt        time.Time `json:"failed_at,omitempty"`
 }
 
 // AdaptiveNodeCapabilities is the partial-availability portrait used by

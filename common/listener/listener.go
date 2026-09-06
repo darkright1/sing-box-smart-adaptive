@@ -62,7 +62,7 @@ type Options struct {
 	TProxy                   bool
 	SocketControl            control.Func
 	// ForceNoMPTCP forces plain TCP for eBPF socket_assign / SOCKMAP.
-	ForceNoMPTCP             bool
+	ForceNoMPTCP bool
 }
 
 func New(
