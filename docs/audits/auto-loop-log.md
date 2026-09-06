@@ -398,3 +398,21 @@ promote/loader)审查完毕,连续三轮零新发现。
   注:用户环境无直连流量,本机不跑;工具供有直连占比的部署使用。
 - #26(build tag 诊断):已核实 sing-box version 输出 Tags/Revision/CGO,
   配置与二进制不匹配可一条命令定位,无需改代码。
+
+## 2026-09-06 IP 泛化缺陷修复 + v1.14.16 部署(用户指示:有问题就修)
+- 评审 #3 落地为真缺陷:MergeStaticDirect 晋升的 /32 写入活跃 bank 后无删除
+  路径;内核判决顺序 static 先于 dns hint,共享 IP 后到的代理证据只能标记
+  hint 层(永远赢不了 static)——错误旁路直到下次全量重发布。
+- 修复(共享 IP 泛化守卫):
+  * V3Backend/MemoryBackend 按 bank 记录 merge 来源前缀;新增
+    DeleteMergedStaticDirect,只撤销 merge 来源项,快照发布的 bypass 规则
+    受保护(不能被同址撤销误删);
+  * 全量发布重建 bank 时清空对应可撤销集合;
+  * Lifecycle.RevokeMergedStaticDirect 内核先行、模型随后;
+  * dns_prefill:同 IP 出现代理证据时自动撤回已晋升 /32(Info 日志)。
+- 测试:MemoryBackend 撤回/快照保护/发布清空 + Lifecycle 端到端撤回
+  (sink+model 双写验证),plain/race/smart_zig 全绿。
+- 关于"内核 domain 直连":dae 式全量内核域名分流需要规则编译器支持
+  suffix/keyword(正则无法内核化)+ 内核 DNS 嗅探建映射,属大架构工程;
+  当前学习式模型 + 本次冲突撤回已覆盖安全子集,暂不重建。
+- v1.14.16 部署 VM115/107,代理 302/0.14s,HK 组测 17/16 entries。
