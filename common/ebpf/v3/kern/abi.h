@@ -341,14 +341,14 @@ struct sb_v3_packet {
 	__u8 dmac[6];
 	__u32 ifindex;
 	__u32 mark;
-	/* TCP flags from the first byte of the TCP flags field.  XDP uses this
-	 * only to avoid redirecting established TCP; TC keeps the field purely
-	 * observational and does not change its ABI-visible decisions. */
-	__u8 tcp_flags;
 	/* Offset from frame start to the L4 header (parser). Observational
 	 * extensions (e.g. the DNS response sniffer) use it to reach the
 	 * payload without re-walking the frame. */
 	__u16 payload_offset;
+	/* TCP flags from the first byte of the TCP flags field.  XDP uses this
+	 * only to avoid redirecting established TCP; TC keeps the field purely
+	 * observational and does not change its ABI-visible decisions. */
+	__u8 tcp_flags;
 	__u8 reserved3[1];
 };
 
