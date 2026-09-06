@@ -164,7 +164,9 @@ type v3DNSObservationKey struct {
 }
 
 type v3DNSObservationValue struct {
-	Qname [ebpfv3.DNSObservationNameMax]byte
+	Qname      [ebpfv3.DNSObservationNameMax]byte
+	TTLSeconds uint32
+	Reserved0  uint32
 }
 
 type v3RedirectKey struct {
@@ -1333,7 +1335,7 @@ func (b *V3Backend) DrainDNSObservations(max int) ([]ebpfv3.DNSObservation, erro
 		if addrErr != nil || !addr.IsValid() || addr.IsUnspecified() || addr.IsLoopback() || addr.IsMulticast() {
 			continue
 		}
-		observations = append(observations, ebpfv3.DNSObservation{Name: name, Address: addr})
+		observations = append(observations, ebpfv3.DNSObservation{Name: name, Address: addr, TTLSeconds: value.TTLSeconds})
 	}
 	return observations, nil
 }

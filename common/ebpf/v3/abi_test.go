@@ -25,9 +25,13 @@ func TestABISizes(t *testing.T) {
 		Reserved1 uint16
 		Addr      [16]byte
 	}
-	type dnsObservationValue [DNSObservationNameMax]byte
+	type dnsObservationValue struct {
+		Qname      [DNSObservationNameMax]byte
+		TTLSeconds uint32
+		Reserved0  uint32
+	}
 	assertSize(t, "DNSObservationKey", unsafe.Sizeof(dnsObservationKey{}), 32)
-	assertSize(t, "DNSObservationValue", unsafe.Sizeof(dnsObservationValue{}), DNSObservationNameMax)
+	assertSize(t, "DNSObservationValue", unsafe.Sizeof(dnsObservationValue{}), DNSObservationNameMax+8)
 }
 
 func assertSize(t *testing.T, name string, got, want uintptr) {

@@ -668,9 +668,22 @@ func (s *sharedNetwork) observeV3DNS(addr netip.Addr, direct bool, evidence uint
 // promoteV3Direct installs a destination /32|/128 for first-packet kernel DIRECT:
 // DNS strong hint + active-bank static merge (no generation bump).
 func (s *sharedNetwork) promoteV3Direct(addr netip.Addr, ttl time.Duration) {
-	if s == nil || !s.engineV3 || s.backend == nil || !addr.IsValid() {
+	if s == nil {
 		return
 	}
+	if ttl <= 0 {
+		ttl = 5 * time.Minute
+	}
+	// Serialize promotion with Close, full static-bank publication, and expiry
+	// GC. The map and the live kernel bank must never disagree about whether a
+	// prefix is still revocable.
+	s.closeAccess.RLock()
+	defer s.closeAccess.RUnlock()
+	if !s.engineV3 || s.backend == nil || s.v3 == nil || !addr.IsValid() {
+		return
+	}
+	s.v3PromoteAccess.Lock()
+	defer s.v3PromoteAccess.Unlock()
 	addr = addr.Unmap()
 	bits := 32
 	if !addr.Is4() {
@@ -680,21 +693,17 @@ func (s *sharedNetwork) promoteV3Direct(addr netip.Addr, ttl time.Duration) {
 	// Evidence strong: dns_prefill / route already proved stable DIRECT.
 	s.observeV3DNS(addr, true, 2 /* DNSEvidenceStrong */, ttl)
 	var err error
-	if s.v3 != nil {
-		err = s.v3.MergeStaticDirect(prefix)
-	} else if s.backend != nil {
-		err = s.backend.MergeStaticDirect(prefix)
-	}
+	err = s.v3.MergeStaticDirect(prefix)
 	if err != nil {
-		s.parent.logger.Debug("eBPF v3 merge static direct: ", err)
+		if s.parent != nil && s.parent.logger != nil {
+			s.parent.logger.Debug("eBPF v3 merge static direct: ", err)
+		}
 		return
 	}
-	s.v3PromoteAccess.Lock()
 	if s.v3Promoted == nil {
 		s.v3Promoted = make(map[netip.Addr]time.Time)
 	}
 	s.v3Promoted[addr] = time.Now().Add(ttl)
-	s.v3PromoteAccess.Unlock()
 }
 
 // revokeV3Promotion removes a previously promoted /32|/128 when later DNS
@@ -703,30 +712,77 @@ func (s *sharedNetwork) promoteV3Direct(addr netip.Addr, ttl time.Duration) {
 // policy). Only learn-promoted prefixes are revocable; snapshot-published
 // bypass rules are never touched.
 func (s *sharedNetwork) revokeV3Promotion(addr netip.Addr) {
-	if s == nil || !s.engineV3 || s.v3 == nil {
+	if s == nil {
+		return
+	}
+	s.closeAccess.RLock()
+	defer s.closeAccess.RUnlock()
+	if !s.engineV3 || s.v3 == nil || !addr.IsValid() {
 		return
 	}
 	s.v3PromoteAccess.Lock()
+	defer s.v3PromoteAccess.Unlock()
 	_, tracked := s.v3Promoted[addr]
 	if tracked {
+		bits := 32
+		if !addr.Is4() {
+			bits = 128
+		}
+		prefix := netip.PrefixFrom(addr.Unmap(), bits).Masked()
+		if err := s.v3.RevokeMergedStaticDirect(prefix); err != nil {
+			if s.parent != nil && s.parent.logger != nil {
+				s.parent.logger.Debug("eBPF v3 revoke promoted direct: ", err)
+			}
+			return
+		}
 		delete(s.v3Promoted, addr)
 	}
-	s.v3PromoteAccess.Unlock()
 	if !tracked {
 		return
 	}
-	bits := 32
-	if !addr.Is4() {
-		bits = 128
-	}
-	prefix := netip.PrefixFrom(addr.Unmap(), bits).Masked()
-	if err := s.v3.RevokeMergedStaticDirect(prefix); err != nil {
-		s.parent.logger.Debug("eBPF v3 revoke promoted direct: ", err)
-		return
-	}
-	if s.parent.logger != nil {
+	if s.parent != nil && s.parent.logger != nil {
 		s.parent.logger.Info("eBPF v3 revoked promoted direct (shared-IP conflict): ", addr.String())
 	}
+}
+
+// gcV3Promoted removes expired learned prefixes from both the in-process
+// expiry table and the active v3 policy bank. Failures are retained for a
+// later retry instead of silently losing the bookkeeping while leaving a
+// stale kernel DIRECT entry installed.
+func (s *sharedNetwork) gcV3Promoted(now time.Time) int {
+	if s == nil {
+		return 0
+	}
+	s.closeAccess.RLock()
+	defer s.closeAccess.RUnlock()
+	if !s.engineV3 || s.v3 == nil {
+		return 0
+	}
+	s.v3PromoteAccess.Lock()
+	defer s.v3PromoteAccess.Unlock()
+	if len(s.v3Promoted) == 0 {
+		return 0
+	}
+	removed := 0
+	for addr, expiresAt := range s.v3Promoted {
+		if now.Before(expiresAt) {
+			continue
+		}
+		bits := 32
+		if !addr.Is4() {
+			bits = 128
+		}
+		prefix := netip.PrefixFrom(addr.Unmap(), bits).Masked()
+		if err := s.v3.RevokeMergedStaticDirect(prefix); err != nil {
+			if s.parent != nil && s.parent.logger != nil {
+				s.parent.logger.Debug("eBPF v3 expired promotion revoke: ", err)
+			}
+			continue
+		}
+		delete(s.v3Promoted, addr)
+		removed++
+	}
+	return removed
 }
 
 // publishV3StaticFromParent publishes the full static DIRECT snapshot:
@@ -736,13 +792,16 @@ func (s *sharedNetwork) publishV3StaticFromParent(parent *ECommon.Backend) error
 	if s == nil || s.backend == nil {
 		return nil
 	}
+	s.closeAccess.RLock()
+	defer s.closeAccess.RUnlock()
+	s.v3PromoteAccess.Lock()
+	defer s.v3PromoteAccess.Unlock()
 	var routeRouter adapter.Router
 	if r, ok := s.parent.router.(adapter.Router); ok {
 		routeRouter = r
 	}
 	outbounds := service.FromContext[adapter.OutboundManager](s.parent.ctx)
 	prefixes := collectV3StaticPrefixes(parent, routeRouter, outbounds)
-	s.staticDirect = prefixes
 	if s.engineV3 && s.v3 != nil {
 		// Publish through Lifecycle so the in-process policy banks and the live
 		// kernel inactive bank are committed as one control-plane operation.
@@ -759,10 +818,9 @@ func (s *sharedNetwork) publishV3StaticFromParent(parent *ECommon.Backend) error
 	} else if err := s.backend.PublishStaticDirect(prefixes, 0, 0); err != nil {
 		return err
 	}
+	s.staticDirect = prefixes
 	// The full snapshot rebuild wiped every learn-promoted merge.
-	s.v3PromoteAccess.Lock()
 	s.v3Promoted = nil
-	s.v3PromoteAccess.Unlock()
 	s.parent.logger.Info("eBPF v3 static policy published: prefixes=", len(prefixes))
 	return nil
 }
@@ -834,6 +892,9 @@ func (s *sharedNetwork) Close() error {
 	}
 	s.closeAccess.Lock()
 	defer s.closeAccess.Unlock()
+	s.v3PromoteAccess.Lock()
+	s.v3Promoted = nil
+	s.v3PromoteAccess.Unlock()
 	s.udpNat.Purge()
 	s.dnsMux.Close()
 	s.closeTransparentWriters()

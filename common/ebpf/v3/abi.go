@@ -9,7 +9,7 @@ import (
 )
 
 // ABIVersion must match SB_V3_ABI_VERSION in abi.h.
-const ABIVersion = 3
+const ABIVersion = 4
 
 const (
 	AFInet  = 2
@@ -192,12 +192,13 @@ type DNSIPValue struct {
 }
 
 // DNSObservation is a bounded plaintext UDP DNS response captured by the
-// TC v3 sniffer.  The kernel only records the qname and one A/AAAA address;
-// userspace remains the sole authority for applying domain rules and deciding
-// whether that address may be promoted to the DIRECT fast path.
+// TC v3 sniffer. The kernel records the qname, one A/AAAA address, and the
+// answer RR TTL; userspace remains the sole authority for applying domain
+// rules and deciding whether that address may be promoted to DIRECT.
 type DNSObservation struct {
-	Name    string
-	Address netip.Addr
+	Name       string
+	Address    netip.Addr
+	TTLSeconds uint32
 }
 
 // LPM4Key / LPM6Key for static policy banks.

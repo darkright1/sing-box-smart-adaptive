@@ -14,8 +14,9 @@ import (
 )
 
 type fakeProvider struct {
-	tag   string
-	nodes []adapter.Outbound
+	tag       string
+	nodes     []adapter.Outbound
+	callbacks blist.List[adapter.ProviderUpdateCallback]
 }
 
 func (p *fakeProvider) Type() string { return "provider" }
@@ -36,9 +37,10 @@ func (p *fakeProvider) HealthCheck(ctx context.Context) (map[string]uint16, erro
 	return nil, nil
 }
 func (p *fakeProvider) RegisterCallback(callback adapter.ProviderUpdateCallback) *blist.Element[adapter.ProviderUpdateCallback] {
-	return nil
+	return p.callbacks.PushBack(callback)
 }
 func (p *fakeProvider) UnregisterCallback(element *blist.Element[adapter.ProviderUpdateCallback]) {
+	p.callbacks.Remove(element)
 }
 
 type fakeProviderManager struct {
@@ -144,6 +146,25 @@ func TestGroupProviderSourceIncrementalUpdate(t *testing.T) {
 	_, second := source.memberOutbounds("prov-b")
 	if len(first) != 4 || len(second) != 4 {
 		t.Fatalf("first=%d second=%d, want 4/4", len(first), len(second))
+	}
+}
+
+func TestGroupProviderSourceCloseUnregistersCallbacks(t *testing.T) {
+	source, manager := newTestProviderSource(t, option.GroupCommonOption{Providers: []string{"prov-a", "prov-b"}})
+	if err := source.register(func(string) error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+	for _, provider := range manager.Providers() {
+		if got := provider.(*fakeProvider).callbacks.Len(); got != 1 {
+			t.Fatalf("callbacks before close=%d, want 1", got)
+		}
+	}
+	source.close()
+	source.close()
+	for _, provider := range manager.Providers() {
+		if got := provider.(*fakeProvider).callbacks.Len(); got != 0 {
+			t.Fatalf("callbacks after close=%d, want 0", got)
+		}
 	}
 }
 

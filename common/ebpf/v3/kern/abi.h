@@ -10,7 +10,7 @@
 #include <linux/types.h>
 
 /* Bump only on incompatible layout changes. Hot take-over must refuse mismatch. */
-#define SB_V3_ABI_VERSION 3U
+#define SB_V3_ABI_VERSION 4U
 
 #define SB_V3_AF_INET 2U
 #define SB_V3_AF_INET6 10U
@@ -292,7 +292,11 @@ _Static_assert(sizeof(struct sb_v3_dns_obs_key) == 32U, "sb_v3_dns_obs_key size"
 
 struct sb_v3_dns_obs_value {
 	char qname[SB_V3_DNS_OBSERVATION_NAME_MAX]; /* lowercase, no trailing dot */
+	__u32 ttl_seconds; /* RR TTL, capped by userspace policy before promotion */
+	__u32 reserved0;
 };
+
+_Static_assert(sizeof(struct sb_v3_dns_obs_value) == 136U, "sb_v3_dns_obs_value size");
 
 /* Host-to-kernel snapshot row for v3_source_mac (design §7.3). */
 struct sb_v3_mac_policy_entry {
@@ -353,6 +357,10 @@ struct sb_v3_packet {
 };
 
 _Static_assert(sizeof(struct sb_v3_packet) == 64U, "sb_v3_packet size");
+_Static_assert(__builtin_offsetof(struct sb_v3_packet, saddr) == 8U, "sb_v3_packet saddr offset");
+_Static_assert(__builtin_offsetof(struct sb_v3_packet, daddr) == 24U, "sb_v3_packet daddr offset");
+_Static_assert(__builtin_offsetof(struct sb_v3_packet, ifindex) == 52U, "sb_v3_packet ifindex offset");
+_Static_assert(__builtin_offsetof(struct sb_v3_packet, payload_offset) == 60U, "sb_v3_packet payload offset");
 
 struct sb_xdp_control {
 	__u32 abi_version;

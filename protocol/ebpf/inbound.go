@@ -701,6 +701,11 @@ func (i *Inbound) startUDPNATCleanup() {
 				// Previously GC was only reached from verdict metrics, so a
 				// dns_prefill-only deployment retained expired LPM entries.
 				i.gcPromotedBypass()
+				if i.sharedNetwork != nil {
+					if expired := i.sharedNetwork.gcV3Promoted(time.Now()); expired > 0 && i.logger != nil {
+						i.logger.Info("eBPF gc promoted v3 DIRECT entries expired=", expired)
+					}
+				}
 			}
 		}
 	}()

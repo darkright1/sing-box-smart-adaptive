@@ -215,6 +215,11 @@ func (i *Inbound) dnsPrefillApply(
 			}
 			continue
 		}
+		if ttl <= 0 {
+			// A zero-TTL direct answer is non-cacheable. Keep the conflict
+			// handling above, but do not install a new kernel promotion.
+			continue
+		}
 		if i.dnsPrefill.enabled {
 			if i.promoteLearnedBypass(addr, ttl) {
 				i.dnsPrefillPromotes.Add(1)
@@ -226,26 +231,12 @@ func (i *Inbound) dnsPrefillApply(
 			}
 		} else if i.v3DNSHintEnabled() && i.sharedNetwork != nil {
 			// policy_offload DNS path without legacy dns_prefill module.
-			i.sharedNetwork.observeV3DNS(addr, true, 2 /* DNSEvidenceStrong */, ttl)
-			p := netip.PrefixFrom(addr.Unmap(), prefixBits(addr)).Masked()
-			var mergeErr error
-			if i.sharedNetwork.v3 != nil {
-				mergeErr = i.sharedNetwork.v3.MergeStaticDirect(p)
-			} else if i.sharedNetwork.backend != nil {
-				mergeErr = i.sharedNetwork.backend.MergeStaticDirect(p)
-			}
-			if mergeErr != nil && i.logger != nil {
-				i.logger.Debug("eBPF v3 dns hint merge: ", mergeErr)
-			}
+			// Use the shared promotion path so the same RR/configured TTL is
+			// tracked and later revoked by v3's expiry GC. Directly merging here
+			// used to leave an untracked static /32 when dns_prefill was disabled.
+			i.sharedNetwork.promoteV3Direct(addr, ttl)
 		}
 	}
-}
-
-func prefixBits(addr netip.Addr) int {
-	if addr.Is4() {
-		return 32
-	}
-	return 128
 }
 
 // wireDNSPrefill caches Router/OutboundManager and registers the observer.
@@ -375,11 +366,28 @@ func (i *Inbound) startDNSObservationMonitor() {
 					if i.dnsPrefillClosed.Load() {
 						return
 					}
-					i.dnsPrefillApply(i.Tag(), observation.Name, []netip.Addr{observation.Address}, i.directPromoteTTL(), i.dnsPrefillRouter, i.dnsPrefillOutbounds)
+					ttl := dnsObservationPromotionTTL(i.directPromoteTTL(), observation.TTLSeconds)
+					i.dnsPrefillApply(i.Tag(), observation.Name, []netip.Addr{observation.Address}, ttl, i.dnsPrefillRouter, i.dnsPrefillOutbounds)
 				}
 			}
 		}
 	}()
+}
+
+func dnsObservationPromotionTTL(configured time.Duration, rrTTLSeconds uint32) time.Duration {
+	if configured <= 0 {
+		configured = 5 * time.Minute
+	}
+	if rrTTLSeconds == 0 {
+		// A zero-TTL answer is explicitly non-cacheable. The observation
+		// monitor skips promotion when this sentinel is returned.
+		return 0
+	}
+	rrTTL := time.Duration(rrTTLSeconds) * time.Second
+	if rrTTL < configured {
+		return rrTTL
+	}
+	return configured
 }
 
 func (i *Inbound) stopDNSObservationMonitor() {

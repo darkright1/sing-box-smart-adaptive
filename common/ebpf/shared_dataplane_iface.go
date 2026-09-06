@@ -61,8 +61,9 @@ type SharedDataplane interface {
 	MergeStaticDirect(prefix netip.Prefix) error
 	PublishDNSHint(addr netip.Addr, direct bool, evidence uint8, generation uint32, ttl time.Duration) error
 	// DrainDNSObservations removes a bounded batch of plaintext DNS answers
-	// captured by the v3 TC sniffer. v2 returns an empty batch. Domain policy
-	// evaluation and any DIRECT promotion remain in userspace.
+	// captured by the v3 TC sniffer. Each row carries the first A/AAAA answer
+	// and its RR TTL; v2 returns an empty batch. Domain policy evaluation and
+	// any DIRECT promotion remain in userspace.
 	DrainDNSObservations(max int) ([]ebpfv3.DNSObservation, error)
 	// PublishMACPolicies replaces the source-MAC identity snapshot (v3 only).
 	PublishMACPolicies(entries []ebpfv3.MACPolicyEntry) error

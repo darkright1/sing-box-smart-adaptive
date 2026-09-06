@@ -157,9 +157,9 @@ static __attribute__((always_inline)) void dns_response_sniff(const __u8 *udp_pa
 
 	/* Zero-fill so the fixed-size map copy below is verifier-safe and cannot
 	 * expose uninitialised stack bytes when the name is shorter than 128. */
-	__u8 qname[SB_V3_DNS_OBSERVATION_NAME_MAX] = {};
+	struct sb_v3_dns_obs_value observation = {};
 	const __u8 *question_end;
-	int qlen = dns_sniff_name(dns + 12, dns, payload_end, qname, sizeof(qname), &question_end);
+	int qlen = dns_sniff_name(dns + 12, dns, payload_end, observation.qname, sizeof(observation.qname), &question_end);
 	if (qlen <= 0)
 		return;
 	/* skip to end of question section */
@@ -175,7 +175,7 @@ static __attribute__((always_inline)) void dns_response_sniff(const __u8 *udp_pa
 
 	__u64 hash = 1469598103934665603ULL;
 	for (int i = 0; i < qlen; i++) {
-		hash ^= qname[i];
+		hash ^= observation.qname[i];
 		hash *= 1099511628211ULL;
 	}
 
@@ -202,10 +202,12 @@ static __attribute__((always_inline)) void dns_response_sniff(const __u8 *udp_pa
 				__builtin_memcpy(key.addr, rdata, 4);
 			else
 				__builtin_memcpy(key.addr, rdata, 16);
-			/* sb_v3_dns_obs_value is exactly the zero-filled qname array; use it
-			 * directly to keep the ingress stack frame below the 512-byte BPF
-			 * limit instead of allocating a second 128-byte temporary. */
-			map_update(&v3_dns_observe, &key, qname, BPF_ANY);
+			/* RR fields are TYPE, CLASS, TTL, RDLENGTH. Preserve the authoritative
+			 * TTL so userspace can cap the promotion lifetime to the answer's
+			 * actual validity window instead of inventing a longer default. */
+			observation.ttl_seconds = ((__u32)p[4] << 24) | ((__u32)p[5] << 16) |
+				((__u32)p[6] << 8) | p[7];
+			map_update(&v3_dns_observe, &key, &observation, BPF_ANY);
 			return;
 		}
 		p = rdata + rdlen;

@@ -3,6 +3,8 @@ package group
 import (
 	"context"
 	"net"
+	"sync"
+	"sync/atomic"
 
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/adapter/outbound"
@@ -37,11 +39,12 @@ type Selector struct {
 	outbound                     adapter.OutboundManager
 	connection                   adapter.ConnectionManager
 	logger                       logger.ContextLogger
-	tags                         []string
 	baseTags                     []string
 	defaultTag                   string
-	outbounds                    map[string]adapter.Outbound
 	providerSource               *groupProviderSource
+	membership                   atomic.Pointer[groupOutboundSnapshot]
+	stateAccess                  sync.Mutex
+	closed                       bool
 	selected                     common.TypedValue[adapter.Outbound]
 	history                      *urltest.HistoryStorage
 	interruptGroup               *interrupt.Group
@@ -55,19 +58,73 @@ func NewSelector(ctx context.Context, router adapter.Router, logger log.ContextL
 		outbound:                     service.FromContext[adapter.OutboundManager](ctx),
 		connection:                   service.FromContext[adapter.ConnectionManager](ctx),
 		logger:                       logger,
-		tags:                         options.Outbounds,
 		baseTags:                     options.Outbounds,
 		defaultTag:                   options.Default,
 		providerSource:               newGroupProviderSource(ctx, options.GroupCommonOption),
-		outbounds:                    make(map[string]adapter.Outbound),
 		history:                      service.PtrFromContext[urltest.HistoryStorage](ctx),
 		interruptGroup:               interrupt.NewGroup(),
 		interruptExternalConnections: options.InterruptExistConnections,
 	}
-	if len(outbound.tags) == 0 {
+	if len(options.Outbounds) == 0 && len(options.Providers) == 0 && !options.UseAllProviders {
 		return nil, E.New("missing tags")
 	}
+	outbound.membership.Store(newGroupOutboundSnapshot(nil, nil))
 	return outbound, nil
+}
+
+func (s *Selector) snapshot() *groupOutboundSnapshot {
+	return s.membership.Load()
+}
+
+func (s *Selector) rebuildSnapshot(providerTag string) *groupOutboundSnapshot {
+	tags := append([]string(nil), s.baseTags...)
+	byTag := make(map[string]adapter.Outbound, len(tags))
+	for _, tag := range tags {
+		if detour, loaded := s.outbound.Outbound(tag); loaded && detour != nil {
+			byTag[tag] = detour
+		}
+	}
+	if s.providerSource.has() {
+		_, members := s.providerSource.memberOutbounds(providerTag)
+		providerTags, renamed := renameProviderMembers(members, func() map[string]struct{} {
+			occupied := make(map[string]struct{}, len(tags))
+			for _, tag := range tags {
+				occupied[tag] = struct{}{}
+			}
+			return occupied
+		}())
+		for _, member := range renamed {
+			byTag[member.Tag()] = member
+		}
+		tags = append(tags, providerTags...)
+	}
+	return newGroupOutboundSnapshot(tags, byTag)
+}
+
+func (s *Selector) setFallbackLocked(snapshot *groupOutboundSnapshot) {
+	if snapshot == nil {
+		s.selected.Store(nil)
+		return
+	}
+	if current := s.selected.Load(); current != nil {
+		if next, loaded := snapshot.outbounds[current.Tag()]; loaded {
+			s.selected.Store(next)
+			return
+		}
+	}
+	if s.defaultTag != "" {
+		if next, loaded := snapshot.outbounds[s.defaultTag]; loaded {
+			s.selected.Store(next)
+			return
+		}
+	}
+	for _, tag := range snapshot.tags {
+		if next := snapshot.outbounds[tag]; next != nil {
+			s.selected.Store(next)
+			return
+		}
+	}
+	s.selected.Store(nil)
 }
 
 func (s *Selector) Network() []string {
@@ -79,26 +136,30 @@ func (s *Selector) Network() []string {
 }
 
 func (s *Selector) Start() error {
+	s.stateAccess.Lock()
+	defer s.stateAccess.Unlock()
+	if s.closed {
+		return E.New("selector is closed")
+	}
 	for i, tag := range s.baseTags {
-		detour, loaded := s.outbound.Outbound(tag)
-		if !loaded {
+		if _, loaded := s.outbound.Outbound(tag); !loaded {
 			return E.New("outbound ", i, " not found: ", tag)
 		}
-		s.outbounds[tag] = detour
 	}
 	if s.providerSource.has() {
 		if err := s.providerSource.register(s.onProviderUpdated); err != nil {
 			return err
 		}
-		s.tags = appendProviderMembers(s.baseTags, s.outbounds, s.providerSource, "")
 	}
+	snapshot := s.rebuildSnapshot("")
+	s.membership.Store(snapshot)
 
 	if s.Tag() != "" {
 		cacheFile := service.FromContext[adapter.CacheFile](s.ctx)
 		if cacheFile != nil {
 			selected := cacheFile.LoadSelected(s.Tag())
 			if selected != "" {
-				detour, loaded := s.outbounds[selected]
+				detour, loaded := snapshot.outbounds[selected]
 				if loaded {
 					s.selected.Store(detour)
 					return nil
@@ -108,48 +169,47 @@ func (s *Selector) Start() error {
 	}
 
 	if s.defaultTag != "" {
-		detour, loaded := s.outbounds[s.defaultTag]
+		detour, loaded := snapshot.outbounds[s.defaultTag]
 		if !loaded {
+			s.providerSource.close()
 			return E.New("default outbound not found: ", s.defaultTag)
 		}
 		s.selected.Store(detour)
 		return nil
 	}
 
-	s.selected.Store(s.outbounds[s.tags[0]])
+	s.setFallbackLocked(snapshot)
 	return nil
 }
 
 func (s *Selector) onProviderUpdated(tag string) error {
-	if !s.providerSource.has() {
+	s.stateAccess.Lock()
+	defer s.stateAccess.Unlock()
+	if s.closed || !s.providerSource.has() {
 		return E.New("outbound provider not found: ", tag)
 	}
-	if _, ok := s.providerSource.providers[tag]; !ok {
+	if !s.providerSource.hasProvider(tag) {
 		return E.New("outbound provider not found: ", tag)
 	}
-	s.tags = appendProviderMembers(s.baseTags, s.outbounds, s.providerSource, tag)
-	// A provider refresh may remove the selected node; fall back to the
-	// default/first member in that case.
-	if s.selected.Load() == nil {
-		if len(s.tags) > 0 {
-			if detour, loaded := s.outbounds[s.tags[0]]; loaded {
-				s.selected.Store(detour)
-			}
-		}
-	}
+	snapshot := s.rebuildSnapshot(tag)
+	s.membership.Store(snapshot)
+	s.setFallbackLocked(snapshot)
 	return nil
 }
 
 func (s *Selector) Now() string {
 	selected := s.selected.Load()
 	if selected == nil {
-		return s.tags[0]
+		if snapshot := s.snapshot(); snapshot != nil && len(snapshot.tags) > 0 {
+			return snapshot.tags[0]
+		}
+		return ""
 	}
 	return selected.Tag()
 }
 
 func (s *Selector) All() []string {
-	return s.tags
+	return s.snapshot().all()
 }
 
 func (s *Selector) Selected() adapter.Outbound {
@@ -158,11 +218,21 @@ func (s *Selector) Selected() adapter.Outbound {
 
 func (s *Selector) SelectPreMatchOutbound(metadata *adapter.InboundContext, selectOutbound func(adapter.Outbound) (adapter.Outbound, adapter.PreMatchAction)) (adapter.Outbound, adapter.PreMatchAction) {
 	_ = metadata
-	return selectOutbound(s.selected.Load())
+	selected := s.selected.Load()
+	if selected == nil {
+		return nil, adapter.PreMatchContinue
+	}
+	return selectOutbound(selected)
 }
 
 func (s *Selector) SelectOutbound(tag string) bool {
-	detour, loaded := s.outbounds[tag]
+	s.stateAccess.Lock()
+	defer s.stateAccess.Unlock()
+	snapshot := s.snapshot()
+	if snapshot == nil {
+		return false
+	}
+	detour, loaded := snapshot.outbounds[tag]
 	if !loaded {
 		return false
 	}
@@ -185,8 +255,25 @@ func (s *Selector) SelectOutbound(tag string) bool {
 	return true
 }
 
+func (s *Selector) Close() error {
+	s.stateAccess.Lock()
+	if s.closed {
+		s.stateAccess.Unlock()
+		return nil
+	}
+	s.closed = true
+	s.providerSource.close()
+	s.membership.Store(newGroupOutboundSnapshot(nil, nil))
+	s.selected.Store(nil)
+	s.stateAccess.Unlock()
+	return nil
+}
+
 func (s *Selector) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
 	selected := s.selected.Load()
+	if selected == nil {
+		return nil, E.New("selector has no selected outbound")
+	}
 	adapter.NoteRealOutbound(ctx, selected)
 	conn, err := selected.DialContext(ctx, network, destination)
 	if err != nil {
@@ -197,6 +284,9 @@ func (s *Selector) DialContext(ctx context.Context, network string, destination 
 
 func (s *Selector) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {
 	selected := s.selected.Load()
+	if selected == nil {
+		return nil, E.New("selector has no selected outbound")
+	}
 	adapter.NoteRealOutbound(ctx, selected)
 	conn, err := selected.ListenPacket(ctx, destination)
 	if err != nil {
@@ -208,6 +298,9 @@ func (s *Selector) ListenPacket(ctx context.Context, destination M.Socksaddr) (n
 func (s *Selector) NewConnection(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
 	ctx = interrupt.ContextWithIsExternalConnection(ctx)
 	selected := s.selected.Load()
+	if selected == nil {
+		return
+	}
 	if outboundHandler, isHandler := selected.(adapter.ConnectionHandler); isHandler {
 		outboundHandler.NewConnection(ctx, conn, metadata, onClose)
 	} else {
@@ -218,6 +311,9 @@ func (s *Selector) NewConnection(ctx context.Context, conn net.Conn, metadata ad
 func (s *Selector) NewPacketConnection(ctx context.Context, conn N.PacketConn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
 	ctx = interrupt.ContextWithIsExternalConnection(ctx)
 	selected := s.selected.Load()
+	if selected == nil {
+		return
+	}
 	if outboundHandler, isHandler := selected.(adapter.PacketConnectionHandler); isHandler {
 		outboundHandler.NewPacketConnection(ctx, conn, metadata, onClose)
 	} else {

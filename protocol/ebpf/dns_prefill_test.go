@@ -76,3 +76,15 @@ func TestV3DNSHintDoesNotImplicitlyFollowFakeIP(t *testing.T) {
 		t.Fatal("dns_ip_hint=strong should enable real-DNS observation")
 	}
 }
+
+func TestDNSObservationPromotionTTLIsCapped(t *testing.T) {
+	if got := dnsObservationPromotionTTL(5*time.Minute, 10); got != 10*time.Second {
+		t.Fatalf("short RR TTL=%v", got)
+	}
+	if got := dnsObservationPromotionTTL(5*time.Minute, 600); got != 5*time.Minute {
+		t.Fatalf("configured cap=%v", got)
+	}
+	if got := dnsObservationPromotionTTL(0, 0); got != 0 {
+		t.Fatalf("zero RR TTL must disable promotion, got %v", got)
+	}
+}
