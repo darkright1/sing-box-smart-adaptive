@@ -378,3 +378,11 @@ promote/loader)审查完毕,连续三轮零新发现。
   全套回归(plain/race/smart_zig cgo)全绿。
 - 发布 v1.14.14(run 34018495783),VM115/107 部署验证:代理 302/200,
   HK 组测 17/16 entries(冷启动后画像自动补齐)。
+
+## 2026-09-06 同名节点加后缀 + v1.14.15 部署(用户指示)
+- provider 成员与显式成员(或另一 provider 的同名节点)冲突时,不再丢弃:
+  冲突成员包一层改名 outbound(" #2"/" #3"...),面板/测速历史/SelectOutbound
+  用唯一 tag,拨号仍走真实成员。selector 与 urltest 共用该逻辑。
+- 测试:同名冲突后缀 + 显式保留 + 重命名 outbound 拨号指向,全绿
+  (plain/race/smart_zig cgo)。
+- v1.14.15 部署 VM115/107:冷启动后 HK 组测 32/18 entries,代理 200/302 正常。
