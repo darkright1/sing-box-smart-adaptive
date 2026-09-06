@@ -199,14 +199,19 @@ func (s *URLTest) onProviderUpdated(tag string) error {
 		return E.New("outbound provider not found: ", tag)
 	}
 	_, members := s.providerSource.memberOutbounds(tag)
-	s.tags = common.Uniq(append(append([]string(nil), s.baseTags...), common.Map(members, func(m adapter.Outbound) string { return m.Tag() })...))
-	outbounds := make([]adapter.Outbound, 0, len(s.baseTags)+len(members))
+	occupied := make(map[string]struct{}, len(s.baseTags))
+	for _, baseTag := range s.baseTags {
+		occupied[baseTag] = struct{}{}
+	}
+	memberTags, renamedMembers := renameProviderMembers(members, occupied)
+	s.tags = common.Uniq(append(append([]string(nil), s.baseTags...), memberTags...))
+	outbounds := make([]adapter.Outbound, 0, len(s.baseTags)+len(renamedMembers))
 	for _, baseTag := range s.baseTags {
 		if detour, loaded := s.outbound.Outbound(baseTag); loaded {
 			outbounds = append(outbounds, detour)
 		}
 	}
-	outbounds = append(outbounds, members...)
+	outbounds = append(outbounds, renamedMembers...)
 	s.group.replaceOutbounds(outbounds)
 	go s.group.CheckOutbounds(s.ctx, true)
 	return nil

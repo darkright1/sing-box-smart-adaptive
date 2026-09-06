@@ -3,6 +3,7 @@ package group
 import (
 	"context"
 	"regexp"
+	"strconv"
 	"sync"
 
 	"github.com/sagernet/sing-box/adapter"
@@ -110,22 +111,51 @@ func (s *groupProviderSource) memberOutbounds(updatedTag string) (tags []string,
 	return tags, outbounds
 }
 
-// appendProviderMembers merges provider members into the group's explicit
-// tag list and outbound map, preserving explicit entries on conflict.
-func appendProviderMembers(explicitTags []string, outbounds map[string]adapter.Outbound, source *groupProviderSource, updatedTag string) []string {
-	_, members := source.memberOutbounds(updatedTag)
-	tags := explicitTags
-	seen := make(map[string]struct{}, len(explicitTags)+len(members))
-	for _, tag := range explicitTags {
-		seen[tag] = struct{}{}
-	}
+// renamedOutbound delegates everything except the tag, which carries the
+// deduplicating suffix. Panel entries, history keys and SelectOutbound all
+// key on the renamed tag while dialing still goes through the real member.
+type renamedOutbound struct {
+	adapter.Outbound
+	tag string
+}
+
+func (o *renamedOutbound) Tag() string { return o.tag }
+
+// renameProviderMembers assigns every provider member a unique, panel-visible
+// tag. When a member collides with an occupied tag (an explicit member, or a
+// same-named node from another provider) it keeps its name and gains a
+// " #N" suffix, matching how clash renames duplicate provider nodes.
+func renameProviderMembers(members []adapter.Outbound, occupied map[string]struct{}) (tags []string, renamed []adapter.Outbound) {
 	for _, member := range members {
 		tag := member.Tag()
-		if _, exists := seen[tag]; !exists {
-			seen[tag] = struct{}{}
-			tags = append(tags, tag)
+		if _, taken := occupied[tag]; taken {
+			for n := 2; ; n++ {
+				candidate := tag + " #" + strconv.Itoa(n)
+				if _, taken := occupied[candidate]; !taken {
+					member = &renamedOutbound{Outbound: member, tag: candidate}
+					tag = candidate
+					break
+				}
+			}
 		}
-		outbounds[tag] = member
+		occupied[tag] = struct{}{}
+		tags = append(tags, tag)
+		renamed = append(renamed, member)
 	}
-	return tags
+	return tags, renamed
+}
+
+// appendProviderMembers merges provider members into the group's explicit
+// tag list and outbound map. Same-name nodes are suffixed, never dropped.
+func appendProviderMembers(explicitTags []string, outbounds map[string]adapter.Outbound, source *groupProviderSource, updatedTag string) []string {
+	_, members := source.memberOutbounds(updatedTag)
+	occupied := make(map[string]struct{}, len(explicitTags)+len(members))
+	for _, tag := range explicitTags {
+		occupied[tag] = struct{}{}
+	}
+	providerTags, renamed := renameProviderMembers(members, occupied)
+	for _, member := range renamed {
+		outbounds[member.Tag()] = member
+	}
+	return append(explicitTags, providerTags...)
 }
