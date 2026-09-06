@@ -533,8 +533,11 @@ func TestSmartProbeDeadlineCommitsCompletedObservations(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
 	defer cancel()
 	result, err := smart.probe(ctx)
-	if !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("expected partial-cycle deadline, got %v", err)
+	// New contract: the caller deadline returns the partial map with a nil
+	// error so panels render it; the portrait sweep continues in the
+	// background and commits every observation that already completed.
+	if err != nil {
+		t.Fatalf("partial cycle must not surface the caller deadline, got %v", err)
 	}
 	if result[fast.Tag()] != 12 {
 		t.Fatalf("completed probe missing from result: %v", result)

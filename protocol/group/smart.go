@@ -2639,8 +2639,14 @@ func (s *Smart) probe(ctx context.Context) (map[string]uint16, error) {
 	return s.probeWithBudget(ctx, 0)
 }
 
-func (s *Smart) probeWithBudget(ctx context.Context, budget int) (map[string]uint16, error) {
-	result := make(map[string]uint16)
+func (s *Smart) probeWithBudget(ctx context.Context, budget int) (result map[string]uint16, err error) {
+	result = make(map[string]uint16)
+	// The portrait sweep must outlive the caller's deadline: a panel timeout
+	// must not discard in-flight dial evidence, or the catalog can never fill
+	// its health portraits.  Workers and the collector run on an internal
+	// sweep deadline (probeCycleTimeout); the caller receives whatever
+	// completed inside its own window while the sweep keeps recording.
+	var resultMu sync.Mutex
 	if ctx.Err() != nil || s.closing.Load() {
 		return result, ctx.Err()
 	}
@@ -2694,6 +2700,11 @@ func (s *Smart) probeWithBudget(ctx context.Context, budget int) (map[string]uin
 		start := int(s.probeCursor.Add(uint64(advance))-uint64(advance)) % len(candidates)
 		candidates = append(candidates[start:], candidates[:start]...)
 	}
+	sweepDeadline := s.probeCycleTimeout
+	if sweepDeadline <= 0 {
+		sweepDeadline = defaultSmartProbeCycleTimeout
+	}
+	sweepCtx, sweepCancel := context.WithTimeout(context.WithoutCancel(ctx), sweepDeadline)
 	type probeResult struct {
 		candidate adapter.Outbound
 		delay     uint16
@@ -2723,7 +2734,7 @@ func (s *Smart) probeWithBudget(ctx context.Context, budget int) (map[string]uin
 		go func() {
 			defer waitGroup.Done()
 			for candidate := range jobs {
-				if ctx.Err() != nil || s.closing.Load() {
+				if sweepCtx.Err() != nil || s.closing.Load() {
 					results <- probeResult{candidate: candidate, err: context.Canceled}
 					continue
 				}
@@ -2740,17 +2751,17 @@ func (s *Smart) probeWithBudget(ctx context.Context, budget int) (map[string]uin
 					// another group. Apply the per-node timeout only after a slot is
 					// acquired inside the registry; otherwise a healthy node can be
 					// mislabeled merely because the shared queue took five seconds.
-					delay, err, performed = s.probeRegistry.runWithMetaForEndpoint(ctx, metadata.identity, key, s.probeURL, s.probeTimeout, s.probeInterval, candidate)
+					delay, err, performed = s.probeRegistry.runWithMetaForEndpoint(sweepCtx, metadata.identity, key, s.probeURL, s.probeTimeout, s.probeInterval, candidate)
 				} else {
 					// Test/embedded constructors created before the shared registry
 					// contract retain the stock direct probe path.
-					testCtx, cancel := context.WithTimeout(ctx, s.probeTimeout)
+					testCtx, cancel := context.WithTimeout(sweepCtx, s.probeTimeout)
 					delay, err = urltest.URLTest(testCtx, s.probeURL, candidate)
 					cancel()
 					performed = true
 				}
 				families := s.probeTCPFamilies(ctx, candidate, metadata)
-				penalize := err != nil && !errors.Is(err, errSharedSmartProbeDeferred) && ctx.Err() == nil && !s.closing.Load()
+				penalize := err != nil && !errors.Is(err, errSharedSmartProbeDeferred) && sweepCtx.Err() == nil && !s.closing.Load()
 				results <- probeResult{candidate: candidate, delay: delay, err: err, penalize: penalize, performed: performed, families: families}
 			}
 		}()
@@ -2814,7 +2825,9 @@ func (s *Smart) probeWithBudget(ctx context.Context, budget int) (map[string]uin
 				probe.err = nil
 				probe.performed = familyPerformed
 			}
+			resultMu.Lock()
 			result[probe.candidate.Tag()] = probe.delay
+			resultMu.Unlock()
 			if !probe.performed {
 				continue
 			}
@@ -2861,59 +2874,81 @@ func (s *Smart) probeWithBudget(ctx context.Context, budget int) (map[string]uin
 	close(jobs)
 	waitGroup.Wait()
 	close(results)
-	summary := <-summaryDone
-	if ctx.Err() == nil && !s.closing.Load() {
-		// TCP probes establish reachability; a small, serialized UDP DNS sample
-		// establishes that the same candidate can carry transactional datagrams.
-		// Keep this separate from the TCP result map so URLTest callers retain
-		// their historical latency contract while UDP evidence enters its own
-		// profile and cannot poison TCP ranking.
-		s.probeUDPWithBudget(ctx, allCandidates, budget)
-	}
-	if s.closing.Load() {
-		// Shutdown: skip store mutations so Close can clear maps safely.  A
-		// probe-cycle deadline is different: completed observations remain
-		// valuable and must be committed so inactive/large groups eventually
-		// build a baseline over multiple bounded cycles.
-		return result, ctx.Err()
-	}
-	commonFailure := summary.performed > 1 && summary.successes == 0
-	penalizedProfiles := make(map[string]struct{}, len(summary.collected))
-	for _, probe := range summary.collected {
-		if probe.err != nil && probe.penalize && probe.performed && !commonFailure {
-			profileID := profileIDFor(probe.candidate.Tag())
-			if _, exists := penalizedProfiles[profileID]; exists {
-				continue
-			}
-			metadata, ok := metadataByTag[probe.candidate.Tag()]
-			if !ok {
-				metadata = s.buildCandidateMetadata(probe.candidate.Tag(), "")
-			}
-			if s.probeRegistry == nil || s.probeRegistry.dead(metadata.probeKey) {
-				penalizedProfiles[profileID] = struct{}{}
-				s.noteCandidateProbe(probe.candidate.Tag(), time.Now())
-				s.observeDial(time.Now(), networkKey, "", probe.candidate.Tag(), N.NetworkTCP, false, s.probeTimeout)
+
+	finishSweep := func(summary probeSummary) {
+		defer sweepCancel()
+		if sweepCtx.Err() == nil && !s.closing.Load() {
+			// TCP probes establish reachability; a small, serialized UDP DNS sample
+			// establishes that the same candidate can carry transactional datagrams.
+			// Keep this separate from the TCP result map so URLTest callers retain
+			// their historical latency contract while UDP evidence enters its own
+			// profile and cannot poison TCP ranking.
+			s.probeUDPWithBudget(sweepCtx, allCandidates, budget)
+		}
+		if s.closing.Load() {
+			// Shutdown: skip store mutations so Close can clear maps safely.  A
+			// probe-cycle deadline is different: completed observations remain
+			// valuable and must be committed so inactive/large groups eventually
+			// build a baseline over multiple bounded cycles.
+			return
+		}
+		commonFailure := summary.performed > 1 && summary.successes == 0
+		penalizedProfiles := make(map[string]struct{}, len(summary.collected))
+		for _, probe := range summary.collected {
+			if probe.err != nil && probe.penalize && probe.performed && !commonFailure {
+				profileID := profileIDFor(probe.candidate.Tag())
+				if _, exists := penalizedProfiles[profileID]; exists {
+					continue
+				}
+				metadata, ok := metadataByTag[probe.candidate.Tag()]
+				if !ok {
+					metadata = s.buildCandidateMetadata(probe.candidate.Tag(), "")
+				}
+				if s.probeRegistry == nil || s.probeRegistry.dead(metadata.probeKey) {
+					penalizedProfiles[profileID] = struct{}{}
+					s.noteCandidateProbe(probe.candidate.Tag(), time.Now())
+					s.observeDial(time.Now(), networkKey, "", probe.candidate.Tag(), N.NetworkTCP, false, s.probeTimeout)
+				}
 			}
 		}
-	}
-	if summary.successes > 0 {
-		s.noteProbeCycle(summary.successes)
-		// Publish the baseline immediately.  Ranking is otherwise refreshed only
-		// by a real dial, which makes traffic-idle groups look permanently warming
-		// even though their active probes have already populated the store.
-		ranking, _, _, _ := s.rankPooled(s.ctx, N.NetworkTCP, M.Socksaddr{})
-		ranking.Release()
-	}
-	if commonFailure {
-		if s.logger != nil {
-			s.logger.Warn("smart probe suppressed candidate penalties because every candidate failed")
+		if summary.successes > 0 {
+			s.noteProbeCycle(summary.successes)
+			// Publish the baseline immediately.  Ranking is otherwise refreshed only
+			// by a real dial, which makes traffic-idle groups look permanently warming
+			// even though their active probes have already populated the store.
+			ranking, _, _, _ := s.rankPooled(s.ctx, N.NetworkTCP, M.Socksaddr{})
+			ranking.Release()
 		}
-		return result, E.New("all smart probes failed; candidate penalties suppressed")
+		if commonFailure {
+			if s.logger != nil {
+				s.logger.Warn("smart probe suppressed candidate penalties because every candidate failed")
+			}
+			err = E.New("all smart probes failed; candidate penalties suppressed")
+			return
+		}
 	}
-	// Preserve the deadline for callers while retaining every observation that
-	// completed before it.  Scheduled callers intentionally ignore this error;
-	// explicit URLTest callers can still distinguish a partial cycle.
-	return result, ctx.Err()
+	var summary probeSummary
+	sweepComplete := make(chan struct{})
+	go func() {
+		defer close(sweepComplete)
+		summary = <-summaryDone
+		finishSweep(summary)
+	}()
+	// The caller (a panel HTTP request) gets the delays collected inside its
+	// own window; the portrait sweep keeps running to completion on the
+	// internal deadline so every performed dial lands in the health ledger.
+	select {
+	case <-sweepComplete:
+		return result, err
+	case <-ctx.Done():
+	}
+	resultMu.Lock()
+	snapshot := make(map[string]uint16, len(result))
+	for tag, delay := range result {
+		snapshot[tag] = delay
+	}
+	resultMu.Unlock()
+	return snapshot, nil
 }
 
 type smartUDPProbeFamilyResult struct {
