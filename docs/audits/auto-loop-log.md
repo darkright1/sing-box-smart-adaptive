@@ -386,3 +386,15 @@ promote/loader)审查完毕,连续三轮零新发现。
 - 测试:同名冲突后缀 + 显式保留 + 重命名 outbound 拨号指向,全绿
   (plain/race/smart_zig cgo)。
 - v1.14.15 部署 VM115/107:冷启动后 HK 组测 32/18 entries,代理 200/302 正常。
+
+## 2026-09-06 外部评审回应:接线契约测试 + 基准工具化(用户指示)
+- #9(hook 静默 no-op):接线逻辑抽为 wireVerdictLearner /
+  wirePromoteAndSpliceHooks,新增契约测试
+  TestInboundWiresVerdictLearnerAndSpliceHooks(linux CI 执行);
+  VerdictLearnerHub/ConnectionSplicerHub 增加 Len() 观测访问器。
+- #28(基准缺口):新增 scripts/bench/dataplane-bench.sh + README 方法论
+  ——同机同池 A/B 轮替(官方 TUN/auto_redirect vs 本分支 TC),延迟
+  p50/p95/p99 + 进程 CPU + 可选 iperf3 吞吐,proxy/direct 双流量模型。
+  注:用户环境无直连流量,本机不跑;工具供有直连占比的部署使用。
+- #26(build tag 诊断):已核实 sing-box version 输出 Tags/Revision/CGO,
+  配置与二进制不匹配可一条命令定位,无需改代码。
