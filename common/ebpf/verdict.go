@@ -187,6 +187,15 @@ func lookupVerdictStat(statsFD int, index uint32) uint64 {
 
 // Export returns a snapshot of recent writes (debug / tests). Not a full map dump.
 // Oldest first. When full, head points at the oldest entry (next overwrite slot).
+// Export returns the recorded verdict entries. Nil-receiver safe (the
+// nil-safe contract test pins this).
+func (v *VerdictBackend) Export() []VerdictEntry {
+	if v == nil {
+		return nil
+	}
+	return v.verdictExportRing.Export()
+}
+
 // Generation returns the current control generation.
 func (v *VerdictBackend) Generation() uint32 {
 	if v == nil {
