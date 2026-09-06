@@ -188,7 +188,7 @@ func (s *Selector) onProviderUpdated(tag string) error {
 	if s.closed || !s.providerSource.has() {
 		return E.New("outbound provider not found: ", tag)
 	}
-	if !s.providerSource.hasProvider(tag) {
+	if tag != "" && !s.providerSource.hasProvider(tag) {
 		return E.New("outbound provider not found: ", tag)
 	}
 	snapshot := s.rebuildSnapshot(tag)

@@ -259,7 +259,7 @@ func (s *URLTest) onProviderUpdated(tag string) error {
 		s.stateAccess.Unlock()
 		return E.New("outbound provider not found: ", tag)
 	}
-	if !s.providerSource.hasProvider(tag) {
+	if tag != "" && !s.providerSource.hasProvider(tag) {
 		s.stateAccess.Unlock()
 		return E.New("outbound provider not found: ", tag)
 	}
@@ -428,6 +428,10 @@ func NewURLTestGroup(ctx context.Context, outboundManager adapter.OutboundManage
 
 func (g *URLTestGroup) PostStart() {
 	g.access.Lock()
+	if g.closed {
+		g.access.Unlock()
+		return
+	}
 	g.started = true
 	g.lastActive.Store(time.Now())
 	g.access.Unlock()

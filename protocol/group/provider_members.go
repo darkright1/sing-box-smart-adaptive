@@ -111,14 +111,21 @@ func (s *groupProviderSource) register(callback adapter.ProviderUpdateCallback) 
 	var providerTags []string
 	if s.useAllProviders {
 		for _, provider := range s.manager.Providers() {
-			if provider == nil {
+			if provider == nil || provider.Tag() == "" {
 				continue
 			}
-			providerTags = append(providerTags, provider.Tag())
-			resolved[provider.Tag()] = provider
+			tag := provider.Tag()
+			if _, exists := resolved[tag]; exists {
+				continue
+			}
+			providerTags = append(providerTags, tag)
+			resolved[tag] = provider
 		}
 	} else {
 		for i, tag := range s.providerTags {
+			if _, exists := resolved[tag]; exists {
+				continue
+			}
 			provider, loaded := s.manager.Get(tag)
 			if !loaded {
 				return E.New("outbound provider ", i, " not found: ", tag)
