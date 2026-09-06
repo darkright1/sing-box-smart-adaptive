@@ -84,7 +84,7 @@ type sharedNetwork struct {
 	udpClients         udpClientTable
 	udpWarnings        udpWarningLimiters
 	listenPort         uint16
-	closeAccess        sync.Mutex
+	closeAccess        sync.RWMutex
 }
 
 type sharedNetworkIngressInterfaceKey struct{}

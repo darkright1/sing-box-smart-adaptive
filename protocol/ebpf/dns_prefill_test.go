@@ -4,6 +4,7 @@ package ebpf
 
 import (
 	"testing"
+	"time"
 
 	"github.com/sagernet/sing-box/option"
 )

@@ -26,10 +26,15 @@ and the first matching A/AAAA answer to the userspace control plane.
 
 ## ABI and build gates
 
-The v3 ABI is version 3. Native runtime and the optional XDP loader both bind
+The v3 ABI is version 4. Native runtime and the optional XDP loader both bind
 the new map FD. Linux CI regenerates the v3 object, checks BTF/maps/source
 sections and the `v3_dns_observe` symbol, and runs the tagged Go/race/vet
 matrix. eBPF objects are not generated on macOS.
+
+The observation value now carries the authoritative RR TTL. Userspace clamps
+that value by the configured promotion TTL before publishing a DIRECT /32 or
+/128. A bounded GC runs with the UDP cleanup loop and revokes expired entries
+from the active v3 bank; failed revocations remain tracked for retry.
 
 ## Verification performed
 
