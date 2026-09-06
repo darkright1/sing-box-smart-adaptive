@@ -80,7 +80,9 @@ func (m *Manager) Close() error {
 	m.started = false
 	providers := m.providers
 	m.providers = nil
+	m.providerByTag = make(map[string]adapter.Provider)
 	m.access.Unlock()
+	m.notifyProviderCallbacks()
 	var err error
 	for _, provider := range providers {
 		if closer, isCloser := provider.(io.Closer); isCloser {

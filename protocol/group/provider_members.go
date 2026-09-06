@@ -249,6 +249,10 @@ func (s *groupProviderSource) close() {
 		handles[tag] = handle
 	}
 	clear(s.handles)
+	clear(s.providers)
+	clear(s.outboundsCache)
+	s.providerTags = nil
+	s.manager = nil
 	s.managerObserver = nil
 	s.managerHandle = nil
 	s.callback = nil
