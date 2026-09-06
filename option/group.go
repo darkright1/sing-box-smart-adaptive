@@ -59,8 +59,13 @@ type SmartOutboundOptions struct {
 	ProbeCycleTimeout badoption.Duration `json:"probe_cycle_timeout,omitempty"`
 	ProbeTimeout      badoption.Duration `json:"probe_timeout,omitempty"`
 	ProbeConcurrency  int                `json:"probe_concurrency,omitempty"`
-	MaxAttempts       int                `json:"max_attempts,omitempty"`
-	AttemptTimeout    badoption.Duration `json:"attempt_timeout,omitempty"`
+	// DashboardProbeBudget bounds how many candidates one panel-triggered
+	// group delay test probes. 0 (default) = full probe, matching native
+	// sing-box panel behavior; a positive value keeps the anti-thrash bound
+	// for deployments that must not let a dashboard burst the node pool.
+	DashboardProbeBudget int                `json:"dashboard_probe_budget,omitempty"`
+	MaxAttempts          int                `json:"max_attempts,omitempty"`
+	AttemptTimeout       badoption.Duration `json:"attempt_timeout,omitempty"`
 	// EstablishedStallTimeout bounds passive first-response observation after
 	// a successful dial and first write. Smart does not generate traffic.
 	EstablishedStallTimeout badoption.Duration `json:"established_stall_timeout,omitempty"`

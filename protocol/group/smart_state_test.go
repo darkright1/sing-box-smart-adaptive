@@ -126,7 +126,8 @@ func TestSmartProbeScheduleFollowsTrafficActivity(t *testing.T) {
 }
 
 func TestSmartManualProbeUsesDashboardBudget(t *testing.T) {
-	smart := &Smart{probeNow: make(chan struct{}, 1)}
+	// A configured positive bound must still narrow the manual probe.
+	smart := &Smart{probeNow: make(chan struct{}, 1), dashboardProbeBudget: defaultSmartDashboardProbeBudget}
 	smart.PerformUpdateCheck()
 	if budget := smart.manualProbeBudget.Load(); budget != int32(defaultSmartDashboardProbeBudget) {
 		t.Fatalf("manual probe budget = %d, want %d", budget, defaultSmartDashboardProbeBudget)
@@ -140,6 +141,22 @@ func TestSmartManualProbeUsesDashboardBudget(t *testing.T) {
 	smart.requestProbeWithBudget(defaultSmartActiveProbeBudget)
 	if budget := smart.manualProbeBudget.Load(); budget != int32(defaultSmartDashboardProbeBudget) {
 		t.Fatalf("traffic wakeup widened manual budget to %d", budget)
+	}
+}
+
+func TestSmartManualProbeUnboundedByDefault(t *testing.T) {
+	// Default (no dashboard_probe_budget) restores the native panel behavior:
+	// a manual group test probes the full catalog through the refactored
+	// probeWithBudget pipeline.
+	smart := &Smart{probeNow: make(chan struct{}, 1)}
+	smart.PerformUpdateCheck()
+	if budget := smart.manualProbeBudget.Load(); budget != 0 {
+		t.Fatalf("default manual probe budget = %d, want 0 (unbounded)", budget)
+	}
+	select {
+	case <-smart.probeNow:
+	default:
+		t.Fatal("manual delay test did not wake Smart probe worker")
 	}
 }
 

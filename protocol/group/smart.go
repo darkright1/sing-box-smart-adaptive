@@ -487,6 +487,7 @@ type Smart struct {
 	probeCycleTimeout          time.Duration
 	probeTimeout               time.Duration
 	probeConcurrency           int
+	dashboardProbeBudget       int
 	familyProbeEnabled         bool
 	maxAttempts                int
 	attemptTimeout             time.Duration
@@ -592,6 +593,12 @@ func NewSmart(ctx context.Context, router adapter.Router, logger log.ContextLogg
 	}
 	if probeConcurrency > 4 {
 		probeConcurrency = 4
+	}
+	// 0 (default) restores the native full group probe for panels; a positive
+	// bound keeps the dashboard anti-thrash budget.
+	dashboardProbeBudget := options.DashboardProbeBudget
+	if dashboardProbeBudget < 0 {
+		dashboardProbeBudget = 0
 	}
 	if probeCycleTimeout < probeTimeout {
 		probeCycleTimeout = probeTimeout
@@ -2610,7 +2617,7 @@ func (s *Smart) URLTest(ctx context.Context) (map[string]uint16, error) {
 // normal Smart worker, but only a small advisory budget per request.  A later
 // scheduled cycle fills the remaining catalog without a control-plane burst.
 func (s *Smart) DashboardURLTest(ctx context.Context) (map[string]uint16, error) {
-	return s.probeWithBudget(ctx, defaultSmartDashboardProbeBudget)
+	return s.probeWithBudget(ctx, s.dashboardProbeBudget)
 }
 
 // PerformUpdateCheck is the non-blocking hook used by the Clash API after a
@@ -2622,9 +2629,10 @@ func (s *Smart) PerformUpdateCheck() {
 		return
 	}
 	// A leaf delay request is a control-plane hint, not a traffic-activity
-	// wakeup. Keep it on the small dashboard budget; otherwise an active Smart
-	// group would expand one manual test into its 16-candidate profiling cycle.
-	s.requestProbeWithBudget(defaultSmartDashboardProbeBudget)
+	// wakeup. Keep it on the dashboard budget (full catalog when unbounded);
+	// otherwise an active Smart group would expand one manual test into its
+	// 16-candidate profiling cycle.
+	s.requestProbeWithBudget(s.dashboardProbeBudget)
 }
 
 func (s *Smart) probe(ctx context.Context) (map[string]uint16, error) {
