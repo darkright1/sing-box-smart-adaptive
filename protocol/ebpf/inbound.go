@@ -724,27 +724,9 @@ func (i *Inbound) startOutboundOffload() error {
 		if err := i.outboundCoord.StartVerdict(i.backendInstance()); err != nil {
 			return err
 		}
-		if i.outboundCoord.Verdict() != nil {
-			if hub := service.FromContext[*adapter.VerdictLearnerHub](i.ctx); hub != nil {
-				hub.Add(i)
-			} else {
-				service.MustRegister[adapter.VerdictLearner](i.ctx, i)
-			}
-		}
 	}
-	if i.outboundCoord != nil {
-		i.outboundCoord.SetPromoteHooks(func(addr netip.Addr, ttl time.Duration) {
-			_ = i.promoteLearnedBypass(addr, ttl)
-		}, i.clearPromotedBypass)
-	}
-	// Register for ConnectionManager fail-open splice hooks (master §6.1).
-	if i.outboundCoord.enabled() && i.outboundCoord.Splice() != nil {
-		if hub := service.FromContext[*adapter.ConnectionSplicerHub](i.ctx); hub != nil {
-			hub.Add(i)
-		} else {
-			service.MustRegister[adapter.ConnectionSplicer](i.ctx, i)
-		}
-	}
+	i.wireVerdictLearner()
+	i.wirePromoteAndSpliceHooks()
 	return nil
 }
 
@@ -1669,4 +1651,35 @@ func redirectAddressFromOOB(oob []byte) (netip.Addr, error) {
 		}
 	}
 	return netip.Addr{}, E.New("IP packet info is missing")
+}
+
+// wireVerdictLearner registers this inbound as a verdict learner whenever the
+// outbound coordinator owns a verdict map. This hook was once a silent no-op
+// (registered without route/conn.go wiring); keep it contract-tested via
+// TestInboundWiresVerdictLearnerAndSpliceHooks.
+func (i *Inbound) wireVerdictLearner() {
+	if i.outboundCoord != nil && i.outboundCoord.Verdict() != nil {
+		if hub := service.FromContext[*adapter.VerdictLearnerHub](i.ctx); hub != nil {
+			hub.Add(i)
+		} else {
+			service.MustRegister[adapter.VerdictLearner](i.ctx, i)
+		}
+	}
+}
+
+// wirePromoteAndSpliceHooks binds the /32 promote callbacks and the
+// fail-open splice registration (master §6.1).
+func (i *Inbound) wirePromoteAndSpliceHooks() {
+	if i.outboundCoord != nil {
+		i.outboundCoord.SetPromoteHooks(func(addr netip.Addr, ttl time.Duration) {
+			_ = i.promoteLearnedBypass(addr, ttl)
+		}, i.clearPromotedBypass)
+	}
+	if i.outboundCoord.enabled() && i.outboundCoord.Splice() != nil {
+		if hub := service.FromContext[*adapter.ConnectionSplicerHub](i.ctx); hub != nil {
+			hub.Add(i)
+		} else {
+			service.MustRegister[adapter.ConnectionSplicer](i.ctx, i)
+		}
+	}
 }

@@ -266,6 +266,16 @@ func (h *VerdictLearnerHub) Add(learner VerdictLearner) {
 	h.learners = append(h.learners, learner)
 }
 
+// Len reports how many learners are currently registered (test/observability).
+func (h *VerdictLearnerHub) Len() int {
+	if h == nil {
+		return 0
+	}
+	h.access.Lock()
+	defer h.access.Unlock()
+	return len(h.learners)
+}
+
 func (h *VerdictLearnerHub) Remove(learner VerdictLearner) {
 	if h == nil || learner == nil {
 		return
@@ -327,6 +337,16 @@ func (h *ConnectionSplicerHub) Add(splicer ConnectionSplicer) {
 		}
 	}
 	h.splicers = append(h.splicers, splicer)
+}
+
+// Len reports how many splicers are currently registered (test/observability).
+func (h *ConnectionSplicerHub) Len() int {
+	if h == nil {
+		return 0
+	}
+	h.access.Lock()
+	defer h.access.Unlock()
+	return len(h.splicers)
 }
 
 func (h *ConnectionSplicerHub) Remove(splicer ConnectionSplicer) {
