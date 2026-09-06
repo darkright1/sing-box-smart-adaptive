@@ -365,3 +365,16 @@ promote/loader)审查完毕,连续三轮零新发现。
 - v1.14.13 部署 VM115/VM107(备份 bak-1.14.12-*);VM107 部署中发现根盘
   100% 满(708MB),已清理旧二进制备份+apk 缓存至 61%。
 - 验证:VM107 HK 组测 16 entries、代理 302/0.14s;VM115 全绿。
+
+## 2026-09-06 provider 组功能补齐 + v1.14.14 部署(用户报告)
+- 缺口:selector/urltest 解析 GroupCommonOption(providers/include/exclude/
+  use_all_providers)但运行时零消费——mihomo 风格的 provider 手动组在
+  selector 上直接 "missing tags" 启动失败。
+- 修复:新增共享 groupProviderSource(注册回调 + 增量成员展开 +
+  include/exclude 过滤 + per-provider 缓存),接线 selector(成员并入
+  tags/outbounds,provider 刷新保留已选节点)与 urltest(成员并入组,
+  刷新后全量重建成员列表并立即重测)。smart/loadbalance 原有实现未动。
+- 测试:groupProviderSource include/exclude/use_all/增量更新 3 个单测 +
+  全套回归(plain/race/smart_zig cgo)全绿。
+- 发布 v1.14.14(run 34018495783),VM115/107 部署验证:代理 302/200,
+  HK 组测 17/16 entries(冷启动后画像自动补齐)。
