@@ -340,3 +340,16 @@ promote/loader)审查完毕,连续三轮零新发现。
 - 默认分支:adaptive/official-beta17 → adaptive/official-v1.14.0-smart-ebpf;仓库描述更新
 - 教训:清理脚本的条件优先级 (A||B&&C||D) 打印误导,幸未误删;批量删除
   必须先显式排除清单再执行,不得依赖内联条件短路。
+
+## 2026-09-06 面板测速修复 + 画像解耦(用户报告)
+- 症状:zashboard 组测只出 2 个节点数值、其余超时。根因:b2b73b8f 把
+ 面板触发的组测预算写死为 2,加上 probeConcurrency=2/注册表 4 槽,5 秒
+ 窗口内只能完成极少数探测,且 ctx 取消的节点不算 performed、不写画像。
+- 修复:
+  1. smart.dashboard_probe_budget 配置(默认 0 = 面板全量测速,恢复原生行为);
+  2. 画像扫描与面板请求解耦:全量扫描在内部 probeCycleTimeout 截止时间内
+     后台跑完,面板窗口关闭即返回已完成延迟(部分结果 + nil err),每个
+     已执行拨号都写入健康台账;注册表 TTL 缓存让下次刷新显示更多节点。
+- 实测:VM115 HK 组测 2 → 32 entries;VM107 16 entries。urltest/loadbalance
+  重构零改动(证据:git diff ecd690a3..HEAD 对上述文件为空)。
+- 发布 v1.14.12(run 34008676139),VM115/107 已部署验证,备份保留。
