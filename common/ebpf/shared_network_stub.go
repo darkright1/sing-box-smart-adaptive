@@ -88,6 +88,9 @@ func (b *SharedNetworkBackend) PublishDNSHint(netip.Addr, bool, uint8, uint32, t
 func (b *SharedNetworkBackend) PublishMACPolicies([]ebpfv3.MACPolicyEntry) error {
 	return unsupportedSharedNetworkError()
 }
+func (b *SharedNetworkBackend) DeleteMergedStaticDirect(netip.Prefix) error {
+	return unsupportedSharedNetworkError()
+}
 func (b *SharedNetworkBackend) WriteControlV3(bool, uint32, uint32, uint32, uint32) error {
 	return unsupportedSharedNetworkError()
 }

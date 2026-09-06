@@ -62,6 +62,8 @@ type SharedDataplane interface {
 	PublishDNSHint(addr netip.Addr, direct bool, evidence uint8, generation uint32, ttl time.Duration) error
 	// PublishMACPolicies replaces the source-MAC identity snapshot (v3 only).
 	PublishMACPolicies(entries []ebpfv3.MACPolicyEntry) error
+	// DeleteMergedStaticDirect revokes one promote-sourced DIRECT prefix (v3 only).
+	DeleteMergedStaticDirect(prefix netip.Prefix) error
 	WriteControlV3(enabled bool, flags uint32, activeBank, generation, routingMark uint32) error
 	PolicyGeneration() uint32
 	// V3Stats returns raw reason counters (index = SB_V3_STAT_*), generation, active bank.

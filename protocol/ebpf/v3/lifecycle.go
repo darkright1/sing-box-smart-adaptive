@@ -310,6 +310,24 @@ func (l *Lifecycle) MergeStaticDirect(prefix netip.Prefix) error {
 	return nil
 }
 
+// RevokeMergedStaticDirect removes one learned/promoted DIRECT prefix from
+// both representations. Used when later DNS evidence turns a previously
+// stable-direct IP into a conflict (shared-IP generalisation guard).
+// Kernel sink first (fail-closed), then the memory model.
+func (l *Lifecycle) RevokeMergedStaticDirect(prefix netip.Prefix) error {
+	if l == nil || l.backend == nil {
+		return fmt.Errorf("nil lifecycle")
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.sink != nil {
+		if err := l.sink.DeleteMergedStaticDirect(prefix); err != nil {
+			return err
+		}
+	}
+	return l.backend.DeleteMergedStaticDirect(prefix)
+}
+
 // LearnFlow publishes exact-flow verdict after userspace bare-direct route.
 func (l *Lifecycle) LearnFlow(client, dest netip.AddrPort, protocol uint8, bareDirect bool, now time.Time) error {
 	if l == nil || l.backend == nil {

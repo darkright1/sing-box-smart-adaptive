@@ -207,9 +207,13 @@ func (i *Inbound) dnsPrefillApply(
 			return
 		}
 		if !dnsPrefillIsStableDirect(routeRouter, outbounds, inboundTag, domain, addr) {
-			// Still record proxy evidence for v3 conflict isolation when hint on.
+			// Still record proxy evidence for v3 conflict isolation when hint on,
+			// and revoke any earlier /32 promotion of this address: another
+			// domain sharing the IP must not inherit this domain's kernel
+			// DIRECT (shared-IP generalisation guard).
 			if i.v3DNSHintEnabled() && i.sharedNetwork != nil {
 				i.sharedNetwork.observeV3DNS(addr, false, 2 /* strong observed but not direct */, ttl)
+				i.sharedNetwork.revokeV3Promotion(addr)
 			}
 			continue
 		}

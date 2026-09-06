@@ -73,6 +73,8 @@ type sharedNetwork struct {
 	policyRoute        *sharedNetworkPolicyRoute
 	tc                 *sharedTCManager
 	staticDirect       []netip.Prefix
+	v3PromoteAccess    sync.Mutex
+	v3Promoted         map[netip.Addr]time.Time
 	tcp4               *listener.Listener
 	tcp6               *listener.Listener
 	udp4               *listener.Listener
@@ -536,6 +538,12 @@ func (s v3KernelSink) PublishMACPolicies(entries []ebpfabi.MACPolicyEntry) error
 	}
 	return s.dp.PublishMACPolicies(entries)
 }
+func (s v3KernelSink) DeleteMergedStaticDirect(prefix netip.Prefix) error {
+	if s.dp == nil {
+		return nil
+	}
+	return s.dp.DeleteMergedStaticDirect(prefix)
+}
 func (s v3KernelSink) WriteControlV3(enabled bool, flags uint32, activeBank, generation, routingMark uint32) error {
 	if s.dp == nil {
 		return nil
@@ -679,6 +687,45 @@ func (s *sharedNetwork) promoteV3Direct(addr netip.Addr, ttl time.Duration) {
 	}
 	if err != nil {
 		s.parent.logger.Debug("eBPF v3 merge static direct: ", err)
+		return
+	}
+	s.v3PromoteAccess.Lock()
+	if s.v3Promoted == nil {
+		s.v3Promoted = make(map[netip.Addr]time.Time)
+	}
+	s.v3Promoted[addr] = time.Now().Add(ttl)
+	s.v3PromoteAccess.Unlock()
+}
+
+// revokeV3Promotion removes a previously promoted /32|/128 when later DNS
+// evidence marks the same address as proxy-routed (shared-IP generalisation
+// guard: the kernel static entry must not outlive its promoting domain's
+// policy). Only learn-promoted prefixes are revocable; snapshot-published
+// bypass rules are never touched.
+func (s *sharedNetwork) revokeV3Promotion(addr netip.Addr) {
+	if s == nil || !s.engineV3 || s.v3 == nil {
+		return
+	}
+	s.v3PromoteAccess.Lock()
+	_, tracked := s.v3Promoted[addr]
+	if tracked {
+		delete(s.v3Promoted, addr)
+	}
+	s.v3PromoteAccess.Unlock()
+	if !tracked {
+		return
+	}
+	bits := 32
+	if !addr.Is4() {
+		bits = 128
+	}
+	prefix := netip.PrefixFrom(addr.Unmap(), bits).Masked()
+	if err := s.v3.RevokeMergedStaticDirect(prefix); err != nil {
+		s.parent.logger.Debug("eBPF v3 revoke promoted direct: ", err)
+		return
+	}
+	if s.parent.logger != nil {
+		s.parent.logger.Info("eBPF v3 revoked promoted direct (shared-IP conflict): ", addr.String())
 	}
 }
 
@@ -712,6 +759,10 @@ func (s *sharedNetwork) publishV3StaticFromParent(parent *ECommon.Backend) error
 	} else if err := s.backend.PublishStaticDirect(prefixes, 0, 0); err != nil {
 		return err
 	}
+	// The full snapshot rebuild wiped every learn-promoted merge.
+	s.v3PromoteAccess.Lock()
+	s.v3Promoted = nil
+	s.v3PromoteAccess.Unlock()
 	s.parent.logger.Info("eBPF v3 static policy published: prefixes=", len(prefixes))
 	return nil
 }

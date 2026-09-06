@@ -73,7 +73,9 @@ type V3Backend struct {
 	// lastStatic is kept per bank.  A single snapshot is insufficient because
 	// banks alternate: A→B→C would otherwise try to delete B from bank A and
 	// leave A's stale prefixes live when bank A becomes active again.
-	lastStatic      [2][]netip.Prefix
+	lastStatic [2][]netip.Prefix
+	// mergedDirects[bank] tracks learn-promoted /32|/128 merges (revocable).
+	mergedDirects   [2]map[netip.Prefix]struct{}
 	originalDstLost atomic.Uint64
 	flowEnabled     bool
 }
@@ -892,6 +894,9 @@ func (b *V3Backend) PublishStaticDirect(prefixes []netip.Prefix, generation uint
 		written = append(written, prefix)
 	}
 	b.control.ActiveBank = inactive
+	// The freshly activated bank was rebuilt from the snapshot; promotions
+	// merged into it no longer exist.
+	b.mergedDirects[inactive] = make(map[netip.Prefix]struct{})
 	b.control.PolicyGeneration = generation
 	if err := b.writeControl(b.control.Enabled != 0); err != nil {
 		b.control = previousControl
@@ -982,6 +987,51 @@ func (b *V3Backend) MergeStaticDirect(prefix netip.Prefix) error {
 	}
 	// Keep the active bank snapshot coherent for the next full publish delete pass.
 	b.lastStatic[active] = append(last, prefix)
+	if b.mergedDirects[active] == nil {
+		b.mergedDirects[active] = make(map[netip.Prefix]struct{})
+	}
+	b.mergedDirects[active][prefix] = struct{}{}
+	return nil
+}
+
+// DeleteMergedStaticDirect removes one learn-promoted /32|/128 from the
+// active bank. Only MergeStaticDirect-sourced prefixes are revocable, so a
+// conflicting DNS observation can never delete a snapshot-published bypass
+// rule that happens to share the address.
+func (b *V3Backend) DeleteMergedStaticDirect(prefix netip.Prefix) error {
+	if b == nil {
+		return osErrClosed
+	}
+	prefix = prefix.Masked()
+	if !prefix.IsValid() {
+		return E.New("invalid static prefix")
+	}
+	b.access.Lock()
+	defer b.access.Unlock()
+	if b.runtime == nil {
+		return osErrClosed
+	}
+	active := b.control.ActiveBank & 1
+	if _, revocable := b.mergedDirects[active][prefix]; !revocable {
+		return nil
+	}
+	fd4 := int(b.runtime.policy4_bank0_fd)
+	fd6 := int(b.runtime.policy6_bank0_fd)
+	if active == 1 {
+		fd4 = int(b.runtime.policy4_bank1_fd)
+		fd6 = int(b.runtime.policy6_bank1_fd)
+	}
+	if err := deleteV3PolicyPrefix(fd4, fd6, prefix); err != nil {
+		return err
+	}
+	delete(b.mergedDirects[active], prefix)
+	last := b.lastStatic[active]
+	for i, p := range last {
+		if p == prefix {
+			b.lastStatic[active] = append(last[:i], last[i+1:]...)
+			break
+		}
+	}
 	return nil
 }
 

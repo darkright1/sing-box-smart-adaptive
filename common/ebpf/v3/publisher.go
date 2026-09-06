@@ -135,12 +135,16 @@ func addrBytes(addr netip.Addr) (family uint8, out [16]byte, err error) {
 
 // MemoryBackend is a test double for kernel maps (no cgo).
 type MemoryBackend struct {
-	Control         Control
-	Policy4         [2]map[LPM4Key]PolicyValue
-	Policy6         [2]map[LPM6Key]PolicyValue
-	Flows           map[FlowKey]FlowValue
-	DNS             *DNSHintTable
-	MACPolicies     map[MACKey]MACPolicyValue
+	Control     Control
+	Policy4     [2]map[LPM4Key]PolicyValue
+	Policy6     [2]map[LPM6Key]PolicyValue
+	Flows       map[FlowKey]FlowValue
+	DNS         *DNSHintTable
+	MACPolicies map[MACKey]MACPolicyValue
+	// mergedDirects[bank] records prefixes merged into the active bank via
+	// MergeStaticDirect (learn→promote). Only these are revocable through
+	// DeleteMergedStaticDirect; snapshot-published rules are protected.
+	mergedDirects   [2]map[netip.Prefix]struct{}
 	Publisher       *BankPublisher
 	Stats           [StatsCount]uint64
 	flowLimit       int
@@ -159,6 +163,9 @@ func NewMemoryBackend() *MemoryBackend {
 	b.Policy4[1] = make(map[LPM4Key]PolicyValue)
 	b.Policy6[0] = make(map[LPM6Key]PolicyValue)
 	b.Policy6[1] = make(map[LPM6Key]PolicyValue)
+	for bank := range b.mergedDirects {
+		b.mergedDirects[bank] = make(map[netip.Prefix]struct{})
+	}
 	bank, gen := b.Publisher.Snapshot()
 	b.Control = Control{
 		ABIVersion:       ABIVersion,
@@ -213,6 +220,9 @@ func (b *MemoryBackend) PublishStatic(policies []CompiledPolicy) error {
 	gen, bank := b.Publisher.Commit()
 	b.Control.ActiveBank = bank
 	b.Control.PolicyGeneration = gen
+	// The freshly activated bank was rebuilt from the snapshot; promotions
+	// merged into it no longer exist.
+	b.mergedDirects[bank] = make(map[netip.Prefix]struct{})
 	b.invalidateGenerationMaps(gen)
 	b.Stats[25] = uint64(gen) // RELOAD_GENERATION index if aligned — best-effort
 	return nil
@@ -250,6 +260,7 @@ func (b *MemoryBackend) MergeStaticDirect(prefix netip.Prefix) error {
 			return fmt.Errorf("static policy exceeds eBPF LPM map capacity")
 		}
 		b.Policy4[active][key] = value
+		b.mergedDirects[active][prefix] = struct{}{}
 		return nil
 	}
 	if addr.Is6() {
@@ -264,6 +275,7 @@ func (b *MemoryBackend) MergeStaticDirect(prefix netip.Prefix) error {
 			return fmt.Errorf("static policy exceeds eBPF LPM map capacity")
 		}
 		b.Policy6[active][key] = value
+		b.mergedDirects[active][prefix] = struct{}{}
 		return nil
 	}
 	return fmt.Errorf("invalid static prefix family")
@@ -457,5 +469,38 @@ func (b *MemoryBackend) PublishMACPolicies(entries []MACPolicyEntry) error {
 		snapshot[entry.Key] = entry.Value
 	}
 	b.MACPolicies = snapshot
+	return nil
+}
+
+// DeleteMergedStaticDirect removes one learned/promoted /32|/128 DIRECT from
+// the active bank. Only prefixes recorded by MergeStaticDirect are revocable;
+// snapshot-published rules are protected from accidental removal.
+func (b *MemoryBackend) DeleteMergedStaticDirect(prefix netip.Prefix) error {
+	if b == nil || b.Publisher == nil {
+		return fmt.Errorf("nil memory backend")
+	}
+	prefix = prefix.Masked()
+	if !prefix.IsValid() {
+		return fmt.Errorf("invalid static prefix")
+	}
+	active := b.Control.ActiveBank & 1
+	if _, revocable := b.mergedDirects[active][prefix]; !revocable {
+		return nil
+	}
+	delete(b.mergedDirects[active], prefix)
+	addr := prefix.Addr().Unmap()
+	if addr.Is4() {
+		key, err := PrefixToLPM4(prefix)
+		if err != nil {
+			return err
+		}
+		delete(b.Policy4[active], key)
+		return nil
+	}
+	key, err := PrefixToLPM6(prefix)
+	if err != nil {
+		return err
+	}
+	delete(b.Policy6[active], key)
 	return nil
 }

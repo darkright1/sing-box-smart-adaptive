@@ -643,6 +643,15 @@ func makeSharedNetworkRedirectKey(
 	return key, nil
 }
 
+// DeleteMergedStaticDirect is v3-only; the v2/token data plane has no
+// revocable merged static surface.
+func (b *SharedNetworkBackend) DeleteMergedStaticDirect(prefix netip.Prefix) error {
+	if len(prefix.Addr().As4()) == 0 {
+		return E.New("invalid prefix")
+	}
+	return E.New("DeleteMergedStaticDirect requires engine=v3")
+}
+
 // PublishMACPolicies is v2-specific: the source-MAC identity policy is a v3
 // feature and the token data plane never consumes it, so this surface only
 // rejects explicitly instead of silently ignoring a misconfigured engine.

@@ -92,6 +92,7 @@ type memSink struct {
 	deleted int
 	mac     int
 	gen     uint32
+	revoked []netip.Prefix
 
 	controlWrites int
 	flags         uint32
@@ -122,6 +123,10 @@ func (m *memSink) DeleteDirectFlow(protocol uint8, source, destination netip.Add
 }
 func (m *memSink) PublishMACPolicies(entries []ebpfv3.MACPolicyEntry) error {
 	m.mac += len(entries)
+	return nil
+}
+func (m *memSink) DeleteMergedStaticDirect(prefix netip.Prefix) error {
+	m.revoked = append(m.revoked, prefix)
 	return nil
 }
 func (m *memSink) WriteControlV3(enabled bool, flags uint32, activeBank, generation, routingMark uint32) error {
@@ -368,5 +373,49 @@ func TestLifecyclePublishMACSourcePolicies(t *testing.T) {
 	}
 	if len(lc2.backend.MACPolicies) != 0 {
 		t.Fatalf("stale mac rows survived snapshot replace: %d", len(lc2.backend.MACPolicies))
+	}
+}
+
+// The shared-IP generalisation guard end-to-end: promote merges a /32 into
+// the active banks; a later conflicting observation revokes it from both the
+// sink and the memory model.
+func TestLifecycleRevokeMergedStaticDirect(t *testing.T) {
+	drop := false
+	lc, err := NewLifecycle(option.EBPFSharedNetworkOptions{
+		Enabled:    true,
+		Engine:     EngineV3,
+		DataPlane:  "socket_assign",
+		DropUDP443: &drop,
+		PolicyOffload: option.EBPFPolicyOffloadOptions{
+			Enabled:     true,
+			StaticRules: true,
+			FakeIP:      true,
+			DNSIPHint:   "safe",
+		},
+	}, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lc.Close()
+	sink := &memSink{}
+	lc.BindSink(sink)
+
+	promoted := netip.PrefixFrom(netip.AddrFrom4([4]byte{1, 2, 3, 4}), 32)
+	if err := lc.MergeStaticDirect(promoted); err != nil {
+		t.Fatal(err)
+	}
+	active := lc.backend.Control.ActiveBank & 1
+	key, _ := ebpfv3.PrefixToLPM4(promoted)
+	if _, ok := lc.backend.Policy4[active][key]; !ok {
+		t.Fatal("promoted prefix missing after merge")
+	}
+	if err := lc.RevokeMergedStaticDirect(promoted); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := lc.backend.Policy4[active][key]; ok {
+		t.Fatal("revoked prefix still in memory bank")
+	}
+	if len(sink.revoked) != 1 || sink.revoked[0] != promoted {
+		t.Fatalf("sink revocations=%v", sink.revoked)
 	}
 }
