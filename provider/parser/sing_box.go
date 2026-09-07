@@ -77,6 +77,10 @@ func parseBoxOutbound(ctx context.Context, item any, index int) (option.Outbound
 		return result, false
 	}
 	if registry := service.FromContext[option.OutboundOptionsRegistry](ctx); registry != nil {
+		if support, ok := registry.(option.OutboundSupportRegistry); ok && !support.IsSupported(protocol) {
+			warnIgnoredProviderMember(providerTagFromContext(ctx), "outbound", index, tag, protocol, E.New("unsupported protocol in this build"))
+			return result, false
+		}
 		if _, loaded := registry.CreateOptions(protocol); !loaded {
 			warnIgnoredProviderMember(providerTagFromContext(ctx), "outbound", index, tag, protocol, E.New("unsupported protocol in this build"))
 			return result, false
@@ -107,6 +111,10 @@ func parseBoxEndpoint(ctx context.Context, item any, index int) (option.Endpoint
 		return result, false
 	}
 	if registry := service.FromContext[option.EndpointOptionsRegistry](ctx); registry != nil {
+		if support, ok := registry.(option.EndpointSupportRegistry); ok && !support.IsSupported(protocol) {
+			warnIgnoredProviderMember(providerTagFromContext(ctx), "endpoint", index, tag, protocol, E.New("unsupported protocol in this build"))
+			return result, false
+		}
 		if _, loaded := registry.CreateOptions(protocol); !loaded {
 			warnIgnoredProviderMember(providerTagFromContext(ctx), "endpoint", index, tag, protocol, E.New("unsupported protocol in this build"))
 			return result, false
@@ -156,5 +164,9 @@ func ParseBoxSubscription(ctx context.Context, content string) ([]option.Outboun
 	if len(options.Outbounds) == 0 && len(options.Endpoints) == 0 {
 		return nil, nil, E.New("no supported servers found")
 	}
-	return options.Outbounds, options.Endpoints, nil
+	outbounds, endpoints := filterSupportedMembers(ctx, options.Outbounds, options.Endpoints, providerTagFromContext(ctx))
+	if len(outbounds) == 0 && len(endpoints) == 0 {
+		return nil, nil, E.New("no supported servers found")
+	}
+	return outbounds, endpoints, nil
 }

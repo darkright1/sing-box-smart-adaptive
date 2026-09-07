@@ -33,6 +33,8 @@ func (parserEndpointRegistry) CreateOptions(protocol string) (any, bool) {
 	return new(option.WireGuardEndpointOptions), true
 }
 
+func (parserEndpointRegistry) IsSupported(protocol string) bool { return protocol == C.TypeWireGuard }
+
 type parserStubOutboundRegistry struct{}
 
 func (parserStubOutboundRegistry) OptionTypes() []string { return []string{C.TypeNaive} }
@@ -156,6 +158,36 @@ func TestFilterSupportedMembersDropsSchemaOnlyStubs(t *testing.T) {
 	}}, "test")
 	if len(outbounds) != 0 || len(endpoints) != 0 {
 		t.Fatalf("schema-only stubs must be discarded: outbounds=%d endpoints=%d", len(outbounds), len(endpoints))
+	}
+}
+
+func TestParseClashSubscriptionDropsSchemaOnlyStub(t *testing.T) {
+	ctx := service.ContextWith[option.OutboundOptionsRegistry](context.Background(), parserStubOutboundRegistry{})
+	ctx = service.ContextWith[option.OutboundSupportRegistry](ctx, parserStubOutboundRegistry{})
+	ctx = service.ContextWith[option.EndpointOptionsRegistry](ctx, parserEndpointRegistry{})
+	ctx = service.ContextWith[option.EndpointSupportRegistry](ctx, parserEndpointRegistry{})
+	outbounds, endpoints, err := ParseClashSubscription(ctx, `
+proxies:
+  - name: unavailable
+    type: naive
+    server: 127.0.0.1
+    port: 443
+`)
+	if err == nil || len(outbounds) != 0 || len(endpoints) != 0 {
+		t.Fatalf("schema-only clash protocol must be dropped: outbounds=%d endpoints=%d err=%v", len(outbounds), len(endpoints), err)
+	}
+}
+
+func TestParseBoxSubscriptionDropsSchemaOnlyStub(t *testing.T) {
+	ctx := service.ContextWith[option.OutboundOptionsRegistry](context.Background(), parserStubOutboundRegistry{})
+	ctx = service.ContextWith[option.OutboundSupportRegistry](ctx, parserStubOutboundRegistry{})
+	_, _, err := ParseBoxSubscription(ctx, `{
+  "outbounds": [
+    {"type":"naive", "tag":"unavailable", "server":"127.0.0.1", "server_port":443}
+  ]
+}`)
+	if err == nil || !strings.Contains(err.Error(), "no supported servers found") {
+		t.Fatalf("schema-only sing-box protocol must be dropped: err=%v", err)
 	}
 }
 

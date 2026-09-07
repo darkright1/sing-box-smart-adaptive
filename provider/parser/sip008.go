@@ -25,7 +25,7 @@ type ShadowsocksServerDocument struct {
 	PluginOpts string `json:"plugin_opts"`
 }
 
-func ParseSIP008Subscription(_ context.Context, content string) ([]option.Outbound, []option.Endpoint, error) {
+func ParseSIP008Subscription(ctx context.Context, content string) ([]option.Outbound, []option.Endpoint, error) {
 	var document ShadowsocksDocument
 	err := json.Unmarshal([]byte(content), &document)
 	if err != nil {
@@ -48,6 +48,10 @@ func ParseSIP008Subscription(_ context.Context, content string) ([]option.Outbou
 				PluginOptions: server.PluginOpts,
 			},
 		})
+	}
+	servers, _ = filterSupportedMembers(ctx, servers, nil, providerTagFromContext(ctx))
+	if len(servers) == 0 {
+		return nil, nil, E.New("no supported servers found")
 	}
 	return servers, nil, nil
 }

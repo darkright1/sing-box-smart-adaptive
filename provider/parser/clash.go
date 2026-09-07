@@ -167,6 +167,10 @@ func ParseClashSubscription(ctx context.Context, content string) ([]option.Outbo
 	if len(outbounds) == 0 && len(endpoints) == 0 {
 		return nil, nil, E.New("no supported servers found")
 	}
+	outbounds, endpoints = filterSupportedMembers(ctx, outbounds, endpoints, providerTagFromContext(ctx))
+	if len(outbounds) == 0 && len(endpoints) == 0 {
+		return nil, nil, E.New("no supported servers found")
+	}
 	return outbounds, endpoints, nil
 }
 
