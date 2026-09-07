@@ -48,6 +48,55 @@ func TestLoadBalancePersistentHashKeepsHostAffinity(t *testing.T) {
 	}
 }
 
+func TestLoadBalanceStickySessionRemapsAfterProviderRefresh(t *testing.T) {
+	first := &preMatchTestOutbound{tag: "first"}
+	sticky := &preMatchTestOutbound{tag: "sticky"}
+	third := &preMatchTestOutbound{tag: "third"}
+	history := U.NewHistoryStorage()
+	now := time.Now()
+	for _, outbound := range []adapter.Outbound{first, sticky, third} {
+		history.StoreURLTestHistoryKey(U.KeyForOutbound(outbound, "", N.NetworkTCP), &adapter.URLTestHistory{Time: now, Delay: 20})
+	}
+	group := &LoadBalanceGroup{
+		outbounds: []adapter.Outbound{first, sticky, third},
+		history:   history,
+	}
+	group.strategyFn = strategyStickySessionsWithIndex(group, func(_ uint64, _ int) int {
+		// The old implementation stored this as index 1. After refresh that
+		// index points at third, while the identity record must still resolve to
+		// sticky at its new index 0.
+		return 1
+	})
+	metadata := new(adapter.InboundContext)
+	if selected := group.Unwrap(metadata, true); selected != sticky {
+		t.Fatalf("initial sticky selection=%v, want sticky", selected)
+	}
+	group.replaceOutbounds([]adapter.Outbound{sticky, third})
+	if selected := group.Unwrap(metadata, true); selected != sticky {
+		t.Fatalf("sticky selection after refresh=%v, want sticky", selected)
+	}
+}
+
+func TestLoadBalanceUDPFailureDoesNotPoisonTCPHealth(t *testing.T) {
+	outbound := &preMatchTestOutbound{tag: "udp-node"}
+	history := U.NewHistoryStorage()
+	history.StoreURLTestHistoryKey(U.KeyForOutbound(outbound, "", N.NetworkTCP), &adapter.URLTestHistory{Time: time.Now(), Delay: 20})
+	group := &LoadBalanceGroup{
+		history:     history,
+		udpFailures: newGroupUDPFailureTracker(),
+	}
+	group.udpFailures.mark(outbound)
+	if !group.memberAvailable(outbound, &adapter.InboundContext{Network: N.NetworkTCP}) {
+		t.Fatal("UDP failure suppressed TCP member")
+	}
+	if group.memberAvailable(outbound, &adapter.InboundContext{Network: N.NetworkUDP}) {
+		t.Fatal("UDP failure did not suppress UDP member")
+	}
+	if history.LoadURLTestHistoryKey(U.KeyForOutbound(outbound, "", N.NetworkTCP)) == nil {
+		t.Fatal("UDP failure removed TCP URL-test history")
+	}
+}
+
 func TestLoadBalanceSelectPreMatchOutboundWithMetadata(t *testing.T) {
 	selectedOutbound := new(preMatchTestOutbound)
 	metadata := &adapter.InboundContext{Network: N.NetworkUDP}

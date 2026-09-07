@@ -374,11 +374,14 @@ func (s *URLTest) ListenPacket(ctx context.Context, destination M.Socksaddr) (ne
 	adapter.NoteRealOutbound(ctx, outbound)
 	conn, err := outbound.ListenPacket(ctx, destination)
 	if err == nil {
+		group.udpFailures.clear(outbound)
 		return group.interruptGroup.NewPacketConn(conn, interrupt.IsExternalConnectionFromContext(ctx)), nil
 	}
 	s.logger.ErrorContext(ctx, err)
-	key := historyKeyForOutbound(s.outbound, outbound, group.link, N.NetworkTCP)
-	group.history.DeleteURLTestHistoryKey(key)
+	// UDP failure is transport-scoped passive evidence. Do not erase the
+	// authenticated TCP URL-test observation; suppress this member briefly and
+	// let the next bounded test refresh the control-plane state.
+	group.udpFailures.mark(outbound)
 	return nil, err
 }
 
@@ -408,6 +411,7 @@ type URLTestGroup struct {
 	lastCheck                    atomic.Int64
 	selectedOutboundTCP          adapter.Outbound
 	selectedOutboundUDP          adapter.Outbound
+	udpFailures                  *groupUDPFailureTracker
 	selectionAccess              sync.RWMutex
 	interruptGroup               *interrupt.Group
 	interruptExternalConnections bool
@@ -451,6 +455,7 @@ func NewURLTestGroup(ctx context.Context, outboundManager adapter.OutboundManage
 		pause:                        service.FromContext[pause.Manager](ctx),
 		interruptGroup:               interrupt.NewGroup(),
 		interruptExternalConnections: interruptExternalConnections,
+		udpFailures:                  newGroupUDPFailureTracker(),
 	}, nil
 }
 
@@ -529,6 +534,7 @@ func (g *URLTestGroup) Close() error {
 }
 
 func (g *URLTestGroup) Select(network string) (adapter.Outbound, bool) {
+	isUDP := N.NetworkName(network) == N.NetworkUDP
 	g.selectionAccess.RLock()
 	var selected adapter.Outbound
 	switch network {
@@ -542,7 +548,7 @@ func (g *URLTestGroup) Select(network string) (adapter.Outbound, bool) {
 	var minOutbound adapter.Outbound
 	if selected != nil {
 		key := historyKeyForOutbound(g.outbound, selected, g.link, N.NetworkTCP)
-		if history := g.history.LoadURLTestHistoryKey(key); history != nil {
+		if history := g.history.LoadURLTestHistoryKey(key); history != nil && (!isUDP || !g.udpFailures.active(selected)) {
 			if g.containsOutbound(selected, network) {
 				minOutbound = selected
 				minDelay = history.Delay
@@ -552,6 +558,9 @@ func (g *URLTestGroup) Select(network string) (adapter.Outbound, bool) {
 	outbounds := g.OutboundsSnapshot()
 	for _, detour := range outbounds {
 		if !common.Contains(detour.Network(), network) {
+			continue
+		}
+		if isUDP && g.udpFailures.active(detour) {
 			continue
 		}
 		key := historyKeyForOutbound(g.outbound, detour, g.link, N.NetworkTCP)
@@ -567,6 +576,9 @@ func (g *URLTestGroup) Select(network string) (adapter.Outbound, bool) {
 	if minOutbound == nil {
 		for _, detour := range outbounds {
 			if !common.Contains(detour.Network(), network) {
+				continue
+			}
+			if isUDP && g.udpFailures.active(detour) {
 				continue
 			}
 			return detour, false

@@ -279,7 +279,7 @@ func (s *LoadBalance) DialContext(ctx context.Context, network string, destinati
 		return nil, E.New("load-balance is not started")
 	}
 	group.Touch()
-	metadata := adapter.ContextFrom(ctx)
+	metadata := loadBalanceMetadataWithNetwork(adapter.ContextFrom(ctx), network)
 	outbound := group.Unwrap(metadata, true)
 	if outbound == nil || !common.Contains(outbound.Network(), network) {
 		return nil, E.New("missing supported outbound")
@@ -302,7 +302,7 @@ func (s *LoadBalance) ListenPacket(ctx context.Context, destination M.Socksaddr)
 		return nil, E.New("load-balance is not started")
 	}
 	group.Touch()
-	metadata := adapter.ContextFrom(ctx)
+	metadata := loadBalanceMetadataWithNetwork(adapter.ContextFrom(ctx), N.NetworkUDP)
 	outbound := group.Unwrap(metadata, true)
 	if outbound == nil || !common.Contains(outbound.Network(), N.NetworkUDP) {
 		return nil, E.New("missing supported outbound")
@@ -310,13 +310,29 @@ func (s *LoadBalance) ListenPacket(ctx context.Context, destination M.Socksaddr)
 	adapter.NoteRealOutbound(ctx, outbound)
 	conn, err := outbound.ListenPacket(ctx, destination)
 	if err == nil {
+		group.udpFailures.clear(outbound)
 		return group.interruptGroup.NewPacketConnEx(conn, interrupt.IsExternalConnectionFromContext(ctx), interrupt.IsProviderConnectionFromContext(ctx)), nil
 	}
 	s.logger.ErrorContext(ctx, err)
-	key := historyKeyForOutbound(s.outbound, outbound, group.link, N.NetworkTCP)
-	group.history.DeleteURLTestHistoryKey(key)
+	// UDP failure is transport-scoped passive evidence. Keep the TCP URL-test
+	// history intact; only suppress this endpoint for a short UDP cooldown and
+	// let the normal bounded check refresh its control-plane view.
+	group.udpFailures.mark(outbound)
 	go group.CheckOutbounds(true)
 	return nil, err
+}
+
+func loadBalanceMetadataWithNetwork(metadata *adapter.InboundContext, network string) *adapter.InboundContext {
+	network = N.NetworkName(network)
+	if metadata == nil {
+		return &adapter.InboundContext{Network: network}
+	}
+	if N.NetworkName(metadata.Network) == network {
+		return metadata
+	}
+	copyMetadata := *metadata
+	copyMetadata.Network = network
+	return &copyMetadata
 }
 
 func (s *LoadBalance) NewConnection(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
@@ -409,6 +425,7 @@ type LoadBalanceGroup struct {
 	interruptExternalConnections bool
 	access                       sync.Mutex
 	outboundsAccess              sync.RWMutex
+	udpFailures                  *groupUDPFailureTracker
 	ticker                       *time.Ticker
 	close                        chan struct{}
 	started                      bool
@@ -466,6 +483,7 @@ func NewLoadBalanceGroup(ctx context.Context, outboundManager adapter.OutboundMa
 		pause:                        service.FromContext[pause.Manager](ctx),
 		interruptGroup:               interrupt.NewGroup(),
 		interruptExternalConnections: interruptExternalConnections,
+		udpFailures:                  newGroupUDPFailureTracker(),
 	}
 	if persistent {
 		// Surge's persistent mode is host-affinity over the currently available
@@ -716,6 +734,16 @@ func (g *LoadBalanceGroup) AliveForTestUrl(proxy adapter.Outbound) bool {
 	return false
 }
 
+func (g *LoadBalanceGroup) memberAvailable(proxy adapter.Outbound, metadata *adapter.InboundContext) bool {
+	if !g.AliveForTestUrl(proxy) {
+		return false
+	}
+	if metadata != nil && N.NetworkName(metadata.Network) == N.NetworkUDP && g.udpFailures.active(proxy) {
+		return false
+	}
+	return true
+}
+
 func (g *LoadBalanceGroup) alivenessWindow() time.Duration {
 	if g.interval > 0 {
 		return g.interval
@@ -756,7 +784,7 @@ func strategyRandom(g *LoadBalanceGroup, _ string) strategyFn {
 		}
 		available := make([]adapter.Outbound, 0, len(outbounds))
 		for _, proxy := range outbounds {
-			if !g.AliveForTestUrl(proxy) {
+			if !g.memberAvailable(proxy, metadata) {
 				continue
 			}
 			if matcher != nil && !matcher(proxy) {
@@ -875,7 +903,7 @@ func strategyRoundRobin(g *LoadBalanceGroup, url string) strategyFn {
 		for offset := 0; offset < length; offset++ {
 			id := (idx + offset) % length
 			proxy := outbounds[id]
-			if g.AliveForTestUrl(proxy) {
+			if g.memberAvailable(proxy, metadata) {
 				if matcher != nil && !matcher(proxy) {
 					return nil
 				}
@@ -917,7 +945,7 @@ func strategyHashing(g *LoadBalanceGroup, url string, fullHost bool) strategyFn 
 		for i := 0; i < maxRetry; i++ {
 			idx := jumpHash(key, buckets)
 			proxy := outbounds[idx]
-			if g.AliveForTestUrl(proxy) {
+			if g.memberAvailable(proxy, metadata) {
 				if matcher != nil && !matcher(proxy) {
 					return nil
 				}
@@ -930,7 +958,7 @@ func strategyHashing(g *LoadBalanceGroup, url string, fullHost bool) strategyFn 
 
 		// when availability is poor, traverse the entire list to get the available nodes
 		for _, proxy := range outbounds {
-			if g.AliveForTestUrl(proxy) {
+			if g.memberAvailable(proxy, metadata) {
 				if matcher != nil && !matcher(proxy) {
 					return nil
 				}
@@ -950,52 +978,58 @@ func strategyStickySessions(g *LoadBalanceGroup, url string) strategyFn {
 
 func strategyStickySessionsWithIndex(g *LoadBalanceGroup, selectIndex func(key uint64, length int) int) strategyFn {
 	maxRetry := 5
-	lruCache := common.Must1(freelru.New[uint64, int](1000, maphash.NewHasher[uint64]().Hash32, true))
+	// Store the selected endpoint identity, never its position in the current
+	// member slice. Provider refreshes routinely reorder or remove members; an
+	// index would silently turn a session pinned to A into a session pinned to B.
+	lruCache := common.Must1(freelru.New[uint64, adapter.SelectedRecord](1000, maphash.NewHasher[uint64]().Hash32, true))
 	lruCache.SetLifetime(g.ttl)
 	hash := maphash.NewHasher[string]()
 	return func(metadata *adapter.InboundContext, touch bool, matcher outboundMatcher) adapter.Outbound {
+		_ = touch
 		key := hash.Hash(getKeyWithSrcAndDst(metadata))
 		outbounds := g.outboundsSnapshot()
 		length := len(outbounds)
 		if length == 0 {
 			return nil
 		}
-		var (
-			idx int
-			has bool
-		)
+		var cachedRecord adapter.SelectedRecord
+		var has bool
 		if matcher == nil {
-			idx, has = lruCache.Get(key)
+			cachedRecord, has = lruCache.Get(key)
 		} else {
-			idx, has = lruCache.Peek(key)
+			cachedRecord, has = lruCache.Peek(key)
 		}
-		validMapping := has && idx < length
-		if !validMapping {
-			idx = selectIndex(key, length)
-		}
-
-		nowIdx := idx
-		for i := 1; i < maxRetry; i++ {
-			nowIdx %= length
-			proxy := outbounds[nowIdx]
-			if g.AliveForTestUrl(proxy) {
-				matched := matcher == nil || matcher(proxy)
-				if !validMapping || nowIdx != idx {
-					lruCache.Add(key, nowIdx)
-				} else if matcher != nil {
+		if has {
+			// Resolve the record against the fresh catalog. DialIdentity keeps
+			// credential variants distinct; EndpointIdentity allows a safe
+			// fallback when one credential disappeared during refresh.
+			if preferred := resolveSelectionRecord(outbounds, cachedRecord); preferred != nil && g.memberAvailable(preferred, metadata) {
+				if matcher != nil {
+					if !matcher(preferred) {
+						return nil
+					}
 					lruCache.Get(key)
 				}
-				if !matched {
+				return preferred
+			}
+		}
+
+		idx := selectIndex(key, length)
+		for i := 0; i < maxRetry; i++ {
+			idx %= length
+			proxy := outbounds[idx]
+			if g.memberAvailable(proxy, metadata) {
+				lruCache.Add(key, selectedRecordForOutbound(proxy))
+				if matcher != nil && !matcher(proxy) {
 					return nil
 				}
 				return proxy
-			} else {
-				nowIdx = selectIndex(key, length)
 			}
+			idx = selectIndex(key, length)
 		}
 		fbIdx := int(jumpHash(key, int32(length)))
 		matched := matcher == nil || matcher(outbounds[fbIdx])
-		lruCache.Add(key, fbIdx)
+		lruCache.Add(key, selectedRecordForOutbound(outbounds[fbIdx]))
 		if !matched {
 			return nil
 		}
