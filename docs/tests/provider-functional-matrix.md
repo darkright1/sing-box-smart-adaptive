@@ -18,6 +18,27 @@
 | P6 | 同步回调与关闭竞态 | provider 在注册回调时立即通知不会死锁；关闭后迟到回调无效且所有句柄注销。 |
 | P7 | tag miss | 不存在的显式 provider 返回带索引和 tag 的错误；不会留下半发布 membership。 |
 | P8 | 过滤与重复刷新 | `include/exclude` 在缓存和刷新路径一致；未变化 provider 不重复调用 `Outbounds()`。 |
+| P9 | 聚合 provider + 单 provider 并存 | `type: aggregate` 的组合可被任意组引用；源 provider 仍可单独引用；源更新/删除会实时反映，重名节点稳定加后缀。 |
+
+## 聚合 provider 语义
+
+聚合 provider 只保存源 provider 的 tag，不复制订阅内容、连接或健康画像。示例：
+
+```json
+{
+  "providers": [
+    {"type": "remote", "tag": "airport-a", "url": "https://example.invalid/a", "include": "HK|香港", "exclude": "Gcore"},
+    {"type": "remote", "tag": "airport-b", "url": "https://example.invalid/b"},
+    {"type": "aggregate", "tag": "airports-all", "providers": ["airport-a", "airport-b"], "include": "HK|JP"}
+  ],
+  "outbounds": [
+    {"type": "smart", "tag": "smart-all", "providers": ["airports-all"]},
+    {"type": "selector", "tag": "airport-a-only", "providers": ["airport-a"]}
+  ]
+}
+```
+
+源 provider 的 `include/exclude` 在其自身解析阶段执行；聚合 provider 和组级 `include/exclude` 再分别作为下一层门禁。这样既能给每个订阅单独过滤，又能保留聚合视图和单订阅视图。
 
 ## 执行门
 
@@ -26,6 +47,7 @@
 ```sh
 go test ./protocol/group ./adapter/provider
 go test -race ./protocol/group ./adapter/provider
+go test ./provider/aggregate
 ```
 
 再在 VM117 用当前 Linux 构建加载临时配置，确认 provider 组实际 `All()`、选择和删除回调；只允许使用临时端口和临时运行目录。GitHub Actions 使用 `release-linux.yml` 手动运行并将 `publish_release=false`，仅上传 Actions Artifact，不创建公开 Release。全部用例通过后才可提出生产部署申请。

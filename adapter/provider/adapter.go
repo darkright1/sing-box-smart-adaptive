@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"reflect"
+	"regexp"
 	"slices"
 	"sync"
 	"sync/atomic"
@@ -54,6 +55,38 @@ type Adapter struct {
 	enabled  bool
 	timeout  time.Duration
 	interval time.Duration
+}
+
+// FilterProviderOptions applies the provider-local include/exclude contract
+// before runtime outbounds are created. Remote, local-file, and inline
+// providers all use this helper so multi-provider configurations share one
+// filtering semantics and one auditable path. Exclude is a hard veto; include
+// is an optional positive selector. Input order is preserved.
+func FilterProviderOptions(outbounds []option.Outbound, endpoints []option.Endpoint, include, exclude *regexp.Regexp) ([]option.Outbound, []option.Endpoint) {
+	if include == nil && exclude == nil {
+		return outbounds, endpoints
+	}
+	filteredOutbounds := make([]option.Outbound, 0, len(outbounds))
+	for _, item := range outbounds {
+		if exclude != nil && exclude.MatchString(item.Tag) {
+			continue
+		}
+		if include != nil && !include.MatchString(item.Tag) {
+			continue
+		}
+		filteredOutbounds = append(filteredOutbounds, item)
+	}
+	filteredEndpoints := make([]option.Endpoint, 0, len(endpoints))
+	for _, item := range endpoints {
+		if exclude != nil && exclude.MatchString(item.Tag) {
+			continue
+		}
+		if include != nil && !include.MatchString(item.Tag) {
+			continue
+		}
+		filteredEndpoints = append(filteredEndpoints, item)
+	}
+	return filteredOutbounds, filteredEndpoints
 }
 
 const providerDeltaHistoryLimit = 16

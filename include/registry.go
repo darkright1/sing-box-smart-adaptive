@@ -41,6 +41,7 @@ import (
 	"github.com/sagernet/sing-box/protocol/tun"
 	"github.com/sagernet/sing-box/protocol/vless"
 	"github.com/sagernet/sing-box/protocol/vmess"
+	providerAggregate "github.com/sagernet/sing-box/provider/aggregate"
 	providerLocal "github.com/sagernet/sing-box/provider/local"
 	"github.com/sagernet/sing-box/provider/remote"
 	"github.com/sagernet/sing-box/service/api"
@@ -88,6 +89,7 @@ func ProviderRegistry() *provider.Registry {
 
 	providerLocal.RegisterProviderInline(registry)
 	providerLocal.RegisterProviderLocal(registry)
+	providerAggregate.RegisterProvider(registry)
 	remote.RegisterProvider(registry)
 
 	return registry

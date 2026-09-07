@@ -4,12 +4,13 @@ import (
 	"context"
 	"io"
 	"path/filepath"
+	"regexp"
 	"sync"
 	"time"
 
 	"github.com/sagernet/fswatch"
 	"github.com/sagernet/sing-box/adapter"
-	"github.com/sagernet/sing-box/adapter/provider"
+	providerAdapter "github.com/sagernet/sing-box/adapter/provider"
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
@@ -21,18 +22,18 @@ import (
 	"github.com/sagernet/sing/service/filemanager"
 )
 
-func RegisterProviderLocal(registry *provider.Registry) {
-	provider.Register[option.ProviderLocalOptions](registry, C.ProviderTypeLocal, NewProviderLocal)
+func RegisterProviderLocal(registry *providerAdapter.Registry) {
+	providerAdapter.Register[option.ProviderLocalOptions](registry, C.ProviderTypeLocal, NewProviderLocal)
 }
 
-func RegisterProviderInline(registry *provider.Registry) {
-	provider.Register[option.ProviderInlineOptions](registry, C.ProviderTypeInline, NewProviderInline)
+func RegisterProviderInline(registry *providerAdapter.Registry) {
+	providerAdapter.Register[option.ProviderInlineOptions](registry, C.ProviderTypeInline, NewProviderInline)
 }
 
 var _ adapter.Provider = (*ProviderLocal)(nil)
 
 type ProviderLocal struct {
-	provider.Adapter
+	providerAdapter.Adapter
 	ctx         context.Context
 	logger      log.ContextLogger
 	provider    adapter.ProviderManager
@@ -46,6 +47,8 @@ type ProviderLocal struct {
 	overrideDialer *option.OverrideDialerOptions
 	overrideTLS    *option.OverrideTLSOptions
 	overrideAnyTLS *option.OverrideAnyTLSOptions
+	exclude        *regexp.Regexp
+	include        *regexp.Regexp
 }
 
 func NewProviderInline(ctx context.Context, router adapter.Router, logFactory log.Factory, tag string, options option.ProviderInlineOptions) (adapter.Provider, error) {
@@ -54,8 +57,9 @@ func NewProviderInline(ctx context.Context, router adapter.Router, logFactory lo
 		endpointMgr = service.FromContext[adapter.EndpointManager](ctx)
 		logger      = logFactory.NewLogger(F.ToString("provider/inline", "[", tag, "]"))
 	)
+	options.Outbounds, options.Endpoints = providerAdapter.FilterProviderOptions(options.Outbounds, options.Endpoints, (*regexp.Regexp)(options.Include), (*regexp.Regexp)(options.Exclude))
 	provider := &ProviderLocal{
-		Adapter: provider.NewAdapter(ctx, router, outbound, endpointMgr, logFactory, logger, tag, C.ProviderTypeInline, options.HealthCheck),
+		Adapter: providerAdapter.NewAdapter(ctx, router, outbound, endpointMgr, logFactory, logger, tag, C.ProviderTypeInline, options.HealthCheck),
 		ctx:     ctx,
 		logger:  logger,
 	}
@@ -78,7 +82,7 @@ func NewProviderLocal(ctx context.Context, router adapter.Router, logFactory log
 		logger      = logFactory.NewLogger(F.ToString("provider/local", "[", tag, "]"))
 	)
 	provider := &ProviderLocal{
-		Adapter:  provider.NewAdapter(ctx, router, outbound, endpointMgr, logFactory, logger, tag, C.ProviderTypeLocal, options.HealthCheck),
+		Adapter:  providerAdapter.NewAdapter(ctx, router, outbound, endpointMgr, logFactory, logger, tag, C.ProviderTypeLocal, options.HealthCheck),
 		ctx:      ctx,
 		logger:   logger,
 		provider: service.FromContext[adapter.ProviderManager](ctx),
@@ -86,6 +90,8 @@ func NewProviderLocal(ctx context.Context, router adapter.Router, logFactory log
 		overrideDialer: options.OverrideDialer,
 		overrideTLS:    options.OverrideTLS,
 		overrideAnyTLS: options.OverrideAnyTLS,
+		exclude:        (*regexp.Regexp)(options.Exclude),
+		include:        (*regexp.Regexp)(options.Include),
 	}
 	filePath := filemanager.BasePath(ctx, options.Path)
 	provider.path, _ = filepath.Abs(filePath)
@@ -154,6 +160,7 @@ func (s *ProviderLocal) reloadFile(path string) error {
 	if err != nil {
 		return err
 	}
+	outboundOpts, endpointOpts = providerAdapter.FilterProviderOptions(outboundOpts, endpointOpts, s.include, s.exclude)
 	s.UpdateOutbounds(s.lastOutOpts, outboundOpts)
 	s.lastOutOpts = outboundOpts
 	s.UpdateEndpoints(s.lastEPOpts, endpointOpts)

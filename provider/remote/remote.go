@@ -555,12 +555,7 @@ func (s *ProviderRemote) updateProviderFromContent(content string) error {
 	if err != nil {
 		return err
 	}
-	outboundOpts = common.Filter(outboundOpts, func(it option.Outbound) bool {
-		return (s.exclude == nil || !s.exclude.MatchString(it.Tag)) && (s.include == nil || s.include.MatchString(it.Tag))
-	})
-	endpointOpts = common.Filter(endpointOpts, func(it option.Endpoint) bool {
-		return (s.exclude == nil || !s.exclude.MatchString(it.Tag)) && (s.include == nil || s.include.MatchString(it.Tag))
-	})
+	outboundOpts, endpointOpts = provider.FilterProviderOptions(outboundOpts, endpointOpts, s.include, s.exclude)
 	s.UpdateOutbounds(s.lastOutOpts, outboundOpts)
 	s.lastOutOpts = outboundOpts
 	s.UpdateEndpoints(s.lastEPOpts, endpointOpts)

@@ -61,6 +61,8 @@ func (h Provider) DescribeSchema(builder schema.Builder) (*schema.Node, error) {
 
 type ProviderLocalOptions struct {
 	Path        string                     `json:"path"`
+	Exclude     *badoption.Regexp          `json:"exclude,omitempty"`
+	Include     *badoption.Regexp          `json:"include,omitempty"`
 	HealthCheck ProviderHealthCheckOptions `json:"health_check,omitempty"`
 
 	OverrideDialer *OverrideDialerOptions `json:"override_dialer,omitempty"`
@@ -139,7 +141,20 @@ func (o ProviderRemoteOptions) DescribeSchema(builder schema.Builder) (*schema.N
 type ProviderInlineOptions struct {
 	Outbounds   []Outbound                 `json:"outbounds,omitempty"`
 	Endpoints   []Endpoint                 `json:"endpoints,omitempty"`
+	Exclude     *badoption.Regexp          `json:"exclude,omitempty"`
+	Include     *badoption.Regexp          `json:"include,omitempty"`
 	HealthCheck ProviderHealthCheckOptions `json:"health_check,omitempty"`
+}
+
+// ProviderAggregateOptions exposes a live union of other providers. The
+// source providers remain independently addressable; the aggregate is only a
+// view over their current members and never owns or closes them.
+type ProviderAggregateOptions struct {
+	Providers       []string                   `json:"providers,omitempty" reference:"provider"`
+	UseAllProviders bool                       `json:"use_all_providers,omitempty"`
+	Exclude         *badoption.Regexp          `json:"exclude,omitempty"`
+	Include         *badoption.Regexp          `json:"include,omitempty"`
+	HealthCheck     ProviderHealthCheckOptions `json:"health_check,omitempty"`
 }
 
 type ProviderHealthCheckOptions struct {
