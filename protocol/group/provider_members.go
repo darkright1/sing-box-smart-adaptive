@@ -8,6 +8,7 @@ import (
 	"sync"
 
 	"github.com/sagernet/sing-box/adapter"
+	providerAdapter "github.com/sagernet/sing-box/adapter/provider"
 	"github.com/sagernet/sing-box/option"
 	E "github.com/sagernet/sing/common/exceptions"
 	"github.com/sagernet/sing/common/x/list"
@@ -95,10 +96,7 @@ func (s *groupProviderSource) hasLocked() bool {
 // prevents Smart's health-aware catalog from drifting from selector,
 // url-test, or load-balance.
 func providerMemberAllowed(tag string, include, exclude *regexp.Regexp) bool {
-	if exclude != nil && exclude.MatchString(tag) {
-		return false
-	}
-	return include == nil || include.MatchString(tag)
+	return providerAdapter.MemberAllowed(tag, include, exclude)
 }
 
 // register subscribes to provider updates and resolves the configured tags.

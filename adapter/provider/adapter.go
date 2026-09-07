@@ -57,6 +57,17 @@ type Adapter struct {
 	interval time.Duration
 }
 
+// MemberAllowed applies the common include/exclude contract to one member.
+// Exclude is a hard veto; include is an optional positive selector. Every
+// provider source and group must use this function so their filter semantics
+// cannot drift apart.
+func MemberAllowed(tag string, include, exclude *regexp.Regexp) bool {
+	if exclude != nil && exclude.MatchString(tag) {
+		return false
+	}
+	return include == nil || include.MatchString(tag)
+}
+
 // FilterProviderOptions applies the provider-local include/exclude contract
 // before runtime outbounds are created. Remote, local-file, and inline
 // providers all use this helper so multi-provider configurations share one
@@ -68,20 +79,14 @@ func FilterProviderOptions(outbounds []option.Outbound, endpoints []option.Endpo
 	}
 	filteredOutbounds := make([]option.Outbound, 0, len(outbounds))
 	for _, item := range outbounds {
-		if exclude != nil && exclude.MatchString(item.Tag) {
-			continue
-		}
-		if include != nil && !include.MatchString(item.Tag) {
+		if !MemberAllowed(item.Tag, include, exclude) {
 			continue
 		}
 		filteredOutbounds = append(filteredOutbounds, item)
 	}
 	filteredEndpoints := make([]option.Endpoint, 0, len(endpoints))
 	for _, item := range endpoints {
-		if exclude != nil && exclude.MatchString(item.Tag) {
-			continue
-		}
-		if include != nil && !include.MatchString(item.Tag) {
+		if !MemberAllowed(item.Tag, include, exclude) {
 			continue
 		}
 		filteredEndpoints = append(filteredEndpoints, item)

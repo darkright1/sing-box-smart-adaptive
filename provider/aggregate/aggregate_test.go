@@ -129,3 +129,34 @@ func TestAggregateProviderCombinesAndKeepsSourcesIndependent(t *testing.T) {
 		t.Fatal("closed aggregate accepted a late child update")
 	}
 }
+
+func TestAggregateProviderRejectsNestedAggregates(t *testing.T) {
+	child := &Provider{tag: "child-aggregate"}
+	leaf := &testProvider{tag: "airport"}
+	manager := &testManager{providers: []adapter.Provider{child, leaf}}
+
+	explicit := &Provider{
+		manager:        manager,
+		tag:            "parent",
+		configuredTags: []string{"child-aggregate"},
+	}
+	if _, err := explicit.resolveChildren(true); err == nil {
+		t.Fatal("explicit aggregate-of-aggregate should be rejected")
+	}
+
+	all := &Provider{
+		manager: manager,
+		tag:     "all",
+		useAll:  true,
+	}
+	children, err := all.resolveChildren(true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := children[child.tag]; ok {
+		t.Fatal("use_all_providers must not include aggregate children")
+	}
+	if _, ok := children[leaf.tag]; !ok {
+		t.Fatal("use_all_providers dropped a leaf provider")
+	}
+}

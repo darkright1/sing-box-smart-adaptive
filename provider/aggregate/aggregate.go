@@ -226,6 +226,12 @@ func (p *Provider) resolveChildren(strict bool) (map[string]adapter.Provider, er
 			if child == nil || child.Tag() == "" || child.Tag() == p.tag {
 				continue
 			}
+			// Keep the graph acyclic. An aggregate is a live view, so allowing
+			// aggregate-of-aggregate with use_all could create callback cycles and
+			// duplicate the same endpoint repeatedly.
+			if child.Type() == C.ProviderTypeAggregate {
+				continue
+			}
 			desired[child.Tag()] = child
 		}
 		return desired, nil
@@ -240,6 +246,9 @@ func (p *Provider) resolveChildren(strict bool) (map[string]adapter.Provider, er
 				continue
 			}
 			return nil, E.New("outbound provider ", index, " not found: ", tag)
+		}
+		if child.Type() == C.ProviderTypeAggregate {
+			return nil, E.New("aggregate provider cannot contain aggregate provider: ", tag)
 		}
 		desired[tag] = child
 	}
@@ -315,7 +324,7 @@ func (p *Provider) rebuild() {
 			updatedAt = t
 		}
 		for _, outbound := range child.provider.Outbounds() {
-			if outbound == nil || outbound.Tag() == "" || !allowed(outbound.Tag(), include, exclude) {
+			if outbound == nil || outbound.Tag() == "" || !providerAdapter.MemberAllowed(outbound.Tag(), include, exclude) {
 				continue
 			}
 			all = append(all, member{base: outbound.Tag(), identity: identity(outbound), outbound: outbound})
@@ -353,13 +362,6 @@ func (p *Provider) rebuild() {
 	p.updatedAt = updatedAt
 	p.access.Unlock()
 	p.notify()
-}
-
-func allowed(tag string, include, exclude *regexp.Regexp) bool {
-	if exclude != nil && exclude.MatchString(tag) {
-		return false
-	}
-	return include == nil || include.MatchString(tag)
 }
 
 func identity(outbound adapter.Outbound) string {
