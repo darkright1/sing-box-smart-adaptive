@@ -643,11 +643,11 @@ func (a *Adapter) healthcheck(ctx context.Context) (map[string]uint16, error) {
 			if err != nil {
 				a.logger.Debug("outbound ", tag, " unavailable: ", err)
 				key := urltest.KeyForOutbound(detour, a.link, N.NetworkTCP)
-				a.history.DeleteURLTestHistoryKey(key, tag)
+				a.history.DeleteURLTestHistoryKey(key)
 			} else {
 				a.logger.Debug("outbound ", tag, " available: ", t, "ms")
 				key := urltest.KeyForOutbound(detour, a.link, N.NetworkTCP)
-				a.history.StoreURLTestHistoryKey(key, tag, &adapter.URLTestHistory{
+				a.history.StoreURLTestHistoryKey(key, &adapter.URLTestHistory{
 					Time:  time.Now(),
 					Delay: t,
 				})

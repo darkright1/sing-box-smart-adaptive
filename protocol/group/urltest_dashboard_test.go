@@ -32,7 +32,7 @@ func TestSelectDashboardOutboundsSamplesRecentAndStale(t *testing.T) {
 	}
 	now := time.Now()
 	for index := range 6 {
-		history.StoreURLTestHistory(outbounds[index].Tag(), &adapter.URLTestHistory{Time: now.Add(-time.Duration(index) * time.Minute), Delay: uint16(index + 1)})
+		history.StoreURLTestHistoryKey(urltest.KeyForOutbound(outbounds[index], "", N.NetworkTCP), &adapter.URLTestHistory{Time: now.Add(-time.Duration(index) * time.Minute), Delay: uint16(index + 1)})
 	}
 	selected := selectDashboardOutbounds(history, outbounds, dashboardURLTestLimit)
 	if len(selected) != dashboardURLTestLimit {

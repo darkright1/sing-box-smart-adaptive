@@ -21,7 +21,6 @@ import (
 
 type HistoryStorage struct {
 	access       sync.RWMutex
-	delayHistory map[string]*adapter.URLTestHistory
 	keyedHistory map[HistoryKey]*adapter.URLTestHistory
 	updateHooks  []*observable.Subscriber[struct{}]
 }
@@ -74,7 +73,6 @@ func KeyForOutbound(outbound adapter.Outbound, link, network string) HistoryKey 
 
 func NewHistoryStorage() *HistoryStorage {
 	return &HistoryStorage{
-		delayHistory: make(map[string]*adapter.URLTestHistory),
 		keyedHistory: make(map[HistoryKey]*adapter.URLTestHistory),
 	}
 }
@@ -91,40 +89,7 @@ func (s *HistoryStorage) NotifyUpdated() {
 	s.notifyUpdated()
 }
 
-// Deprecated: use LoadURLTestHistoryKey for provider-aware callers. This
-// method remains for static outbounds and external compatibility.
-func (s *HistoryStorage) LoadURLTestHistory(tag string) *adapter.URLTestHistory {
-	if s == nil {
-		return nil
-	}
-	s.access.RLock()
-	defer s.access.RUnlock()
-	return s.delayHistory[tag]
-}
-
-// Deprecated: use LoadURLTestHistoryKey for provider-aware callers. This
-// method remains for static outbounds and external compatibility.
-func (s *HistoryStorage) DeleteURLTestHistory(tag string) {
-	s.access.Lock()
-	delete(s.delayHistory, tag)
-	s.notifyUpdated()
-	s.access.Unlock()
-}
-
-// Deprecated: use StoreURLTestHistoryKey for provider-aware callers. This
-// method remains for static outbounds and external compatibility.
-func (s *HistoryStorage) StoreURLTestHistory(tag string, history *adapter.URLTestHistory) {
-	s.access.Lock()
-	s.delayHistory[tag] = history
-	s.notifyUpdated()
-	s.access.Unlock()
-}
-
-// LoadURLTestHistoryKey loads an identity-aware observation. The legacy tag
-// fallback is deliberately disabled for identified provider members: a reused
-// duplicate suffix must never inherit another endpoint's old latency. Static
-// outbounds retain compatibility with the historical tag-only cache.
-func (s *HistoryStorage) LoadURLTestHistoryKey(key HistoryKey, legacyTag string) *adapter.URLTestHistory {
+func (s *HistoryStorage) LoadURLTestHistoryKey(key HistoryKey) *adapter.URLTestHistory {
 	if s == nil {
 		return nil
 	}
@@ -133,13 +98,10 @@ func (s *HistoryStorage) LoadURLTestHistoryKey(key HistoryKey, legacyTag string)
 	if history := s.keyedHistory[key]; history != nil {
 		return history
 	}
-	if (key.PathIdentity == "" || key.PathIdentity == legacyTag) && key.DialIdentity == "" {
-		return s.delayHistory[legacyTag]
-	}
 	return nil
 }
 
-func (s *HistoryStorage) StoreURLTestHistoryKey(key HistoryKey, legacyTag string, history *adapter.URLTestHistory) {
+func (s *HistoryStorage) StoreURLTestHistoryKey(key HistoryKey, history *adapter.URLTestHistory) {
 	if s == nil {
 		return
 	}
@@ -153,15 +115,12 @@ func (s *HistoryStorage) StoreURLTestHistoryKey(key HistoryKey, legacyTag string
 	s.access.Unlock()
 }
 
-func (s *HistoryStorage) DeleteURLTestHistoryKey(key HistoryKey, legacyTag string) {
+func (s *HistoryStorage) DeleteURLTestHistoryKey(key HistoryKey) {
 	if s == nil {
 		return
 	}
 	s.access.Lock()
 	delete(s.keyedHistory, key)
-	if (key.PathIdentity == "" || key.PathIdentity == legacyTag) && key.DialIdentity == "" {
-		delete(s.delayHistory, legacyTag)
-	}
 	s.notifyUpdated()
 	s.access.Unlock()
 }
@@ -171,14 +130,14 @@ func (s *HistoryStorage) DeleteURLTestHistoryKey(key HistoryKey, legacyTag strin
 // the matching path identity, dial identity, and network, so a duplicate
 // provider alias or credential variant cannot leak another node's history into
 // the display.
-func (s *HistoryStorage) LoadLatestURLTestHistoryForOutbound(outbound adapter.Outbound, legacyTag, network string) *adapter.URLTestHistory {
+func (s *HistoryStorage) LoadLatestURLTestHistoryForOutbound(outbound adapter.Outbound, network string) *adapter.URLTestHistory {
 	if s == nil {
 		return nil
 	}
-	return s.LoadLatestURLTestHistoryKey(KeyForOutbound(outbound, "", network), legacyTag)
+	return s.LoadLatestURLTestHistoryKey(KeyForOutbound(outbound, "", network))
 }
 
-func (s *HistoryStorage) LoadLatestURLTestHistoryKey(key HistoryKey, legacyTag string) *adapter.URLTestHistory {
+func (s *HistoryStorage) LoadLatestURLTestHistoryKey(key HistoryKey) *adapter.URLTestHistory {
 	if s == nil {
 		return nil
 	}
@@ -195,9 +154,6 @@ func (s *HistoryStorage) LoadLatestURLTestHistoryKey(key HistoryKey, legacyTag s
 	}
 	if latest != nil {
 		return latest
-	}
-	if (key.PathIdentity == "" || key.PathIdentity == legacyTag) && key.DialIdentity == "" {
-		return s.delayHistory[legacyTag]
 	}
 	return nil
 }

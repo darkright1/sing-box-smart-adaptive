@@ -14,7 +14,7 @@ func TestLoadBalanceRandomPrefersAvailableMembers(t *testing.T) {
 	firstOutbound := &preMatchTestOutbound{tag: "first"}
 	secondOutbound := &preMatchTestOutbound{tag: "second"}
 	history := U.NewHistoryStorage()
-	history.StoreURLTestHistory(secondOutbound.Tag(), &adapter.URLTestHistory{Time: time.Now(), Delay: 20})
+	history.StoreURLTestHistoryKey(U.KeyForOutbound(secondOutbound, "", N.NetworkTCP), &adapter.URLTestHistory{Time: time.Now(), Delay: 20})
 	loadBalanceGroup := &LoadBalanceGroup{
 		outbounds: []adapter.Outbound{firstOutbound, secondOutbound},
 		history:   history,
@@ -32,8 +32,8 @@ func TestLoadBalancePersistentHashKeepsHostAffinity(t *testing.T) {
 	secondOutbound := &preMatchTestOutbound{tag: "second"}
 	history := U.NewHistoryStorage()
 	now := time.Now()
-	history.StoreURLTestHistory(firstOutbound.Tag(), &adapter.URLTestHistory{Time: now, Delay: 20})
-	history.StoreURLTestHistory(secondOutbound.Tag(), &adapter.URLTestHistory{Time: now, Delay: 30})
+	history.StoreURLTestHistoryKey(U.KeyForOutbound(firstOutbound, "", N.NetworkTCP), &adapter.URLTestHistory{Time: now, Delay: 20})
+	history.StoreURLTestHistoryKey(U.KeyForOutbound(secondOutbound, "", N.NetworkTCP), &adapter.URLTestHistory{Time: now, Delay: 30})
 	loadBalanceGroup := &LoadBalanceGroup{
 		outbounds: []adapter.Outbound{firstOutbound, secondOutbound},
 		history:   history,
@@ -77,8 +77,8 @@ func TestLoadBalancePreMatchDoesNotConsumeIneligibleRoundRobinSelection(t *testi
 	firstOutbound := &preMatchTestOutbound{tag: "first"}
 	secondOutbound := &preMatchTestOutbound{tag: "second"}
 	history := U.NewHistoryStorage()
-	history.StoreURLTestHistory(firstOutbound.Tag(), new(adapter.URLTestHistory))
-	history.StoreURLTestHistory(secondOutbound.Tag(), new(adapter.URLTestHistory))
+	history.StoreURLTestHistoryKey(U.KeyForOutbound(firstOutbound, "", N.NetworkTCP), new(adapter.URLTestHistory))
+	history.StoreURLTestHistoryKey(U.KeyForOutbound(secondOutbound, "", N.NetworkTCP), new(adapter.URLTestHistory))
 	loadBalanceGroup := &LoadBalanceGroup{
 		outbounds: []adapter.Outbound{firstOutbound, secondOutbound},
 		history:   history,
@@ -99,8 +99,8 @@ func TestLoadBalancePreMatchAdvancesAcceptedRoundRobinSelection(t *testing.T) {
 	firstOutbound := &preMatchTestOutbound{tag: "first"}
 	secondOutbound := &preMatchTestOutbound{tag: "second"}
 	history := U.NewHistoryStorage()
-	history.StoreURLTestHistory(firstOutbound.Tag(), new(adapter.URLTestHistory))
-	history.StoreURLTestHistory(secondOutbound.Tag(), new(adapter.URLTestHistory))
+	history.StoreURLTestHistoryKey(U.KeyForOutbound(firstOutbound, "", N.NetworkTCP), new(adapter.URLTestHistory))
+	history.StoreURLTestHistoryKey(U.KeyForOutbound(secondOutbound, "", N.NetworkTCP), new(adapter.URLTestHistory))
 	loadBalanceGroup := &LoadBalanceGroup{
 		outbounds: []adapter.Outbound{firstOutbound, secondOutbound},
 		history:   history,
@@ -121,8 +121,8 @@ func TestLoadBalanceStickyPreMatchReusesIneligibleSelectionForL4(t *testing.T) {
 	nonL3Outbound := &preMatchTestOutbound{tag: "non-l3"}
 	l3Outbound := &preMatchTestOutbound{tag: "l3"}
 	history := U.NewHistoryStorage()
-	history.StoreURLTestHistory(nonL3Outbound.Tag(), new(adapter.URLTestHistory))
-	history.StoreURLTestHistory(l3Outbound.Tag(), new(adapter.URLTestHistory))
+	history.StoreURLTestHistoryKey(U.KeyForOutbound(nonL3Outbound, "", N.NetworkTCP), new(adapter.URLTestHistory))
+	history.StoreURLTestHistoryKey(U.KeyForOutbound(l3Outbound, "", N.NetworkTCP), new(adapter.URLTestHistory))
 	loadBalanceGroup := &LoadBalanceGroup{
 		outbounds: []adapter.Outbound{nonL3Outbound, l3Outbound},
 		history:   history,

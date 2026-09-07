@@ -75,7 +75,7 @@ func proxyInfo(server *Server, detour adapter.Outbound) *badjson.JSONObject {
 	if !loaded {
 		leaf = detour
 	}
-	delayHistory := server.urlTestHistory.LoadLatestURLTestHistoryForOutbound(leaf, realTag, N.NetworkTCP)
+	delayHistory := server.urlTestHistory.LoadLatestURLTestHistoryForOutbound(leaf, N.NetworkTCP)
 	if delayHistory != nil {
 		info.Put("history", []*adapter.URLTestHistory{delayHistory})
 	} else {
@@ -319,9 +319,9 @@ func getProxyDelay(server *Server) func(w http.ResponseWriter, r *http.Request) 
 			}
 			key := urltest.KeyForOutbound(leaf, url, N.NetworkTCP)
 			if err != nil {
-				server.urlTestHistory.DeleteURLTestHistoryKey(key, realTag)
+				server.urlTestHistory.DeleteURLTestHistoryKey(key)
 			} else {
-				server.urlTestHistory.StoreURLTestHistoryKey(key, realTag, &adapter.URLTestHistory{
+				server.urlTestHistory.StoreURLTestHistoryKey(key, &adapter.URLTestHistory{
 					Time:  time.Now(),
 					Delay: delay,
 				})

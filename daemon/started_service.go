@@ -621,7 +621,7 @@ func (s *StartedService) readGroups() *Groups {
 			if !loaded {
 				leaf = itemOutbound
 			}
-			if history := historyStorage.LoadLatestURLTestHistoryForOutbound(leaf, realTag, N.NetworkTCP); history != nil {
+			if history := historyStorage.LoadLatestURLTestHistoryForOutbound(leaf, N.NetworkTCP); history != nil {
 				item.UrlTestTime = history.Time.Unix()
 				item.UrlTestDelay = int32(history.Delay)
 			}
@@ -759,9 +759,9 @@ func (s *StartedService) URLTest(ctx context.Context, request *URLTestRequest) (
 			t, err := urltest.URLTest(boxService.ctx, "", outbound)
 			key := urltest.KeyForOutbound(outbound, "", N.NetworkTCP)
 			if err != nil {
-				historyStorage.DeleteURLTestHistoryKey(key, outboundTag)
+				historyStorage.DeleteURLTestHistoryKey(key)
 			} else {
-				historyStorage.StoreURLTestHistoryKey(key, outboundTag, &adapter.URLTestHistory{
+				historyStorage.StoreURLTestHistoryKey(key, &adapter.URLTestHistory{
 					Time:  time.Now(),
 					Delay: t,
 				})
@@ -1202,7 +1202,7 @@ func (s *StartedService) SubscribeOutbounds(_ *emptypb.Empty, server grpc.Server
 				if !loaded {
 					leaf = ob
 				}
-				if history := historyStorage.LoadLatestURLTestHistoryForOutbound(leaf, realTag, N.NetworkTCP); history != nil {
+				if history := historyStorage.LoadLatestURLTestHistoryForOutbound(leaf, N.NetworkTCP); history != nil {
 					item.UrlTestTime = history.Time.Unix()
 					item.UrlTestDelay = int32(history.Delay)
 				}
@@ -1213,7 +1213,7 @@ func (s *StartedService) SubscribeOutbounds(_ *emptypb.Empty, server grpc.Server
 					Tag:  ep.Tag(),
 					Type: ep.Type(),
 				}
-				if history := historyStorage.LoadLatestURLTestHistoryForOutbound(ep, group.RealTag(boxService.outboundManager, ep), N.NetworkTCP); history != nil {
+				if history := historyStorage.LoadLatestURLTestHistoryForOutbound(ep, N.NetworkTCP); history != nil {
 					item.UrlTestTime = history.Time.Unix()
 					item.UrlTestDelay = int32(history.Delay)
 				}

@@ -21,16 +21,16 @@ latency after a refresh.
 URLTest, LoadBalance, provider checks, Clash API, daemon status, and manual
 tests use the identity-aware API. Because URLTest performs the complete
 authenticated outbound request, its record key includes both path and dial
-identity; two credentials on one path cannot share a result. Legacy tag-only
-entries remain available for ordinary static outbounds, but are never used as a
-fallback for identified provider members. Dashboard/status readers select the
-newest observation for the same path, dial identity, and network without
-crossing endpoint identities.
+identity; two credentials on one path cannot share a result. The old tag-only
+storage and API were removed entirely; existing state is intentionally
+discarded because it cannot be proven to belong to the current endpoint.
+Dashboard/status readers select the newest observation for the same path, dial
+identity, and network without crossing endpoint identities.
 
 ## Verification
 
 Tests cover provider alias isolation, probe-target isolation, credential
-isolation, network-family isolation, and static legacy fallback. Run:
+isolation, and network-family isolation. Run:
 
 ```sh
 go test ./common/urltest ./protocol/group ./experimental/clashapi ./daemon ./adapter/provider

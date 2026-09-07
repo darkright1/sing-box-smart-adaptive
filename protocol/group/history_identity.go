@@ -6,16 +6,13 @@ import (
 )
 
 // historyKeyForOutbound resolves a group to its current leaf before deriving
-// the URL-test identity. The display tag is returned only for compatibility
-// with static/legacy cache entries; identified provider members never fall
-// back to a reused duplicate alias.
-func historyKeyForOutbound(manager adapter.OutboundManager, detour adapter.Outbound, link, network string) (urltest.HistoryKey, string) {
-	realTag := detour.Tag()
+// the URL-test identity. Display aliases are never part of the history key.
+func historyKeyForOutbound(manager adapter.OutboundManager, detour adapter.Outbound, link, network string) urltest.HistoryKey {
 	if manager != nil {
-		realTag = RealTag(manager, detour)
+		realTag := RealTag(manager, detour)
 		if leaf, loaded := manager.Outbound(realTag); loaded {
 			detour = leaf
 		}
 	}
-	return urltest.KeyForOutbound(detour, link, network), realTag
+	return urltest.KeyForOutbound(detour, link, network)
 }

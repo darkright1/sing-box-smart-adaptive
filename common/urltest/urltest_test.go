@@ -29,11 +29,11 @@ func TestIdentityHistoryDoesNotReuseProviderAlias(t *testing.T) {
 	keyA := HistoryKey{PathIdentity: "path-a", ProbeTarget: "target-a", Network: "tcp"}
 	keyB := HistoryKey{PathIdentity: "path-b", ProbeTarget: "target-a", Network: "tcp"}
 	history := &adapter.URLTestHistory{Time: time.Now(), Delay: 30}
-	storage.StoreURLTestHistoryKey(keyA, "HK", history)
-	if got := storage.LoadURLTestHistoryKey(keyA, "HK"); got != history {
+	storage.StoreURLTestHistoryKey(keyA, history)
+	if got := storage.LoadURLTestHistoryKey(keyA); got != history {
 		t.Fatalf("identity history did not round-trip")
 	}
-	if got := storage.LoadURLTestHistoryKey(keyB, "HK"); got != nil {
+	if got := storage.LoadURLTestHistoryKey(keyB); got != nil {
 		t.Fatalf("provider alias fallback reused another endpoint's history: %#v", got)
 	}
 }
@@ -43,11 +43,11 @@ func TestIdentityHistorySeparatesProbeContext(t *testing.T) {
 	keyTCP := HistoryKey{PathIdentity: "path", ProbeTarget: "target-a", Network: "tcp"}
 	keyTCPOtherTarget := HistoryKey{PathIdentity: "path", ProbeTarget: "target-b", Network: "tcp"}
 	keyUDP := HistoryKey{PathIdentity: "path", ProbeTarget: "target-a", Network: "udp"}
-	storage.StoreURLTestHistoryKey(keyTCP, "node", &adapter.URLTestHistory{Time: time.Now(), Delay: 20})
-	if storage.LoadURLTestHistoryKey(keyTCPOtherTarget, "node") != nil {
+	storage.StoreURLTestHistoryKey(keyTCP, &adapter.URLTestHistory{Time: time.Now(), Delay: 20})
+	if storage.LoadURLTestHistoryKey(keyTCPOtherTarget) != nil {
 		t.Fatal("different probe target reused URL-test history")
 	}
-	if storage.LoadURLTestHistoryKey(keyUDP, "node") != nil {
+	if storage.LoadURLTestHistoryKey(keyUDP) != nil {
 		t.Fatal("different network family reused URL-test history")
 	}
 }
@@ -56,22 +56,8 @@ func TestIdentityHistorySeparatesAuthenticatedCredentials(t *testing.T) {
 	storage := NewHistoryStorage()
 	keyA := HistoryKey{PathIdentity: "path", DialIdentity: "credential-a", ProbeTarget: "target", Network: "tcp"}
 	keyB := HistoryKey{PathIdentity: "path", DialIdentity: "credential-b", ProbeTarget: "target", Network: "tcp"}
-	storage.StoreURLTestHistoryKey(keyA, "HK", &adapter.URLTestHistory{Time: time.Now(), Delay: 25})
-	if storage.LoadURLTestHistoryKey(keyB, "HK") != nil {
+	storage.StoreURLTestHistoryKey(keyA, &adapter.URLTestHistory{Time: time.Now(), Delay: 25})
+	if storage.LoadURLTestHistoryKey(keyB) != nil {
 		t.Fatal("different authenticated dial identities reused URL-test history")
-	}
-}
-
-func TestLegacyHistoryFallbackOnlyForStableTag(t *testing.T) {
-	storage := NewHistoryStorage()
-	history := &adapter.URLTestHistory{Time: time.Now(), Delay: 12}
-	storage.StoreURLTestHistory("static", history)
-	staticKey := HistoryKey{PathIdentity: "static", ProbeTarget: "target", Network: "tcp"}
-	providerKey := HistoryKey{PathIdentity: "provider-path", ProbeTarget: "target", Network: "tcp"}
-	if storage.LoadURLTestHistoryKey(staticKey, "static") != history {
-		t.Fatal("stable static tag did not retain legacy history fallback")
-	}
-	if storage.LoadURLTestHistoryKey(providerKey, "static") != nil {
-		t.Fatal("provider identity incorrectly used legacy tag fallback")
 	}
 }
