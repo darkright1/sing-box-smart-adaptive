@@ -135,22 +135,9 @@ func Decide(in Input) Decision {
 		}
 	}
 
-	// tc step 9: learned dynamic DIRECT promotions. They never override a
-	// static proxy/block rule, but are valid before exact-flow evidence.
-	if in.Dynamic != nil {
-		switch in.Dynamic.Verdict {
-		case VerdictDirect:
-			return Decision{Action: ActionContinue, Reason: ReasonDNSHintDirect, Mark: 0}
-		case VerdictBlock:
-			return Decision{Action: ActionBlock, Reason: ReasonStaticBlock, Mark: 0}
-		case VerdictProxy:
-			return proxyDecision(c, ReasonStaticProxy)
-		case VerdictMustControl:
-			return proxyDecision(c, ReasonMustControl)
-		}
-	}
-
-	// tc step 10: exact-flow.
+	// tc step 9: exact-flow. It is more specific than a destination-wide
+	// learned prefix, so an explicit flow verdict (including PROXY/BLOCK)
+	// must win over dynamic DIRECT evidence for the same destination.
 	if in.Flow != nil {
 		switch in.Flow.Verdict {
 		case VerdictDirect:
@@ -159,6 +146,21 @@ func Decide(in Input) Decision {
 			return Decision{Action: ActionBlock, Reason: ReasonFlowBlock, Mark: 0}
 		case VerdictProxy:
 			return proxyDecision(c, ReasonFlowProxy)
+		case VerdictMustControl:
+			return proxyDecision(c, ReasonMustControl)
+		}
+	}
+
+	// tc step 10: learned dynamic DIRECT promotions. They never override an
+	// authoritative static rule or an exact-flow verdict.
+	if in.Dynamic != nil {
+		switch in.Dynamic.Verdict {
+		case VerdictDirect:
+			return Decision{Action: ActionContinue, Reason: ReasonDNSHintDirect, Mark: 0}
+		case VerdictBlock:
+			return Decision{Action: ActionBlock, Reason: ReasonStaticBlock, Mark: 0}
+		case VerdictProxy:
+			return proxyDecision(c, ReasonStaticProxy)
 		case VerdictMustControl:
 			return proxyDecision(c, ReasonMustControl)
 		}

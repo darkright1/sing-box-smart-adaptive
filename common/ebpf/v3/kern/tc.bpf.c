@@ -268,10 +268,11 @@ static __attribute__((always_inline)) const struct sb_v3_policy_value *lookup_st
 	return 0;
 }
 
-/* Learned DIRECT promotions are intentionally consulted after the
- * authoritative static snapshot.  A static proxy/block rule therefore still
- * wins over a stale learned address, while a valid dynamic DIRECT entry keeps
- * its old first-packet fast-path behaviour without masquerading as static. */
+/* Learned DIRECT promotions are consulted after authoritative static and
+ * exact-flow verdicts. A static proxy/block rule or a more-specific flow
+ * verdict therefore wins over a stale/generalized learned address, while a
+ * valid dynamic DIRECT entry keeps its first-packet fast-path behaviour
+ * without masquerading as static. */
 static __attribute__((always_inline)) const struct sb_v3_dynamic_direct_value *lookup_dynamic_direct(
 		const struct sb_v3_control *control, const struct sb_v3_packet *packet) {
 	if (packet->family == SB_V3_AF_INET) {
@@ -639,10 +640,6 @@ int sb_v3_ingress(struct __sk_buff *skb) {
 			return handoff_proxy(skb, control, &packet, SB_V3_STAT_MUST_CONTROL, ifindex, pkt_len);
 	}
 
-	const struct sb_v3_dynamic_direct_value *dynamic_direct = lookup_dynamic_direct(control, &packet);
-	if (dynamic_direct && dynamic_direct->verdict == SB_V3_DIRECT)
-		return action_direct(skb, dynamic_direct->reason_code != 0 ? dynamic_direct->reason_code : SB_V3_STAT_DNS_HINT_DIRECT);
-
 	const struct sb_v3_flow_value *flow = lookup_flow(control, &packet);
 	if (flow) {
 		if (flow->verdict == SB_V3_DIRECT)
@@ -654,6 +651,10 @@ int sb_v3_ingress(struct __sk_buff *skb) {
 		if (flow->verdict == SB_V3_MUST_CONTROL)
 			return handoff_proxy(skb, control, &packet, SB_V3_STAT_MUST_CONTROL, ifindex, pkt_len);
 	}
+
+	const struct sb_v3_dynamic_direct_value *dynamic_direct = lookup_dynamic_direct(control, &packet);
+	if (dynamic_direct && dynamic_direct->verdict == SB_V3_DIRECT)
+		return action_direct(skb, dynamic_direct->reason_code != 0 ? dynamic_direct->reason_code : SB_V3_STAT_DNS_HINT_DIRECT);
 
 	__u32 dns_reason = 0;
 	if (dns_hint_allows_direct(control, &packet, &dns_reason))

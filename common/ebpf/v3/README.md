@@ -70,7 +70,7 @@ Kernel sink: `common/ebpf.V3Backend` (sole writer of TC maps).
 - When `policy_offload.enabled` and `dns_ip_hint` are enabled, TC may observe UDP replies from source port 53. The observation is advisory only; malformed/long names are discarded and no packet verdict is changed in the kernel.
 - A maximum of 4096 LRU observations is retained and the userspace monitor drains at most 128 rows every three seconds. Queue pressure therefore cannot create an unbounded goroutine or heap burst; dropped/evicted observations fail open and are not treated as routing failures.
 - `dns_ip_hint: off` keeps the plaintext sniffer disabled, even when `fakeip` is enabled. FakeIP answers use their separate authoritative observer path.
-- Learned DIRECT promotions never enter the double-bank static snapshot. They use bounded, generation-checked dynamic LPM maps with an answer-derived TTL; expired rows are reclaimed before capacity is reported, and static proxy/block rules always win.
+- Learned DIRECT promotions never enter the double-bank static snapshot. They use bounded, generation-checked dynamic LPM maps with an answer-derived TTL; expired rows are reclaimed before capacity is reported, and static proxy/block rules plus more-specific exact-flow verdicts always win.
 
 ## Build BPF object (Linux only)
 

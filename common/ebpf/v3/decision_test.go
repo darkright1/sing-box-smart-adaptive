@@ -47,15 +47,24 @@ func TestDecisionOrderFlowAfterStaticMiss(t *testing.T) {
 	}
 }
 
-func TestDecisionOrderDynamicDirectBeforeFlow(t *testing.T) {
+func TestDecisionOrderFlowBeforeDynamicDirect(t *testing.T) {
 	d := Decide(Input{
 		Control: baseControl(),
 		Packet:  tcpPacket(443),
 		Dynamic: &StaticPolicy{Verdict: VerdictDirect},
 		Flow:    &FlowHit{Verdict: VerdictProxy},
 	})
-	if d.Action != ActionContinue || d.Reason != ReasonDNSHintDirect || d.Mark != 0 {
-		t.Fatalf("dynamic direct must precede flow: %+v", d)
+	if d.Action != ActionProxy || d.Reason != ReasonFlowProxy {
+		t.Fatalf("exact flow must precede dynamic direct: %+v", d)
+	}
+	d = Decide(Input{
+		Control: baseControl(),
+		Packet:  tcpPacket(443),
+		Dynamic: &StaticPolicy{Verdict: VerdictDirect},
+		Flow:    &FlowHit{Verdict: VerdictBlock},
+	})
+	if d.Action != ActionBlock || d.Reason != ReasonFlowBlock || d.Mark != 0 {
+		t.Fatalf("exact flow block must precede dynamic direct: %+v", d)
 	}
 }
 

@@ -15,7 +15,7 @@ generation.
 - `DeleteMergedStaticDirect` is a compatibility façade that can remove only a
   learned row; it cannot delete a snapshot-published rule.
 - The pure memory backend and `decision.go` model the same precedence as the
-  kernel (`static -> dynamic -> exact flow -> DNS hint -> socket assign`).
+  kernel (`static -> exact flow -> dynamic -> DNS hint -> socket assign`).
 
 The kernel map is intentionally not an LRU: user space owns expiry tracking so
 stale rows are explicitly deleted before a fixed-capacity map can fill.
