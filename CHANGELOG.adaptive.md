@@ -15,6 +15,9 @@
   provider refresh.
 - Bound warning de-duplication so long-running provider refreshes cannot retain
   unbounded diagnostic keys.
+- Register the runtime protocol-capability views in the normal box context;
+  minimal builds now enforce the same supported-protocol filter when providers
+  are parsed through the production lifecycle, not only in direct parser tests.
 
 ## Unreleased — connection close diagnostics
 

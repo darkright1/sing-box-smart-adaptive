@@ -99,10 +99,26 @@ func Context(
 		ctx = service.ContextWith[option.OutboundOptionsRegistry](ctx, outboundRegistry)
 		ctx = service.ContextWith[adapter.OutboundRegistry](ctx, outboundRegistry)
 	}
+	// Keep the optional capability view alongside the legacy schema view. A
+	// minimal build may register a schema-only protocol so config/schema tools
+	// can describe it, while providers must still be able to reject it before
+	// constructing runtime outbounds. Registering only OutboundOptionsRegistry
+	// would make the capability gate silently disappear in the normal box
+	// context even though the concrete registry implements it.
+	if service.FromContext[option.OutboundSupportRegistry](ctx) == nil {
+		if supportRegistry, ok := outboundRegistry.(option.OutboundSupportRegistry); ok {
+			ctx = service.ContextWith[option.OutboundSupportRegistry](ctx, supportRegistry)
+		}
+	}
 	if service.FromContext[option.EndpointOptionsRegistry](ctx) == nil ||
 		service.FromContext[adapter.EndpointRegistry](ctx) == nil {
 		ctx = service.ContextWith[option.EndpointOptionsRegistry](ctx, endpointRegistry)
 		ctx = service.ContextWith[adapter.EndpointRegistry](ctx, endpointRegistry)
+	}
+	if service.FromContext[option.EndpointSupportRegistry](ctx) == nil {
+		if supportRegistry, ok := endpointRegistry.(option.EndpointSupportRegistry); ok {
+			ctx = service.ContextWith[option.EndpointSupportRegistry](ctx, supportRegistry)
+		}
 	}
 	if service.FromContext[adapter.DNSTransportRegistry](ctx) == nil {
 		ctx = service.ContextWith[option.DNSTransportOptionsRegistry](ctx, dnsTransportRegistry)
