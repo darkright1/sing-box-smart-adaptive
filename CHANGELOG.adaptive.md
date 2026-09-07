@@ -13,6 +13,8 @@
   all-invalid subscription with `no supported servers found`.
 - Guard raw URI parsing from legacy panic paths so a malformed line cannot abort a
   provider refresh.
+- Bound warning de-duplication so long-running provider refreshes cannot retain
+  unbounded diagnostic keys.
 
 ## Unreleased — connection close diagnostics
 

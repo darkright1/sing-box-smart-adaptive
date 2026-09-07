@@ -37,12 +37,44 @@ var subscriptionParsers = []subscriptionParser{
 	{name: "raw", parse: ParseRawSubscription},
 }
 
-var ignoredProviderFieldOnce sync.Map
-var ignoredProviderMemberOnce sync.Map
+// warningDeduper bounds diagnostic state. Provider feeds can rotate tags and
+// indexes indefinitely; an unbounded sync.Map would turn harmless log
+// suppression into a slow memory leak.
+type warningDeduper struct {
+	access sync.Mutex
+	limit  int
+	keys   map[string]struct{}
+	order  []string
+}
+
+func newWarningDeduper(limit int) *warningDeduper {
+	if limit < 1 {
+		limit = 1
+	}
+	return &warningDeduper{limit: limit, keys: make(map[string]struct{}, limit), order: make([]string, 0, limit)}
+}
+
+func (d *warningDeduper) first(key string) bool {
+	d.access.Lock()
+	defer d.access.Unlock()
+	if _, exists := d.keys[key]; exists {
+		return false
+	}
+	if len(d.order) >= d.limit {
+		oldest := d.order[0]
+		delete(d.keys, oldest)
+		d.order = d.order[1:]
+	}
+	d.keys[key] = struct{}{}
+	d.order = append(d.order, key)
+	return true
+}
+
+var ignoredProviderWarnings = newWarningDeduper(4096)
 
 func warnIgnoredProviderField(field, reason string) {
-	key := field + "|" + reason
-	if _, loaded := ignoredProviderFieldOnce.LoadOrStore(key, struct{}{}); loaded {
+	key := "field|" + field + "|" + reason
+	if !ignoredProviderWarnings.first(key) {
 		return
 	}
 	log.Printf("provider: ignoring unsupported field %q (%s)", field, reason)
@@ -57,7 +89,7 @@ func warnIgnoredProviderMember(providerTag, kind string, index int, tag, protoco
 	protocol = safeProviderText(protocol)
 	message := providerErrorReason(reason)
 	key := providerTag + "|" + kind + "|" + fmt.Sprint(index) + "|" + tag + "|" + protocol + "|" + message
-	if _, loaded := ignoredProviderMemberOnce.LoadOrStore(key, struct{}{}); loaded {
+	if !ignoredProviderWarnings.first(key) {
 		return
 	}
 	if providerTag == "" {
@@ -73,7 +105,7 @@ func warnProviderParserError(providerTag, parserName string, err error) {
 	}
 	message := providerErrorReason(err)
 	key := "parser|" + safeProviderText(providerTag) + "|" + parserName + "|" + message
-	if _, loaded := ignoredProviderMemberOnce.LoadOrStore(key, struct{}{}); loaded {
+	if !ignoredProviderWarnings.first(key) {
 		return
 	}
 	if providerTag == "" {

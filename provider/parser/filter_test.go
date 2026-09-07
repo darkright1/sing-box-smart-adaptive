@@ -216,3 +216,19 @@ func TestProviderErrorReasonDoesNotEchoSubscriptionPayload(t *testing.T) {
 		}
 	}
 }
+
+func TestWarningDeduperIsBounded(t *testing.T) {
+	deduper := newWarningDeduper(2)
+	if !deduper.first("a") || !deduper.first("b") || deduper.first("a") {
+		t.Fatal("warning deduper did not suppress a repeated key")
+	}
+	if !deduper.first("c") {
+		t.Fatal("warning deduper rejected a new key")
+	}
+	if deduper.first("b") {
+		t.Fatal("warning deduper did not retain the newest keys")
+	}
+	if !deduper.first("a") {
+		t.Fatal("warning deduper did not evict the oldest key")
+	}
+}
