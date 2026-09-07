@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/sagernet/sing-box/adapter"
+	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
 	"github.com/sagernet/sing/common/json/badoption"
@@ -15,14 +16,20 @@ import (
 
 type fakeProvider struct {
 	tag              string
+	typeName         string
 	nodes            []adapter.Outbound
 	notifyOnRegister bool
 	callbacks        blist.List[adapter.ProviderUpdateCallback]
 	outboundsCalls   int
 }
 
-func (p *fakeProvider) Type() string { return "provider" }
-func (p *fakeProvider) Tag() string  { return p.tag }
+func (p *fakeProvider) Type() string {
+	if p.typeName != "" {
+		return p.typeName
+	}
+	return "provider"
+}
+func (p *fakeProvider) Tag() string { return p.tag }
 func (p *fakeProvider) Outbounds() []adapter.Outbound {
 	p.outboundsCalls++
 	return p.nodes
@@ -278,6 +285,28 @@ func TestGroupProviderSourceTracksUseAllProviderChanges(t *testing.T) {
 	if manager.callbacks.Len() != 0 {
 		t.Fatalf("manager callbacks after close=%d, want 0", manager.callbacks.Len())
 	}
+}
+
+func TestGroupProviderSourceUseAllSkipsAggregateViews(t *testing.T) {
+	source := newGroupProviderSource(context.Background(), option.GroupCommonOption{UseAllProviders: true})
+	leaf := &fakeProvider{tag: "leaf"}
+	view := &fakeProvider{tag: "all-airports", typeName: C.ProviderTypeAggregate}
+	manager := &fakeProviderManager{providers: []adapter.Provider{leaf, view}}
+	source.manager = manager
+	if err := source.register(func(string) error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+	source.access.Lock()
+	if _, ok := source.providers[view.tag]; ok {
+		source.access.Unlock()
+		t.Fatal("use_all_providers included a synthetic aggregate view")
+	}
+	if _, ok := source.providers[leaf.tag]; !ok {
+		source.access.Unlock()
+		t.Fatal("use_all_providers dropped a leaf provider")
+	}
+	source.access.Unlock()
+	source.close()
 }
 
 func TestAppendProviderMembersSuffixesSameNameNodes(t *testing.T) {

@@ -9,6 +9,7 @@ import (
 
 	"github.com/sagernet/sing-box/adapter"
 	providerAdapter "github.com/sagernet/sing-box/adapter/provider"
+	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/option"
 	E "github.com/sagernet/sing/common/exceptions"
 	"github.com/sagernet/sing/common/x/list"
@@ -183,6 +184,13 @@ func resolveProviderSet(manager adapter.ProviderManager, useAll bool, configured
 	if useAll {
 		for _, provider := range manager.Providers() {
 			if provider == nil || provider.Tag() == "" {
+				continue
+			}
+			// Aggregate providers are synthetic live views. Including them in
+			// use_all_providers together with their leaf sources would duplicate
+			// every endpoint and make selection depend on declaration order. They
+			// remain available through an explicit providers reference.
+			if provider.Type() == C.ProviderTypeAggregate {
 				continue
 			}
 			tag := provider.Tag()
