@@ -20,9 +20,13 @@ var _ adapter.ProviderManager = (*Manager)(nil)
 var _ adapter.ProviderManagerObserver = (*Manager)(nil)
 
 type Manager struct {
-	ctx           context.Context
-	logger        log.ContextLogger
-	registry      adapter.ProviderRegistry
+	ctx      context.Context
+	logger   log.ContextLogger
+	registry adapter.ProviderRegistry
+	// operation serializes state transitions without extending the manager
+	// mutex across provider Start/Close callbacks. Provider implementations are
+	// external code and may re-enter the manager or wait on another lifecycle.
+	operation     sync.Mutex
 	access        sync.Mutex
 	started       bool
 	stage         adapter.StartStage
@@ -44,25 +48,22 @@ func (m *Manager) Initialize() {
 }
 
 func (m *Manager) Start(stage adapter.StartStage) error {
+	m.operation.Lock()
+	defer m.operation.Unlock()
 	m.access.Lock()
 	if m.started && m.stage >= stage {
 		panic("already started")
 	}
 	m.started = true
 	m.stage = stage
-	providers := m.providers
+	providers := append([]adapter.Provider(nil), m.providers...)
 	m.access.Unlock()
 	if stage == adapter.StartStateStart && len(providers) > 0 {
 		startContext := adapter.NewHTTPStartContext()
 		defer startContext.Close()
 		for _, provider := range providers {
-			if contextStarter, ok := provider.(interface {
-				StartContext(ctx context.Context, startContext *adapter.HTTPStartContext) error
-			}); ok {
-				err := contextStarter.StartContext(m.ctx, startContext)
-				if err != nil {
-					return E.Cause(err, stage, " provider/", provider.Type(), "[", provider.Tag(), "]")
-				}
+			if err := startProvider(m.ctx, provider, startContext); err != nil {
+				return E.Cause(err, stage, " provider/", provider.Type(), "[", provider.Tag(), "]")
 			}
 		}
 		return nil
@@ -71,13 +72,12 @@ func (m *Manager) Start(stage adapter.StartStage) error {
 }
 
 func (m *Manager) Close() error {
+	m.operation.Lock()
+	defer m.operation.Unlock()
 	monitor := taskmonitor.New(m.logger, C.StopTimeout)
 	m.access.Lock()
-	if !m.started {
-		m.access.Unlock()
-		return nil
-	}
 	m.started = false
+	m.stage = adapter.StartStateInitialize
 	providers := m.providers
 	m.providers = nil
 	m.providerByTag = make(map[string]adapter.Provider)
@@ -134,6 +134,8 @@ func (m *Manager) Get(tag string) (adapter.Provider, bool) {
 }
 
 func (m *Manager) Remove(tag string) error {
+	m.operation.Lock()
+	defer m.operation.Unlock()
 	m.access.Lock()
 	provider, found := m.providerByTag[tag]
 	if !found {
@@ -148,13 +150,9 @@ func (m *Manager) Remove(tag string) error {
 		panic("invalid provider index")
 	}
 	m.providers = append(m.providers[:index], m.providers[index+1:]...)
-	started := m.started
 	m.access.Unlock()
 	m.notifyProviderCallbacks()
-	if started {
-		return common.Close(provider)
-	}
-	return nil
+	return common.Close(provider)
 }
 
 func (m *Manager) Create(ctx context.Context, router adapter.Router, logFactory log.Factory, tag string, providerType string, options any) error {
@@ -162,36 +160,40 @@ func (m *Manager) Create(ctx context.Context, router adapter.Router, logFactory 
 		return os.ErrInvalid
 	}
 
+	m.operation.Lock()
+	defer m.operation.Unlock()
 	provider, err := m.registry.CreateProvider(ctx, router, logFactory, tag, providerType, options)
 	if err != nil {
 		return err
 	}
 	m.access.Lock()
-	if m.started {
-		if m.stage >= adapter.StartStateStart {
-			if contextStarter, ok := provider.(interface {
-				StartContext(ctx context.Context, startContext *adapter.HTTPStartContext) error
-			}); ok {
-				startContext := adapter.NewHTTPStartContext()
-				err = contextStarter.StartContext(m.ctx, startContext)
-				startContext.Close()
-				if err != nil {
-					m.access.Unlock()
-					_ = common.Close(provider)
-					return E.Cause(err, "start provider/", provider.Type(), "[", provider.Tag(), "]")
-				}
-			}
+	started := m.started
+	stage := m.stage
+	existsProvider := m.providerByTag[tag]
+	m.access.Unlock()
+
+	// A replacement is prepared completely before it becomes authoritative.
+	// Start is intentionally outside the manager lock; a failed start leaves the
+	// old provider untouched and the newly-created provider is closed.
+	if started && stage >= adapter.StartStateStart {
+		startContext := adapter.NewHTTPStartContext()
+		err = startProvider(m.ctx, provider, startContext)
+		startContext.Close()
+		if err != nil {
+			_ = common.Close(provider)
+			return E.Cause(err, "start provider/", provider.Type(), "[", provider.Tag(), "]")
 		}
 	}
-	if existsProvider, loaded := m.providerByTag[tag]; loaded {
-		if m.started {
-			err = common.Close(existsProvider)
-			if err != nil {
-				m.access.Unlock()
-				_ = common.Close(provider)
-				return E.Cause(err, "close provider", provider.Type(), "[", existsProvider.Tag(), "]")
-			}
-		}
+
+	m.access.Lock()
+	// operation serializes Create/Remove/Close, so the observed old provider is
+	// still current here. Publish the new provider before retiring the old one.
+	if current := m.providerByTag[tag]; current != existsProvider {
+		m.access.Unlock()
+		_ = common.Close(provider)
+		return E.New("provider changed while creating: ", tag)
+	}
+	if existsProvider != nil {
 		existsIndex := common.Index(m.providers, func(it adapter.Provider) bool {
 			return it == existsProvider
 		})
@@ -204,5 +206,22 @@ func (m *Manager) Create(ctx context.Context, router adapter.Router, logFactory 
 	m.providerByTag[tag] = provider
 	m.access.Unlock()
 	m.notifyProviderCallbacks()
+	if existsProvider != nil {
+		// Closing an old provider is best-effort after publication. A partial
+		// cleanup failure must never roll the authoritative view back to a
+		// provider whose resources may already be closed.
+		if err = common.Close(existsProvider); err != nil {
+			return E.Cause(err, "close replaced provider/", existsProvider.Type(), "[", existsProvider.Tag(), "]")
+		}
+	}
+	return nil
+}
+
+func startProvider(ctx context.Context, provider adapter.Provider, startContext *adapter.HTTPStartContext) error {
+	if contextStarter, ok := provider.(interface {
+		StartContext(ctx context.Context, startContext *adapter.HTTPStartContext) error
+	}); ok {
+		return contextStarter.StartContext(ctx, startContext)
+	}
 	return nil
 }

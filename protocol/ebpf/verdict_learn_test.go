@@ -202,13 +202,26 @@ func TestVerdictRouteInputsUnknownRefuses(t *testing.T) {
 	}
 }
 
-func TestVerdictRouteInputsIPOnlyAllows(t *testing.T) {
+func TestVerdictRouteInputsWithPortRefusesGlobalPromotion(t *testing.T) {
 	opts := verdictLearnOptions{mode: "learn", ttl: time.Minute}
 	meta := adapter.InboundContext{MatchInputs: adapter.RouteMatchIP | adapter.RouteMatchPort}
 	ok, reason := evaluateVerdictLearn(opts, stubDirectDialer{empty: true}, meta,
 		netip.MustParseAddrPort("1.2.3.4:443"))
+	if ok || reason != verdictSkipSniff {
+		t.Fatalf("ip+port must refuse global promotion, ok=%v reason=%d", ok, reason)
+	}
+}
+
+func TestVerdictRouteDestinationIPScopeAllows(t *testing.T) {
+	opts := verdictLearnOptions{mode: "learn", ttl: time.Minute}
+	meta := adapter.InboundContext{
+		MatchInputs:  adapter.RouteMatchIP | adapter.RouteMatchPort,
+		VerdictScope: adapter.RouteVerdictScopeDestinationIP,
+	}
+	ok, reason := evaluateVerdictLearn(opts, stubDirectDialer{empty: true}, meta,
+		netip.MustParseAddrPort("1.2.3.4:443"))
 	if !ok || reason != verdictSkipNone {
-		t.Fatalf("ip-only must allow, ok=%v reason=%d", ok, reason)
+		t.Fatalf("explicit destination-IP scope must allow, ok=%v reason=%d", ok, reason)
 	}
 }
 
@@ -333,10 +346,11 @@ func TestVerdictLearnIPOnlyAllowsDespiteSniffMetadata(t *testing.T) {
 	// Q3 P3: sniff filled Protocol but routing only evaluated IP/port → learn OK.
 	opts := verdictLearnOptions{mode: "learn", ttl: time.Minute, allowWithSniff: false}
 	meta := adapter.InboundContext{
-		MatchInputs: adapter.RouteMatchIP | adapter.RouteMatchPort,
-		Protocol:    "tls",
-		Client:      "chrome",
-		SniffHost:   "example.com",
+		MatchInputs:  adapter.RouteMatchIP | adapter.RouteMatchPort,
+		VerdictScope: adapter.RouteVerdictScopeDestinationIP,
+		Protocol:     "tls",
+		Client:       "chrome",
+		SniffHost:    "example.com",
 	}
 	ok, reason := evaluateVerdictLearn(opts, stubDirectDialer{empty: true}, meta,
 		netip.MustParseAddrPort("1.2.3.4:443"))

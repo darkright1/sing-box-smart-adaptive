@@ -5,6 +5,31 @@ import (
 	"testing"
 )
 
+func TestCanonicalPrefixNormalizesMappedIPv4(t *testing.T) {
+	mapped := netip.PrefixFrom(netip.MustParseAddr("::ffff:203.0.113.9"), 128)
+	got, err := CanonicalPrefix(mapped)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := netip.MustParsePrefix("203.0.113.9/32")
+	if got != want {
+		t.Fatalf("canonical prefix=%v want %v", got, want)
+	}
+	key, err := PrefixToLPM4(mapped)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if key.PrefixLen != 32 || key.Addr != [4]byte{203, 0, 113, 9} {
+		t.Fatalf("mapped prefix produced wrong lpm key: %+v", key)
+	}
+}
+
+func TestCanonicalPrefixRejectsPartialMappedNetwork(t *testing.T) {
+	if _, err := CanonicalPrefix(netip.MustParsePrefix("::ffff:203.0.113.0/95")); err == nil {
+		t.Fatal("partial IPv4-mapped network must not become a policy key")
+	}
+}
+
 func TestPublishStaticAtomicAndGeneration(t *testing.T) {
 	b := NewMemoryBackend()
 	prefix := netip.MustParsePrefix("1.1.1.1/32")

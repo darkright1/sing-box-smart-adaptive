@@ -108,7 +108,11 @@ type InboundContext struct {
 	PreMatch                            bool
 	// MatchInputs accumulates condition classes evaluated during routing.
 	MatchInputs RouteMatchInputs
-	Extended    *InboundContextExtended
+	// VerdictScope describes which dimensions influenced the winning route
+	// verdict. eBPF destination-only promotion is permitted only for the
+	// DestinationIP scope; zero remains fail-closed for legacy callers.
+	VerdictScope RouteVerdictScope
+	Extended     *InboundContextExtended
 
 	// rule cache
 
@@ -153,6 +157,7 @@ func (c *InboundContext) ResetRuleCache() {
 	// MatchInputs is scoped per rule evaluation; only the final matched rule's
 	// classes must survive for eBPF verdict learn (not prior failed rules).
 	c.MatchInputs = 0
+	c.VerdictScope = RouteVerdictScopeUnknown
 	c.ResetRuleMatchCache()
 }
 
@@ -252,6 +257,20 @@ func OverrideContext(ctx context.Context) context.Context {
 
 // RouteMatchInputs is a bitset of rule condition classes evaluated for a flow.
 type RouteMatchInputs uint32
+
+// RouteVerdictScope is the semantic scope of a route decision. It prevents a
+// verdict that depends on source, port, process, domain, or other metadata from
+// being generalized into a global destination-IP kernel rule.
+type RouteVerdictScope uint8
+
+const (
+	RouteVerdictScopeUnknown RouteVerdictScope = iota
+	RouteVerdictScopeDestinationIP
+)
+
+type RouteVerdictScopeProvider interface {
+	VerdictScope() RouteVerdictScope
+}
 
 // RouteMatchUnknown must be a real bit.  Zero means that no rule-input class
 // was recorded (legacy callers); using zero for Unknown made OR accumulation a

@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/sagernet/sing-box/adapter"
+	"github.com/sagernet/sing-box/common/nodeidentity"
 	"github.com/sagernet/sing-box/common/urltest"
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/log"
@@ -35,8 +36,10 @@ type Adapter struct {
 	outboundsAccess sync.RWMutex
 	outbounds       []adapter.Outbound
 	outboundsByTag  map[string]adapter.Outbound
+	outboundIDs     map[string]string
 	endpoints       []adapter.Outbound
 	endpointsByTag  map[string]adapter.Outbound
+	endpointIDs     map[string]string
 	ticker          *time.Ticker
 	checking        atomic.Bool
 	paused          atomic.Bool
@@ -138,8 +141,12 @@ func (a *Adapter) Outbounds() []adapter.Outbound {
 	a.outboundsAccess.RLock()
 	defer a.outboundsAccess.RUnlock()
 	outbounds := make([]adapter.Outbound, 0, len(a.outbounds)+len(a.endpoints))
-	outbounds = append(outbounds, a.outbounds...)
-	outbounds = append(outbounds, a.endpoints...)
+	for _, outbound := range a.outbounds {
+		outbounds = append(outbounds, withEndpointIdentity(outbound, a.outboundIDs[outbound.Tag()]))
+	}
+	for _, endpoint := range a.endpoints {
+		outbounds = append(outbounds, withEndpointIdentity(endpoint, a.endpointIDs[endpoint.Tag()]))
+	}
 	return outbounds
 }
 
@@ -147,10 +154,10 @@ func (a *Adapter) Outbound(tag string) (adapter.Outbound, bool) {
 	a.outboundsAccess.RLock()
 	defer a.outboundsAccess.RUnlock()
 	if detour, ok := a.outboundsByTag[tag]; ok {
-		return detour, true
+		return withEndpointIdentity(detour, a.outboundIDs[tag]), true
 	}
 	detour, ok := a.endpointsByTag[tag]
-	return detour, ok
+	return withEndpointIdentity(detour, a.endpointIDs[tag]), ok
 }
 
 func (a *Adapter) resolveOutboundTags(newOpts []option.Outbound) []string {
@@ -177,7 +184,13 @@ func (a *Adapter) resolveOutboundTags(newOpts []option.Outbound) []string {
 // across provider reloads (order-independent). Avoids " (2)" churn that breaks
 // smart pins/filters when the subscription list reorders.
 func providerOutboundIdentity(opt option.Outbound) string {
-	return providerOptionFingerprint(opt.Type, opt.Tag, opt.Options)
+	normalized, err := nodeidentity.CanonicalEndpointOptions(opt.Options)
+	if err != nil {
+		normalized = opt.Options
+	}
+	// Display/provider aliases are not endpoint identity. Credentials are
+	// removed by CanonicalEndpointOptions so copies share one health portrait.
+	return providerOptionFingerprint(opt.Type, "", normalized)
 }
 
 // providerOptionFingerprint uses encoding/json instead of fmt's structural
@@ -270,6 +283,12 @@ func (a *Adapter) UpdateOutbounds(oldOpts []option.Outbound, newOpts []option.Ou
 	a.outboundsAccess.Lock()
 	a.outbounds = outbounds
 	a.outboundsByTag = outboundsByTag
+	a.outboundIDs = make(map[string]string, len(newTags))
+	for i, tag := range newTags {
+		if i < len(newOpts) {
+			a.outboundIDs[tag] = providerOutboundIdentity(newOpts[i])
+		}
+	}
 	a.outboundsAccess.Unlock()
 	a.recordOutboundDelta(previousOutbounds, outboundsByTag)
 	if a.enabled && a.history != nil {
@@ -410,8 +429,10 @@ func (a *Adapter) Close() error {
 	endpoints := a.endpoints
 	a.outbounds = nil
 	a.outboundsByTag = nil
+	a.outboundIDs = nil
 	a.endpoints = nil
 	a.endpointsByTag = nil
+	a.endpointIDs = nil
 	a.outboundsAccess.Unlock()
 	var err error
 	for _, ob := range outbounds {
@@ -429,6 +450,25 @@ func (a *Adapter) Close() error {
 		}
 	}
 	return err
+}
+
+// identifiedOutbound keeps endpoint identity attached to provider members
+// without exposing provider options or credentials to group consumers.
+type identifiedOutbound struct {
+	adapter.Outbound
+	identity string
+}
+
+func (o *identifiedOutbound) EndpointIdentity() string { return o.identity }
+
+func withEndpointIdentity(outbound adapter.Outbound, identity string) adapter.Outbound {
+	if outbound == nil || identity == "" {
+		return outbound
+	}
+	if identified, ok := outbound.(adapter.OutboundWithEndpointIdentity); ok && identified.EndpointIdentity() == identity {
+		return outbound
+	}
+	return &identifiedOutbound{Outbound: outbound, identity: identity}
 }
 
 func (a *Adapter) loopCheck() {
@@ -630,6 +670,16 @@ func (a *Adapter) UpdateEndpoints(oldOpts []option.Endpoint, newOpts []option.En
 	a.outboundsAccess.Lock()
 	a.endpoints = endpoints
 	a.endpointsByTag = endpointsByTag
+	a.endpointIDs = make(map[string]string, len(newTags))
+	for i, tag := range newTags {
+		if i < len(newOpts) {
+			normalized, normalizeErr := nodeidentity.CanonicalEndpointOptions(newOpts[i].Options)
+			if normalizeErr != nil {
+				normalized = newOpts[i].Options
+			}
+			a.endpointIDs[tag] = providerOptionFingerprint(newOpts[i].Type, "", normalized)
+		}
+	}
 	a.outboundsAccess.Unlock()
 	if a.enabled && a.history != nil {
 		go a.HealthCheck(a.ctx)

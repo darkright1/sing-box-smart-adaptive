@@ -432,17 +432,19 @@ type Smart struct {
 	logger     log.ContextLogger
 	tags       []string
 
-	provider        adapter.ProviderManager
-	providerAccess  sync.Mutex
-	providers       map[string]adapter.Provider
-	providerHandles map[string]*list.Element[adapter.ProviderUpdateCallback]
-	outboundsCache  map[string][]adapter.Outbound
-	providerTags    []string
-	exclude         *regexp.Regexp
-	include         *regexp.Regexp
-	manualExclude   *nodefilter.Matcher
-	nodeWeights     *nodeweight.Matcher
-	useAllProviders bool
+	provider              adapter.ProviderManager
+	providerAccess        sync.Mutex
+	providers             map[string]adapter.Provider
+	providerHandles       map[string]*list.Element[adapter.ProviderUpdateCallback]
+	providerObserver      adapter.ProviderManagerObserver
+	providerManagerHandle *list.Element[adapter.ProviderManagerUpdateCallback]
+	outboundsCache        map[string][]adapter.Outbound
+	providerTags          []string
+	exclude               *regexp.Regexp
+	include               *regexp.Regexp
+	manualExclude         *nodefilter.Matcher
+	nodeWeights           *nodeweight.Matcher
+	useAllProviders       bool
 
 	access                 sync.RWMutex
 	candidates             []adapter.Outbound
@@ -837,30 +839,74 @@ func normalizeSmartProbeURL(raw string) string {
 }
 
 func (s *Smart) Start() error {
-	if s.providerHandles == nil {
-		s.providerHandles = make(map[string]*list.Element[adapter.ProviderUpdateCallback])
-	}
+	var (
+		providerTags []string
+		resolved     = make(map[string]adapter.Provider)
+	)
 	if s.useAllProviders {
 		for _, provider := range s.provider.Providers() {
-			s.providerTags = append(s.providerTags, provider.Tag())
-			s.providers[provider.Tag()] = provider
-			s.providerHandles[provider.Tag()] = provider.RegisterCallback(s.onProviderUpdated)
+			if provider == nil || provider.Tag() == "" {
+				continue
+			}
+			tag := provider.Tag()
+			if _, exists := resolved[tag]; exists {
+				continue
+			}
+			providerTags = append(providerTags, tag)
+			resolved[tag] = provider
 		}
 	} else {
-		for index, tag := range s.providerTags {
+		s.providerAccess.Lock()
+		configuredTags := append([]string(nil), s.providerTags...)
+		s.providerAccess.Unlock()
+		for index, tag := range configuredTags {
+			if _, exists := resolved[tag]; exists {
+				continue
+			}
 			provider, loaded := s.provider.Get(tag)
 			if !loaded {
 				return E.New("outbound provider ", index, " not found: ", tag)
 			}
-			s.providers[tag] = provider
-			s.providerHandles[tag] = provider.RegisterCallback(s.onProviderUpdated)
+			providerTags = append(providerTags, tag)
+			resolved[tag] = provider
 		}
 	}
-	if len(s.tags)+len(s.providerTags) == 0 {
+	s.providerAccess.Lock()
+	if s.providerHandles == nil {
+		s.providerHandles = make(map[string]*list.Element[adapter.ProviderUpdateCallback])
+	}
+	s.providerTags = providerTags
+	for _, tag := range providerTags {
+		s.providers[tag] = resolved[tag]
+		s.providerHandles[tag] = nil
+	}
+	useAll := s.useAllProviders
+	manager := s.provider
+	s.providerAccess.Unlock()
+	for _, tag := range providerTags {
+		s.attachSmartProviderCallback(tag, resolved[tag])
+	}
+	if useAll {
+		if observer, ok := manager.(adapter.ProviderManagerObserver); ok {
+			handle := observer.RegisterProviderCallback(s.onProviderManagerUpdated)
+			s.providerAccess.Lock()
+			if s.closing.Load() {
+				s.providerAccess.Unlock()
+				if handle != nil {
+					observer.UnregisterProviderCallback(handle)
+				}
+			} else {
+				s.providerObserver = observer
+				s.providerManagerHandle = handle
+				s.providerAccess.Unlock()
+			}
+		}
+	}
+	if len(s.tags)+len(providerTags) == 0 {
 		return E.New("missing outbound and provider tags")
 	}
 	if err := s.rebuildCandidates(""); err != nil {
-		if !errors.Is(err, errSmartNoCandidates) || len(s.providerTags) == 0 {
+		if !errors.Is(err, errSmartNoCandidates) || len(providerTags) == 0 {
 			return err
 		}
 		s.setWarmingStatus("waiting for provider candidates")
@@ -875,6 +921,94 @@ func (s *Smart) Start() error {
 		}
 	}
 	return nil
+}
+
+func (s *Smart) attachSmartProviderCallback(tag string, provider adapter.Provider) {
+	if provider == nil {
+		return
+	}
+	handle := provider.RegisterCallback(s.onProviderUpdated)
+	s.providerAccess.Lock()
+	if s.closing.Load() || s.providers[tag] != provider {
+		s.providerAccess.Unlock()
+		if handle != nil {
+			provider.UnregisterCallback(handle)
+		}
+		return
+	}
+	s.providerHandles[tag] = handle
+	s.providerAccess.Unlock()
+}
+
+// onProviderManagerUpdated keeps use_all_providers in sync with dynamic
+// manager membership. Provider callbacks are attached outside providerAccess;
+// an implementation may synchronously publish from RegisterCallback.
+func (s *Smart) onProviderManagerUpdated() {
+	if s == nil || !s.useAllProviders || s.closing.Load() {
+		return
+	}
+	desired := make(map[string]adapter.Provider)
+	var desiredTags []string
+	for _, provider := range s.provider.Providers() {
+		if provider == nil || provider.Tag() == "" {
+			continue
+		}
+		tag := provider.Tag()
+		if _, exists := desired[tag]; exists {
+			continue
+		}
+		desired[tag] = provider
+		desiredTags = append(desiredTags, tag)
+	}
+	var removedProviders []adapter.Provider
+	var removedHandles []*list.Element[adapter.ProviderUpdateCallback]
+	var added []struct {
+		tag      string
+		provider adapter.Provider
+	}
+	s.providerAccess.Lock()
+	if s.closing.Load() {
+		s.providerAccess.Unlock()
+		return
+	}
+	changed := len(desiredTags) != len(s.providerTags)
+	for tag, provider := range s.providers {
+		if desiredProvider, exists := desired[tag]; exists && desiredProvider == provider {
+			continue
+		}
+		removedProviders = append(removedProviders, provider)
+		removedHandles = append(removedHandles, s.providerHandles[tag])
+		delete(s.providers, tag)
+		delete(s.providerHandles, tag)
+		delete(s.outboundsCache, tag)
+		changed = true
+	}
+	for _, tag := range desiredTags {
+		if _, exists := s.providers[tag]; exists {
+			continue
+		}
+		provider := desired[tag]
+		s.providers[tag] = provider
+		s.providerHandles[tag] = nil
+		added = append(added, struct {
+			tag      string
+			provider adapter.Provider
+		}{tag: tag, provider: provider})
+		changed = true
+	}
+	s.providerTags = desiredTags
+	s.providerAccess.Unlock()
+	for index, provider := range removedProviders {
+		if provider != nil && removedHandles[index] != nil {
+			provider.UnregisterCallback(removedHandles[index])
+		}
+	}
+	for _, item := range added {
+		s.attachSmartProviderCallback(item.tag, item.provider)
+	}
+	if changed && !s.closing.Load() {
+		_ = s.onProviderUpdated("")
+	}
 }
 
 func (s *Smart) PostStart() error {
@@ -1147,13 +1281,28 @@ func (s *Smart) waitWorkerStop(timeout time.Duration) {
 
 func (s *Smart) unregisterProviderCallbacks() {
 	s.providerAccess.Lock()
+	providers := make(map[string]adapter.Provider, len(s.providers))
+	handles := make(map[string]*list.Element[adapter.ProviderUpdateCallback], len(s.providerHandles))
+	for tag, provider := range s.providers {
+		providers[tag] = provider
+	}
 	for tag, handle := range s.providerHandles {
-		if provider := s.providers[tag]; provider != nil && handle != nil {
+		handles[tag] = handle
+	}
+	observer := s.providerObserver
+	managerHandle := s.providerManagerHandle
+	s.providerObserver = nil
+	s.providerManagerHandle = nil
+	clear(s.providerHandles)
+	s.providerAccess.Unlock()
+	if observer != nil && managerHandle != nil {
+		observer.UnregisterProviderCallback(managerHandle)
+	}
+	for tag, handle := range handles {
+		if provider := providers[tag]; provider != nil && handle != nil {
 			provider.UnregisterCallback(handle)
 		}
 	}
-	clear(s.providerHandles)
-	s.providerAccess.Unlock()
 }
 
 func (s *Smart) currentPhase() smartPhase {

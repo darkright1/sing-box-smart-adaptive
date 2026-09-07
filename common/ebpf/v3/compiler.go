@@ -39,6 +39,27 @@ type CompiledPolicy struct {
 	Value  PolicyValue
 }
 
+// CanonicalPrefix normalizes prefixes before they become policy keys. Go can
+// represent an IPv4 destination as an IPv4-mapped IPv6 address; preserving
+// that representation would make the same /32 land in the IPv6 LPM (or use
+// the wrong prefix length) and later fail to revoke or look up the IPv4 key.
+// Treat mapped prefixes as IPv4 only when their mapped portion is complete.
+func CanonicalPrefix(prefix netip.Prefix) (netip.Prefix, error) {
+	if !prefix.IsValid() {
+		return netip.Prefix{}, fmt.Errorf("invalid prefix")
+	}
+	addr := prefix.Addr()
+	bits := prefix.Bits()
+	if addr.Is4In6() {
+		if bits < 96 {
+			return netip.Prefix{}, fmt.Errorf("invalid ipv4-mapped prefix length")
+		}
+		addr = addr.Unmap()
+		bits -= 96
+	}
+	return netip.PrefixFrom(addr, bits).Masked(), nil
+}
+
 // EligibleForStaticSink implements design §7.2.
 func EligibleForStaticSink(in CompileInput) error {
 	if in.Kind == RuleKindNeedsControl || in.Kind == RuleKindDynamicGroup {
@@ -122,8 +143,12 @@ func reasonForStatic(v Verdict) uint16 {
 
 // PrefixToLPM4 builds an LPM key; bits must be 0–32.
 func PrefixToLPM4(p netip.Prefix) (LPM4Key, error) {
-	p = p.Masked()
-	addr := p.Addr().Unmap()
+	var err error
+	p, err = CanonicalPrefix(p)
+	if err != nil {
+		return LPM4Key{}, err
+	}
+	addr := p.Addr()
 	if !addr.Is4() {
 		return LPM4Key{}, fmt.Errorf("not ipv4 prefix")
 	}
@@ -137,7 +162,11 @@ func PrefixToLPM4(p netip.Prefix) (LPM4Key, error) {
 
 // PrefixToLPM6 builds an LPM key for IPv6.
 func PrefixToLPM6(p netip.Prefix) (LPM6Key, error) {
-	p = p.Masked()
+	var err error
+	p, err = CanonicalPrefix(p)
+	if err != nil {
+		return LPM6Key{}, err
+	}
 	addr := p.Addr()
 	if !addr.Is6() || addr.Is4In6() {
 		// Allow only pure IPv6; Unmap 4in6 should go to LPM4.

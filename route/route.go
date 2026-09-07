@@ -619,6 +619,12 @@ func (r *Router) matchRule(
 	if fatalErr != nil {
 		return
 	}
+	// A non-terminal action can mutate routing metadata (destination, network,
+	// sniffed protocol, or resolver state) before the eventual route decision.
+	// Such a decision is not representable by the destination-IP-only eBPF key.
+	// Keep this taint through the rule walk instead of accidentally treating a
+	// later bare DIRECT rule as globally safe.
+	verdictScopeTainted := false
 
 match:
 	for currentRuleIndex, currentRule := range r.rules {
@@ -687,6 +693,7 @@ match:
 		}
 		switch action := currentRule.Action().(type) {
 		case *R.RuleActionSniff:
+			verdictScopeTainted = true
 			newBuffer, newPacketBuffers, newErr := r.actionSniff(ctx, metadata, action, inputConn, inputPacketConn, buffers, packetBuffers)
 			if newBuffer != nil {
 				buffers = append(buffers, newBuffer)
@@ -698,10 +705,14 @@ match:
 				return
 			}
 		case *R.RuleActionResolve:
+			verdictScopeTainted = true
 			fatalErr = r.actionResolve(ctx, metadata, action)
 			if fatalErr != nil {
 				return
 			}
+		}
+		if _, isRouteOptions := currentRule.Action().(*R.RuleActionRouteOptions); isRouteOptions {
+			verdictScopeTainted = true
 		}
 		actionType := currentRule.Action().Type()
 		if actionType == C.RuleActionTypeRoute ||
@@ -719,6 +730,21 @@ match:
 			selectedRule = currentRule
 			selectedRuleIndex = currentRuleIndex
 			break match
+		}
+	}
+	// Publish the semantic scope alongside MatchInputs. A route without a
+	// matching rule has only the destination itself as an input; a rule must
+	// explicitly prove the same destination-IP scope before eBPF may promote it.
+	metadata.VerdictScope = adapter.RouteVerdictScopeDestinationIP
+	if verdictScopeTainted {
+		metadata.VerdictScope = adapter.RouteVerdictScopeUnknown
+	}
+	if selectedRule != nil {
+		metadata.VerdictScope = adapter.RouteVerdictScopeUnknown
+		if !verdictScopeTainted {
+			if scoped, ok := selectedRule.(adapter.RouteVerdictScopeProvider); ok {
+				metadata.VerdictScope = scoped.VerdictScope()
+			}
 		}
 	}
 	return

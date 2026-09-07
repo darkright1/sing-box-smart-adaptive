@@ -59,6 +59,25 @@ type DefaultRule struct {
 	abstractDefaultRule
 }
 
+// VerdictScope reports whether this rule can be generalized to a destination
+// IP-only kernel verdict. Source/port/network/domain/process and inverted
+// predicates are intentionally excluded because they are not represented by
+// the eBPF destination-IP key.
+func (r *DefaultRule) VerdictScope() adapter.RouteVerdictScope {
+	if r == nil || r.invert || len(r.sourceAddressItems) > 0 || len(r.sourcePortItems) > 0 ||
+		len(r.destinationPortItems) > 0 {
+		return adapter.RouteVerdictScopeUnknown
+	}
+	var classes adapter.RouteMatchInputs
+	for _, item := range r.allItems {
+		classes |= itemMatchClass(item)
+	}
+	if classes == 0 || classes == adapter.RouteMatchIP {
+		return adapter.RouteVerdictScopeDestinationIP
+	}
+	return adapter.RouteVerdictScopeUnknown
+}
+
 type RuleItem interface {
 	Match(metadata *adapter.InboundContext) bool
 	String() string
@@ -320,6 +339,13 @@ var _ adapter.Rule = (*LogicalRule)(nil)
 
 type LogicalRule struct {
 	abstractLogicalRule
+}
+
+// Logical combinations are kept out of destination-only promotion unless a
+// future compiler can prove every branch has the same scope. Treating them as
+// unknown is the safe default and keeps the scope contract explicit.
+func (r *LogicalRule) VerdictScope() adapter.RouteVerdictScope {
+	return adapter.RouteVerdictScopeUnknown
 }
 
 func NewLogicalRule(ctx context.Context, logger log.ContextLogger, options option.LogicalRule) (*LogicalRule, error) {

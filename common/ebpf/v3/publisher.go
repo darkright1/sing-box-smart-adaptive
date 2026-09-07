@@ -193,8 +193,14 @@ func (b *MemoryBackend) PublishStatic(policies []CompiledPolicy) error {
 		nextGen = 1
 	}
 	for _, p := range policies {
+		canonical, canonicalErr := CanonicalPrefix(p.Prefix)
+		if canonicalErr != nil {
+			b.Publisher.AbortCompile()
+			return canonicalErr
+		}
+		p.Prefix = canonical
 		p.Value.Generation = nextGen
-		addr := p.Prefix.Addr().Unmap()
+		addr := p.Prefix.Addr()
 		if addr.Is4() {
 			key, err := PrefixToLPM4(p.Prefix)
 			if err != nil {
@@ -235,9 +241,10 @@ func (b *MemoryBackend) MergeStaticDirect(prefix netip.Prefix) error {
 	if b == nil || b.Publisher == nil {
 		return fmt.Errorf("nil memory backend")
 	}
-	prefix = prefix.Masked()
-	if !prefix.IsValid() {
-		return fmt.Errorf("invalid static prefix")
+	var err error
+	prefix, err = CanonicalPrefix(prefix)
+	if err != nil {
+		return err
 	}
 	active := b.Control.ActiveBank & 1
 	value := PolicyValue{
@@ -479,9 +486,10 @@ func (b *MemoryBackend) DeleteMergedStaticDirect(prefix netip.Prefix) error {
 	if b == nil || b.Publisher == nil {
 		return fmt.Errorf("nil memory backend")
 	}
-	prefix = prefix.Masked()
-	if !prefix.IsValid() {
-		return fmt.Errorf("invalid static prefix")
+	var err error
+	prefix, err = CanonicalPrefix(prefix)
+	if err != nil {
+		return err
 	}
 	active := b.Control.ActiveBank & 1
 	if _, revocable := b.mergedDirects[active][prefix]; !revocable {

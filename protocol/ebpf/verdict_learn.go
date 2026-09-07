@@ -104,19 +104,18 @@ func evaluateVerdictLearn(
 	return true, verdictSkipNone
 }
 
-// verdictRouteInputsOK: MatchInputs==0 (no rule items evaluated) → allow;
-// Unknown or any non-IP-only bit → deny (Q3 P1 fail-closed).
+// verdictRouteInputsOK: only a destination-IP scoped verdict may become a
+// global /32. MatchInputs is retained as a compatibility fallback for callers
+// that predate VerdictScope, but port/network/source dimensions are no longer
+// treated as destination-only because they are absent from the kernel key.
 func verdictRouteInputsOK(metadata adapter.InboundContext) bool {
+	if metadata.VerdictScope != adapter.RouteVerdictScopeUnknown {
+		return metadata.VerdictScope == adapter.RouteVerdictScopeDestinationIP
+	}
 	if metadata.MatchInputs == 0 {
 		return true
 	}
-	if metadata.MatchInputs&adapter.RouteMatchUnknown != 0 {
-		return false
-	}
-	if metadata.MatchInputs&^adapter.RouteMatchIPOnly != 0 {
-		return false
-	}
-	return true
+	return metadata.MatchInputs == adapter.RouteMatchIP
 }
 
 func verdictUsedSniff(metadata adapter.InboundContext) bool {

@@ -191,6 +191,15 @@ type SelectorGroup interface {
 	Selected() Outbound
 }
 
+// OutboundWithEndpointIdentity carries a credential-free, stable identity for
+// provider members. The display tag may change when a provider is reordered or
+// when a duplicate is suffixed, but Smart health/profile state must continue
+// to refer to the same network endpoint.
+type OutboundWithEndpointIdentity interface {
+	Outbound
+	EndpointIdentity() string
+}
+
 // DirectOffloadHub fans out NoteRoutedDirect to all eBPF inbounds that registered.
 type DirectOffloadHub struct {
 	access   sync.Mutex

@@ -21,6 +21,14 @@ func (s *Smart) probeIdentityLocked(candidate adapter.Outbound) string {
 	if candidate == nil {
 		return ""
 	}
+	// Provider adapters attach a credential-free identity to each runtime
+	// member. Prefer it over a display-tag lookup so duplicate suffixes and
+	// provider reload order cannot move a health portrait to another endpoint.
+	if identified, ok := candidate.(adapter.OutboundWithEndpointIdentity); ok {
+		if identity := identified.EndpointIdentity(); identity != "" {
+			return identity
+		}
+	}
 	for _, provider := range s.providers {
 		if provider == nil {
 			continue

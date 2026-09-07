@@ -450,30 +450,51 @@ func dnsPrefillIsStableDirect(
 	}
 
 	outboundTag := ""
+	scope := adapter.RouteVerdictScopeUnknown
+	scopeTainted := false
 	for _, rule := range routeRouter.Rules() {
 		metadata.ResetRuleCache()
 		if !rule.Match(&metadata) {
 			continue
 		}
+		if scoped, ok := rule.(adapter.RouteVerdictScopeProvider); ok {
+			scope = scoped.VerdictScope()
+		}
 		switch action := rule.Action().(type) {
 		case *R.RuleActionRoute:
+			if scopeTainted {
+				return false
+			}
 			outboundTag = action.Outbound
 		case *R.RuleActionBypass:
+			if scopeTainted {
+				return false
+			}
 			if action.Outbound == "" {
-				return true // true kernel bypass
+				return scope == adapter.RouteVerdictScopeDestinationIP // true kernel bypass
 			}
 			outboundTag = action.Outbound
 		case *R.RuleActionDirect:
-			return true
+			if scopeTainted {
+				return false
+			}
+			return scope == adapter.RouteVerdictScopeDestinationIP
 		case *R.RuleActionReject, *R.RuleActionHijackDNS:
 			return false
 		case *R.RuleActionSniff,
 			*R.RuleActionRouteOptions, *R.RuleActionResolve:
+			scopeTainted = true
 			continue // non-terminal
 		default:
 			return false // fail-closed (unknown / predefined / …)
 		}
 		break
+	}
+	if scope == adapter.RouteVerdictScopeUnknown && metadata.MatchInputs != 0 {
+		return false
+	}
+	if scope != adapter.RouteVerdictScopeUnknown && scope != adapter.RouteVerdictScopeDestinationIP {
+		return false
 	}
 
 	var outbound adapter.Outbound

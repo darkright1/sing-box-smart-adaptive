@@ -976,9 +976,10 @@ func (b *V3Backend) MergeStaticDirect(prefix netip.Prefix) error {
 	if b == nil {
 		return osErrClosed
 	}
-	prefix = prefix.Masked()
-	if !prefix.IsValid() {
-		return E.New("invalid static prefix")
+	var err error
+	prefix, err = ebpfv3.CanonicalPrefix(prefix)
+	if err != nil {
+		return E.Cause(err, "invalid static prefix")
 	}
 	b.access.Lock()
 	defer b.access.Unlock()
@@ -1021,9 +1022,10 @@ func (b *V3Backend) DeleteMergedStaticDirect(prefix netip.Prefix) error {
 	if b == nil {
 		return osErrClosed
 	}
-	prefix = prefix.Masked()
-	if !prefix.IsValid() {
-		return E.New("invalid static prefix")
+	var err error
+	prefix, err = ebpfv3.CanonicalPrefix(prefix)
+	if err != nil {
+		return E.Cause(err, "invalid static prefix")
 	}
 	b.access.Lock()
 	defer b.access.Unlock()
@@ -1061,10 +1063,11 @@ func normalizePrefixSnapshot(prefixes []netip.Prefix) []netip.Prefix {
 	seen := make(map[netip.Prefix]struct{}, len(prefixes))
 	out := make([]netip.Prefix, 0, len(prefixes))
 	for _, p := range prefixes {
-		p = p.Masked()
-		if !p.IsValid() {
+		canonical, err := ebpfv3.CanonicalPrefix(p)
+		if err != nil {
 			continue
 		}
+		p = canonical
 		if _, ok := seen[p]; ok {
 			continue
 		}
@@ -1075,8 +1078,12 @@ func normalizePrefixSnapshot(prefixes []netip.Prefix) []netip.Prefix {
 }
 
 func writeV3PolicyPrefix(fd4, fd6 int, prefix netip.Prefix, generation uint32) error {
-	prefix = prefix.Masked()
-	addr := prefix.Addr().Unmap()
+	canonical, err := ebpfv3.CanonicalPrefix(prefix)
+	if err != nil {
+		return err
+	}
+	prefix = canonical
+	addr := prefix.Addr()
 	value := v3PolicyValue{
 		Verdict:    v3VerdictDirect,
 		Source:     v3SourceStatic,
@@ -1097,8 +1104,12 @@ func writeV3PolicyPrefix(fd4, fd6 int, prefix netip.Prefix, generation uint32) e
 }
 
 func deleteV3PolicyPrefix(fd4, fd6 int, prefix netip.Prefix) error {
-	prefix = prefix.Masked()
-	addr := prefix.Addr().Unmap()
+	canonical, err := ebpfv3.CanonicalPrefix(prefix)
+	if err != nil {
+		return err
+	}
+	prefix = canonical
+	addr := prefix.Addr()
 	if addr.Is4() {
 		a := addr.As4()
 		key := v3LPM4{PrefixLen: uint32(prefix.Bits()), Addr: a}
