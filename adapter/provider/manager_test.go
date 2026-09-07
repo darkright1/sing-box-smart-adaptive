@@ -3,6 +3,7 @@ package provider
 import (
 	"context"
 	"errors"
+	"sync"
 	"testing"
 	"time"
 
@@ -17,6 +18,7 @@ type managerTestProvider struct {
 	closeErr  error
 	closeSeen int
 	startFn   func()
+	startErr  error
 }
 
 func (p *managerTestProvider) Type() string                             { return "test" }
@@ -35,7 +37,7 @@ func (p *managerTestProvider) StartContext(context.Context, *adapter.HTTPStartCo
 	if p.startFn != nil {
 		p.startFn()
 	}
-	return nil
+	return p.startErr
 }
 func (p *managerTestProvider) Close() error {
 	p.closeSeen++
@@ -82,9 +84,8 @@ func TestManagerReplacementPublishesNewProviderWhenOldCloseFails(t *testing.T) {
 	m.providers = []adapter.Provider{old}
 	m.providerByTag[old.Tag()] = old
 
-	err := m.Create(context.Background(), nil, nil, "p", "test", nil)
-	if err == nil {
-		t.Fatal("replacement cleanup error should be reported")
+	if err := m.Create(context.Background(), nil, nil, "p", "test", nil); err != nil {
+		t.Fatalf("cleanup warning must not make committed replacement fail: %v", err)
 	}
 	current, ok := m.Get("p")
 	if !ok || current != newProvider {
@@ -92,6 +93,86 @@ func TestManagerReplacementPublishesNewProviderWhenOldCloseFails(t *testing.T) {
 	}
 	if old.closeSeen != 1 {
 		t.Fatalf("old provider close count=%d, want 1", old.closeSeen)
+	}
+}
+
+func TestManagerStartRollsBackPartialFailure(t *testing.T) {
+	first := &managerTestProvider{tag: "first"}
+	second := &managerTestProvider{tag: "second", startErr: errors.New("start failed")}
+	m := NewManager(context.Background(), logger.NOP(), nil)
+	m.providers = []adapter.Provider{first, second}
+	m.providerByTag[first.Tag()] = first
+	m.providerByTag[second.Tag()] = second
+
+	if err := m.Start(adapter.StartStateStart); err == nil {
+		t.Fatal("expected start failure")
+	}
+	if first.closeSeen != 1 {
+		t.Fatalf("started provider close count=%d, want 1", first.closeSeen)
+	}
+	if second.closeSeen != 1 {
+		t.Fatalf("failed provider cleanup count=%d, want 1", second.closeSeen)
+	}
+	if m.started || m.stage != adapter.StartStateInitialize {
+		t.Fatalf("manager state was not rolled back: started=%v stage=%v", m.started, m.stage)
+	}
+	second.startErr = nil
+	if err := m.Start(adapter.StartStateStart); err != nil {
+		t.Fatalf("retry after rollback failed: %v", err)
+	}
+	if err := m.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if first.closeSeen != 2 || second.closeSeen != 2 {
+		t.Fatalf("provider close counts after retry=%d,%d, want 2,2", first.closeSeen, second.closeSeen)
+	}
+}
+
+func TestManagerCallbackCanReenterMutation(t *testing.T) {
+	p := &managerTestProvider{tag: "p"}
+	m := NewManager(context.Background(), logger.NOP(), managerTestRegistry{provider: p})
+	done := make(chan struct{})
+	var once sync.Once
+	m.RegisterProviderCallback(func() {
+		if _, ok := m.Get("p"); ok {
+			_ = m.Remove("p")
+		}
+		once.Do(func() { close(done) })
+	})
+	if err := m.Create(context.Background(), nil, nil, "p", "test", nil); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("provider callback re-entry deadlocked")
+	}
+}
+
+func TestManagerStartHookCanReenterCreate(t *testing.T) {
+	first := &managerTestProvider{tag: "first"}
+	nested := &managerTestProvider{tag: "nested"}
+	m := NewManager(context.Background(), logger.NOP(), managerTestRegistry{provider: nested})
+	m.providers = []adapter.Provider{first}
+	m.providerByTag[first.Tag()] = first
+	first.startFn = func() {
+		if err := m.Create(context.Background(), nil, nil, nested.Tag(), "test", nil); err != nil {
+			t.Errorf("reentrant create failed: %v", err)
+		}
+	}
+
+	done := make(chan error, 1)
+	go func() { done <- m.Start(adapter.StartStateStart) }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("provider start hook re-entry deadlocked")
+	}
+	if _, ok := m.Get(nested.Tag()); !ok {
+		t.Fatal("reentrant provider was not published")
 	}
 }
 

@@ -5028,16 +5028,7 @@ func (s *Smart) rebuildCandidates(updatedProvider string) error {
 	// was running. Do not publish a catalog assembled from retired providers;
 	// the reconciliation callback will perform the current rebuild.
 	s.providerAccess.Lock()
-	providerSetCurrent := len(providerTags) == len(s.providerTags)
-	providerSetCurrent = providerSetCurrent && providerRevision == s.providerRevision
-	if providerSetCurrent {
-		for index, providerTag := range s.providerTags {
-			if providerTags[index] != providerTag || s.providers[providerTag] != providerByTag[providerTag] {
-				providerSetCurrent = false
-				break
-			}
-		}
-	}
+	providerSetCurrent := s.providerCatalogCurrentLocked(providerTags, providerRevision, providerByTag)
 	s.providerAccess.Unlock()
 	if !providerSetCurrent {
 		return nil
@@ -5091,15 +5082,21 @@ func (s *Smart) rebuildCandidates(updatedProvider string) error {
 			}
 		}
 	}
-	// Close can begin after the provider snapshot above. Check before and after
-	// taking the catalog lock so a late callback cannot repopulate a retired
-	// Smart group after Close has cleared its candidates.
-	if s.closing.Load() {
+	// Close or a provider callback can race with the expensive candidate build.
+	// Hold providerAccess while taking the catalog lock for the final check and
+	// publication. This closes the TOCTOU window where a newer provider
+	// generation could be published immediately after an earlier validation.
+	// All other paths acquire providerAccess before touching the catalog during
+	// reconciliation, so this lock order is deliberate and consistent.
+	s.providerAccess.Lock()
+	if s.closing.Load() || !s.providerCatalogCurrentLocked(providerTags, providerRevision, providerByTag) {
+		s.providerAccess.Unlock()
 		return nil
 	}
 	s.access.Lock()
 	if s.closing.Load() {
 		s.access.Unlock()
+		s.providerAccess.Unlock()
 		return nil
 	}
 	oldMetadataByTag := s.candidateMetadataByTag
@@ -5114,6 +5111,7 @@ func (s *Smart) rebuildCandidates(updatedProvider string) error {
 	s.candidateByTag = candidateByTag
 	s.candidateMetadataByTag = candidateMetadataByTag
 	s.access.Unlock()
+	s.providerAccess.Unlock()
 	s.remapPinnedCandidate(candidateMetadataByTag, candidates)
 	if s.store != nil {
 		s.store.pruneCandidates(keepProfiles)
@@ -5132,6 +5130,23 @@ func (s *Smart) rebuildCandidates(updatedProvider string) error {
 	s.control.access.Unlock()
 	s.setCandidatesReadyStatus(candidates)
 	return nil
+}
+
+// providerCatalogCurrentLocked reports whether a candidate build still
+// describes the provider set that was snapshotted before external provider
+// code ran. The caller must hold providerAccess. Keeping this comparison in a
+// single helper makes it possible to repeat it immediately before publishing
+// the catalog, closing the validation/publish TOCTOU window.
+func (s *Smart) providerCatalogCurrentLocked(providerTags []string, providerRevision uint64, providerByTag map[string]adapter.Provider) bool {
+	if len(providerTags) != len(s.providerTags) || providerRevision != s.providerRevision {
+		return false
+	}
+	for index, providerTag := range s.providerTags {
+		if providerTags[index] != providerTag || s.providers[providerTag] != providerByTag[providerTag] {
+			return false
+		}
+	}
+	return true
 }
 
 func (s *Smart) remapPinnedCandidate(metadataByTag map[string]smartCandidateMetadata, candidates []adapter.Outbound) {

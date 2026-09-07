@@ -28,11 +28,20 @@ type Manager struct {
 	// external code and may re-enter the manager or wait on another lifecycle.
 	operation     sync.Mutex
 	access        sync.Mutex
+	closeAccess   sync.Mutex
+	closeOnce     map[adapter.Provider]*providerCloseResult
+	generation    uint64
 	started       bool
+	starting      bool
 	stage         adapter.StartStage
 	providers     []adapter.Provider
 	providerByTag map[string]adapter.Provider
 	callbacks     list.List[adapter.ProviderManagerUpdateCallback]
+}
+
+type providerCloseResult struct {
+	once sync.Once
+	err  error
 }
 
 func NewManager(ctx context.Context, logger logger.ContextLogger, registry adapter.ProviderRegistry) *Manager {
@@ -41,6 +50,7 @@ func NewManager(ctx context.Context, logger logger.ContextLogger, registry adapt
 		logger:        logger,
 		registry:      registry,
 		providerByTag: make(map[string]adapter.Provider),
+		closeOnce:     make(map[adapter.Provider]*providerCloseResult),
 	}
 }
 
@@ -49,45 +59,95 @@ func (m *Manager) Initialize() {
 
 func (m *Manager) Start(stage adapter.StartStage) error {
 	m.operation.Lock()
-	defer m.operation.Unlock()
 	m.access.Lock()
-	if m.started && m.stage >= stage {
+	if m.starting || m.started && m.stage >= stage {
+		m.access.Unlock()
+		m.operation.Unlock()
 		panic("already started")
 	}
-	m.started = true
-	m.stage = stage
+	previousStarted := m.started
+	previousStage := m.stage
+	m.generation++
+	generation := m.generation
+	m.starting = true
 	providers := append([]adapter.Provider(nil), m.providers...)
+	if stage == adapter.StartStateStart {
+		for _, provider := range providers {
+			m.resetCloseState(provider)
+		}
+	}
 	m.access.Unlock()
+	m.operation.Unlock()
 	if stage == adapter.StartStateStart && len(providers) > 0 {
 		startContext := adapter.NewHTTPStartContext()
-		defer startContext.Close()
+		attemptedProviders := make([]adapter.Provider, 0, len(providers))
+		var startErr error
 		for _, provider := range providers {
+			attemptedProviders = append(attemptedProviders, provider)
 			if err := startProvider(m.ctx, provider, startContext); err != nil {
-				return E.Cause(err, stage, " provider/", provider.Type(), "[", provider.Tag(), "]")
+				startErr = E.Cause(err, stage, " provider/", provider.Type(), "[", provider.Tag(), "]")
+				break
 			}
 		}
-		return nil
+		startContext.Close()
+		if startErr != nil {
+			// Start is transactional: a provider that was started before a later
+			// failure must not keep running, and the manager must be retryable.
+			for index := len(attemptedProviders) - 1; index >= 0; index-- {
+				_ = m.closeProvider(attemptedProviders[index])
+			}
+			// Close may have changed the manager while external code was running.
+			// Restore only our own state in the uncontended case; a concurrent
+			// Close already owns cleanup of the providers it detached.
+			m.operation.Lock()
+			m.access.Lock()
+			if m.generation == generation {
+				m.starting = false
+				m.started = previousStarted
+				m.stage = previousStage
+			}
+			m.access.Unlock()
+			m.operation.Unlock()
+			return startErr
+		}
+		return m.commitStart(generation, stage)
 	}
+	return m.commitStart(generation, stage)
+}
+
+func (m *Manager) commitStart(generation uint64, stage adapter.StartStage) error {
+	m.operation.Lock()
+	defer m.operation.Unlock()
+	m.access.Lock()
+	defer m.access.Unlock()
+	if m.generation != generation {
+		return E.New("provider manager changed while starting stage ", stage)
+	}
+	m.starting = false
+	m.started = true
+	m.stage = stage
 	return nil
 }
 
 func (m *Manager) Close() error {
 	m.operation.Lock()
-	defer m.operation.Unlock()
 	monitor := taskmonitor.New(m.logger, C.StopTimeout)
 	m.access.Lock()
+	m.generation++
+	m.starting = false
 	m.started = false
 	m.stage = adapter.StartStateInitialize
 	providers := m.providers
 	m.providers = nil
 	m.providerByTag = make(map[string]adapter.Provider)
 	m.access.Unlock()
+	m.operation.Unlock()
 	m.notifyProviderCallbacks()
 	var err error
 	for _, provider := range providers {
-		if closer, isCloser := provider.(io.Closer); isCloser {
+		if _, isCloser := provider.(io.Closer); isCloser {
 			monitor.Start("close provider/", provider.Type(), "[", provider.Tag(), "]")
-			err = E.Append(err, closer.Close(), func(err error) error {
+			err = E.Append(err, m.closeProvider(provider), func(err error) error {
 				return E.Cause(err, "close provider/", provider.Type(), "[", provider.Tag(), "]")
 			})
 			monitor.Finish()
@@ -135,11 +195,11 @@ func (m *Manager) Get(tag string) (adapter.Provider, bool) {
 
 func (m *Manager) Remove(tag string) error {
 	m.operation.Lock()
-	defer m.operation.Unlock()
 	m.access.Lock()
 	provider, found := m.providerByTag[tag]
 	if !found {
 		m.access.Unlock()
+		m.operation.Unlock()
 		return os.ErrInvalid
 	}
 	delete(m.providerByTag, tag)
@@ -151,8 +211,9 @@ func (m *Manager) Remove(tag string) error {
 	}
 	m.providers = append(m.providers[:index], m.providers[index+1:]...)
 	m.access.Unlock()
+	m.operation.Unlock()
 	m.notifyProviderCallbacks()
-	return common.Close(provider)
+	return m.closeProvider(provider)
 }
 
 func (m *Manager) Create(ctx context.Context, router adapter.Router, logFactory log.Factory, tag string, providerType string, options any) error {
@@ -160,17 +221,19 @@ func (m *Manager) Create(ctx context.Context, router adapter.Router, logFactory 
 		return os.ErrInvalid
 	}
 
-	m.operation.Lock()
-	defer m.operation.Unlock()
 	provider, err := m.registry.CreateProvider(ctx, router, logFactory, tag, providerType, options)
 	if err != nil {
 		return err
 	}
+	m.resetCloseState(provider)
+	m.operation.Lock()
 	m.access.Lock()
 	started := m.started
 	stage := m.stage
 	existsProvider := m.providerByTag[tag]
+	generation := m.generation
 	m.access.Unlock()
+	m.operation.Unlock()
 
 	// A replacement is prepared completely before it becomes authoritative.
 	// Start is intentionally outside the manager lock; a failed start leaves the
@@ -180,17 +243,21 @@ func (m *Manager) Create(ctx context.Context, router adapter.Router, logFactory 
 		err = startProvider(m.ctx, provider, startContext)
 		startContext.Close()
 		if err != nil {
-			_ = common.Close(provider)
+			_ = m.closeProvider(provider)
 			return E.Cause(err, "start provider/", provider.Type(), "[", provider.Tag(), "]")
 		}
 	}
 
+	m.operation.Lock()
 	m.access.Lock()
-	// operation serializes Create/Remove/Close, so the observed old provider is
-	// still current here. Publish the new provider before retiring the old one.
-	if current := m.providerByTag[tag]; current != existsProvider {
+	// Revalidate both the manager generation and the observed tag entry. A
+	// concurrent Close or replacement may have completed while the new
+	// provider was starting; never publish into that newer state.
+	currentProvider := m.providerByTag[tag]
+	if m.generation != generation || currentProvider != existsProvider {
 		m.access.Unlock()
-		_ = common.Close(provider)
+		m.operation.Unlock()
+		_ = m.closeProvider(provider)
 		return E.New("provider changed while creating: ", tag)
 	}
 	if existsProvider != nil {
@@ -205,16 +272,51 @@ func (m *Manager) Create(ctx context.Context, router adapter.Router, logFactory 
 	m.providers = append(m.providers, provider)
 	m.providerByTag[tag] = provider
 	m.access.Unlock()
+	m.operation.Unlock()
 	m.notifyProviderCallbacks()
 	if existsProvider != nil {
 		// Closing an old provider is best-effort after publication. A partial
 		// cleanup failure must never roll the authoritative view back to a
 		// provider whose resources may already be closed.
-		if err = common.Close(existsProvider); err != nil {
-			return E.Cause(err, "close replaced provider/", existsProvider.Type(), "[", existsProvider.Tag(), "]")
+		if err = m.closeProvider(existsProvider); err != nil {
+			// Publication already committed. Cleanup failure is a warning, not a
+			// provisioning failure that would invite a destructive retry.
+			if m.logger != nil {
+				m.logger.Warn("close replaced provider/", existsProvider.Type(), "[", existsProvider.Tag(), "]: ", err)
+			}
 		}
 	}
 	return nil
+}
+
+// closeProvider makes provider cleanup idempotent across lifecycle races. A
+// provider may be selected for cleanup by a failed Start while a concurrent
+// Close/Remove is already tearing the manager down; the external Close method
+// must still run at most once.
+func (m *Manager) closeProvider(provider adapter.Provider) error {
+	if provider == nil {
+		return nil
+	}
+	m.closeAccess.Lock()
+	result := m.closeOnce[provider]
+	if result == nil {
+		result = new(providerCloseResult)
+		m.closeOnce[provider] = result
+	}
+	m.closeAccess.Unlock()
+	result.once.Do(func() {
+		result.err = common.Close(provider)
+	})
+	return result.err
+}
+
+func (m *Manager) resetCloseState(provider adapter.Provider) {
+	if provider == nil {
+		return
+	}
+	m.closeAccess.Lock()
+	delete(m.closeOnce, provider)
+	m.closeAccess.Unlock()
 }
 
 func startProvider(ctx context.Context, provider adapter.Provider, startContext *adapter.HTTPStartContext) error {
