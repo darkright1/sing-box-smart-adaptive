@@ -429,6 +429,8 @@ type smartFingerprintCache struct {
 type smartControlState struct {
 	access          sync.Mutex
 	pinned          string
+	pinnedEndpoint  string
+	pinnedDial      string
 	temporary       string
 	temporaryUntil  time.Time
 	temporaryReason string
@@ -936,9 +938,18 @@ func (s *Smart) Start() error {
 		}
 	}
 	if cacheFile := service.FromContext[adapter.CacheFile](s.ctx); cacheFile != nil {
-		pinned := cacheFile.LoadSelected(s.Tag())
-		if pinned != "" {
-			s.SelectOutbound(pinned)
+		var restored bool
+		if store, ok := cacheFile.(adapter.SelectedRecordStore); ok {
+			if record, loaded := store.LoadSelectedRecord(s.Tag()); loaded {
+				if pinned := s.resolveSmartSelectionRecord(record); pinned != "" {
+					restored = s.SelectOutbound(pinned)
+				}
+			}
+		}
+		if !restored {
+			if pinned := cacheFile.LoadSelected(s.Tag()); pinned != "" {
+				s.SelectOutbound(pinned)
+			}
 		}
 	}
 	return nil
@@ -2115,17 +2126,21 @@ func cloneSmartStateCounts(source map[string]int) map[string]int {
 
 func (s *Smart) SelectOutbound(tag string) bool {
 	s.access.RLock()
-	if _, loaded := s.candidateByTag[tag]; !loaded {
+	candidate, loaded := s.candidateByTag[tag]
+	if !loaded || candidate == nil {
 		s.access.RUnlock()
 		return false
 	}
+	metadata := s.candidateMetadataByTag[tag]
 	s.access.RUnlock()
 	s.control.access.Lock()
 	s.control.pinned = tag
+	s.control.pinnedEndpoint = metadata.identity
+	s.control.pinnedDial = metadata.dialIdentity
 	s.control.access.Unlock()
 	s.resetPolicyBackend()
 	if cacheFile := service.FromContext[adapter.CacheFile](s.ctx); cacheFile != nil && s.Tag() != "" {
-		if err := cacheFile.StoreSelected(s.Tag(), tag); err != nil {
+		if err := storeSelectedRecordValue(cacheFile, s.Tag(), s.smartSelectionRecord(tag)); err != nil {
 			s.logger.Error("store smart pin: ", err)
 		}
 	}
@@ -2135,10 +2150,12 @@ func (s *Smart) SelectOutbound(tag string) bool {
 func (s *Smart) ClearSelection() {
 	s.control.access.Lock()
 	s.control.pinned = ""
+	s.control.pinnedEndpoint = ""
+	s.control.pinnedDial = ""
 	s.control.access.Unlock()
 	s.resetPolicyBackend()
 	if cacheFile := service.FromContext[adapter.CacheFile](s.ctx); cacheFile != nil && s.Tag() != "" {
-		if err := cacheFile.StoreSelected(s.Tag(), ""); err != nil {
+		if err := clearSelectedRecord(cacheFile, s.Tag()); err != nil {
 			s.logger.Error("clear smart pin: ", err)
 		}
 	}
@@ -3580,6 +3597,29 @@ func (s *Smart) candidateProfileID(candidate string) string {
 	return metadata.profileID
 }
 
+func (s *Smart) resolveSmartSelectionRecord(record adapter.SelectedRecord) string {
+	if s == nil {
+		return ""
+	}
+	s.access.RLock()
+	selected := resolveSelectionRecord(s.candidates, record)
+	s.access.RUnlock()
+	if selected == nil {
+		return ""
+	}
+	return selected.Tag()
+}
+
+func (s *Smart) smartSelectionRecord(tag string) adapter.SelectedRecord {
+	record := adapter.SelectedRecord{Version: 1, DisplayTag: tag}
+	s.access.RLock()
+	metadata := s.candidateMetadataByTag[tag]
+	s.access.RUnlock()
+	record.EndpointIdentity = metadata.identity
+	record.DialIdentity = metadata.dialIdentity
+	return record
+}
+
 // candidateProbeIdentity is the credential-free path key used by the bounded
 // TCP/UDP probe schedulers. Probes answer a network-path question, so aliases
 // with different credentials must consume one probe slot and one probe
@@ -4834,6 +4874,8 @@ func (s *Smart) releaseConfirmedBrokenPin(candidate, reason string) bool {
 		return false
 	}
 	s.control.pinned = ""
+	s.control.pinnedEndpoint = ""
+	s.control.pinnedDial = ""
 	s.control.access.Unlock()
 	s.resetPolicyBackend()
 	if s.logger != nil {
@@ -5072,6 +5114,7 @@ func (s *Smart) rebuildCandidates(updatedProvider string) error {
 	s.candidateByTag = candidateByTag
 	s.candidateMetadataByTag = candidateMetadataByTag
 	s.access.Unlock()
+	s.remapPinnedCandidate(candidateMetadataByTag, candidates)
 	if s.store != nil {
 		s.store.pruneCandidates(keepProfiles)
 	}
@@ -5089,6 +5132,34 @@ func (s *Smart) rebuildCandidates(updatedProvider string) error {
 	s.control.access.Unlock()
 	s.setCandidatesReadyStatus(candidates)
 	return nil
+}
+
+func (s *Smart) remapPinnedCandidate(metadataByTag map[string]smartCandidateMetadata, candidates []adapter.Outbound) {
+	s.control.access.Lock()
+	if s.control.pinned == "" {
+		s.control.access.Unlock()
+		return
+	}
+	record := adapter.SelectedRecord{
+		Version:          1,
+		DisplayTag:       s.control.pinned,
+		DialIdentity:     s.control.pinnedDial,
+		EndpointIdentity: s.control.pinnedEndpoint,
+	}
+	selected := resolveSelectionRecord(candidates, record)
+	if selected == nil || selected.Tag() == s.control.pinned {
+		s.control.access.Unlock()
+		return
+	}
+	oldTag := s.control.pinned
+	metadata := metadataByTag[selected.Tag()]
+	s.control.pinned = selected.Tag()
+	s.control.pinnedEndpoint = metadata.identity
+	s.control.pinnedDial = metadata.dialIdentity
+	s.control.access.Unlock()
+	if s.logger != nil {
+		s.logger.Info("smart manual pin remapped: ", oldTag, " -> ", selected.Tag())
+	}
 }
 
 func (s *Smart) setCandidatesReadyStatus(candidates []adapter.Outbound) {

@@ -2,6 +2,7 @@ package cachefile
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/netip"
 	"os"
@@ -22,6 +23,7 @@ import (
 
 var (
 	bucketSelected         = []byte("selected")
+	bucketSelectedIdentity = []byte("selected_identity")
 	bucketExpand           = []byte("group_expand")
 	bucketMode             = []byte("clash_mode")
 	bucketRuleSet          = []byte("rule_set")
@@ -29,6 +31,7 @@ var (
 
 	bucketNameList = []string{
 		string(bucketSelected),
+		string(bucketSelectedIdentity),
 		string(bucketExpand),
 		string(bucketMode),
 		string(bucketRuleSet),
@@ -415,7 +418,75 @@ func (c *CacheFile) StoreSelected(group, selected string) error {
 		if err != nil {
 			return err
 		}
+		// A legacy writer must invalidate the identity record. Otherwise an
+		// older API call could leave a stale identity that wins on the next
+		// restart over the newly stored display tag.
+		if identityBucket := c.bucket(t, bucketSelectedIdentity); identityBucket != nil {
+			if err = identityBucket.Delete([]byte(group)); err != nil {
+				return err
+			}
+		}
 		return bucket.Put([]byte(group), []byte(selected))
+	})
+}
+
+const selectedRecordVersion uint8 = 1
+
+// LoadSelectedRecord loads the identity-aware selection format. A malformed
+// or unknown version is treated as absent so callers can safely fall back to
+// the legacy display-tag record.
+func (c *CacheFile) LoadSelectedRecord(group string) (adapter.SelectedRecord, bool) {
+	var record adapter.SelectedRecord
+	loaded := false
+	c.view(func(t *bbolt.Tx) error {
+		bucket := c.bucket(t, bucketSelectedIdentity)
+		if bucket == nil {
+			return nil
+		}
+		data := bucket.Get([]byte(group))
+		if len(data) == 0 || json.Unmarshal(data, &record) != nil || record.Version != selectedRecordVersion {
+			record = adapter.SelectedRecord{}
+			return nil
+		}
+		loaded = record.DisplayTag != "" || record.DialIdentity != "" || record.EndpointIdentity != ""
+		return nil
+	})
+	return record, loaded
+}
+
+// StoreSelectedRecord stores both the versioned identity record and its
+// legacy display-tag shadow. The shadow keeps older clients functional while
+// the versioned record makes restart restoration identity-aware.
+func (c *CacheFile) StoreSelectedRecord(group string, record adapter.SelectedRecord) error {
+	if record.Version == 0 {
+		record.Version = selectedRecordVersion
+	}
+	if record.Version != selectedRecordVersion {
+		return errors.New("unsupported selected record version")
+	}
+	return c.batch(func(t *bbolt.Tx) error {
+		legacy, err := c.createBucket(t, bucketSelected)
+		if err != nil {
+			return err
+		}
+		identity, err := c.createBucket(t, bucketSelectedIdentity)
+		if err != nil {
+			return err
+		}
+		if record.DisplayTag == "" && record.DialIdentity == "" && record.EndpointIdentity == "" {
+			if err = identity.Delete([]byte(group)); err != nil {
+				return err
+			}
+			return legacy.Delete([]byte(group))
+		}
+		data, err := json.Marshal(record)
+		if err != nil {
+			return err
+		}
+		if err = identity.Put([]byte(group), data); err != nil {
+			return err
+		}
+		return legacy.Put([]byte(group), []byte(record.DisplayTag))
 	})
 }
 

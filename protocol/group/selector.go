@@ -166,8 +166,13 @@ func (s *Selector) Start() error {
 	}
 	snapshot := s.rebuildSnapshot("")
 	var cachedTag string
+	var cachedRecord adapter.SelectedRecord
+	var cachedRecordLoaded bool
 	if s.Tag() != "" {
 		if cacheFile := service.FromContext[adapter.CacheFile](s.ctx); cacheFile != nil {
+			if store, ok := cacheFile.(adapter.SelectedRecordStore); ok {
+				cachedRecord, cachedRecordLoaded = store.LoadSelectedRecord(s.Tag())
+			}
 			cachedTag = cacheFile.LoadSelected(s.Tag())
 		}
 	}
@@ -179,10 +184,22 @@ func (s *Selector) Start() error {
 	}
 	s.membership.Store(snapshot)
 
+	if cachedRecordLoaded {
+		if detour := resolveSelectionRecord(snapshotOutbounds(snapshot), cachedRecord); detour != nil {
+			s.selected.Store(detour)
+			s.stateAccess.Unlock()
+			return nil
+		}
+	}
 	if cachedTag != "" {
 		if detour, loaded := snapshot.outbounds[cachedTag]; loaded {
 			s.selected.Store(detour)
 			s.stateAccess.Unlock()
+			if cacheFile := service.FromContext[adapter.CacheFile](s.ctx); cacheFile != nil {
+				if err := storeSelectedRecord(cacheFile, s.Tag(), detour); err != nil {
+					s.logger.Error("migrate selected identity: ", err)
+				}
+			}
 			return nil
 		}
 	}
@@ -218,12 +235,24 @@ func (s *Selector) onProviderUpdated(tag string) error {
 	}
 	snapshot := s.rebuildSnapshot(tag)
 	s.stateAccess.Lock()
-	defer s.stateAccess.Unlock()
 	if s.closed {
+		s.stateAccess.Unlock()
 		return nil
 	}
 	s.membership.Store(snapshot)
 	s.setFallbackLocked(snapshot)
+	selected := s.selected.Load()
+	s.stateAccess.Unlock()
+	// A provider refresh may renumber a duplicate alias. Persist the resolved
+	// identity so a subsequent restart follows the same endpoint, not the old
+	// display suffix.
+	if selected != nil && s.Tag() != "" {
+		if cacheFile := service.FromContext[adapter.CacheFile](s.ctx); cacheFile != nil {
+			if err := storeSelectedRecord(cacheFile, s.Tag(), selected); err != nil {
+				s.logger.Error("update selected identity: ", err)
+			}
+		}
+	}
 	return nil
 }
 
@@ -275,7 +304,7 @@ func (s *Selector) SelectOutbound(tag string) bool {
 	if s.Tag() != "" {
 		cacheFile := service.FromContext[adapter.CacheFile](s.ctx)
 		if cacheFile != nil {
-			err := cacheFile.StoreSelected(s.Tag(), tag)
+			err := storeSelectedRecord(cacheFile, s.Tag(), detour)
 			if err != nil {
 				s.logger.Error("store selected: ", err)
 			}

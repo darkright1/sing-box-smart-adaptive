@@ -31,6 +31,26 @@ type V2RayServer interface {
 	StatsService() ConnectionTracker
 }
 
+// SelectedRecord is the versioned identity of a persisted group selection.
+// DisplayTag is a UI alias and may change when a provider refreshes duplicate
+// names; the identity fields keep the selection attached to the same
+// endpoint across refreshes and restarts. Identities are opaque hashes and
+// must never contain credentials or subscription URLs.
+type SelectedRecord struct {
+	Version          uint8  `json:"version"`
+	DisplayTag       string `json:"display_tag,omitempty"`
+	DialIdentity     string `json:"dial_identity,omitempty"`
+	EndpointIdentity string `json:"endpoint_identity,omitempty"`
+}
+
+// SelectedRecordStore is an optional extension implemented by cache files
+// that understand identity-aware persisted selections. Keeping it separate
+// from CacheFile preserves compatibility with external CacheFile providers.
+type SelectedRecordStore interface {
+	LoadSelectedRecord(group string) (SelectedRecord, bool)
+	StoreSelectedRecord(group string, record SelectedRecord) error
+}
+
 type CacheFile interface {
 	LifecycleService
 
