@@ -2010,7 +2010,11 @@ func (s *Smart) preMatchLeaf(metadata *adapter.InboundContext) adapter.Outbound 
 func (s *Smart) SmartStatus() adapter.SmartGroupStatus {
 	pinned, temporary, expiresAt, reason := s.controlSnapshot(time.Now())
 	s.statusAccess.RLock()
-	status := s.status
+	// Copy all slice/map fields while holding statusAccess. A shallow struct
+	// copy would leave StateCounts and Candidates backed by the live maps/slices
+	// that updateStatusSelected reuses on the next probe, allowing the dashboard
+	// reader to race with a probe worker after the lock is released.
+	status := cloneSmartGroupStatus(s.status)
 	statusContexts := make(map[string]adapter.SmartContextStatus, len(s.statusContexts))
 	for key, contextStatus := range s.statusContexts {
 		statusContexts[key] = cloneSmartContextStatus(contextStatus)
@@ -2079,6 +2083,22 @@ func cloneSmartContextStatus(source adapter.SmartContextStatus) adapter.SmartCon
 	result := source
 	result.StateCounts = cloneSmartStateCounts(source.StateCounts)
 	result.Candidates = append([]adapter.SmartCandidateStatus(nil), source.Candidates...)
+	return result
+}
+
+func cloneSmartGroupStatus(source adapter.SmartGroupStatus) adapter.SmartGroupStatus {
+	result := source
+	result.StateCounts = cloneSmartStateCounts(source.StateCounts)
+	result.Candidates = append([]adapter.SmartCandidateStatus(nil), source.Candidates...)
+	if source.Contexts != nil {
+		result.Contexts = make([]adapter.SmartContextStatus, len(source.Contexts))
+		for index, contextStatus := range source.Contexts {
+			result.Contexts[index] = cloneSmartContextStatus(contextStatus)
+		}
+	}
+	if source.RecentSwitches != nil {
+		result.RecentSwitches = append([]adapter.SmartSwitchAudit(nil), source.RecentSwitches...)
+	}
 	return result
 }
 
