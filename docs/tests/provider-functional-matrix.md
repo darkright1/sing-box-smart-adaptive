@@ -40,6 +40,8 @@
 
 源 provider 的 `include/exclude` 在其自身解析阶段执行；聚合 provider 和组级 `include/exclude` 再分别作为下一层门禁。这样既能给每个订阅单独过滤，又能保留聚合视图和单订阅视图。
 
+为避免同一节点被聚合视图和源 provider 重复展开，组级 `use_all_providers` 只纳入叶子 provider；需要使用聚合视图时显式写入 `providers`。聚合 provider 本身仍可被 Smart、URLTest、LoadBalance 或 Selector 单独引用。
+
 ## 执行门
 
 先运行：
