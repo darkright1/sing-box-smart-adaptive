@@ -179,6 +179,13 @@ func (s *URLTest) Close() error {
 	// Provider unregistration can execute provider-owned synchronization and
 	// must not run while URLTest's state lock is held.
 	s.providerSource.close()
+	// Start may fail before URLTestGroup is constructed (for example when
+	// interval validation rejects the configuration).  common.Close invokes
+	// Close through reflection and does not treat a typed nil pointer as an
+	// empty close set, so guard the optional group explicitly.
+	if group == nil {
+		return nil
+	}
 	return common.Close(group)
 }
 

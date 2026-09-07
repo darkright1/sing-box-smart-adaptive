@@ -11,6 +11,18 @@ import (
 	N "github.com/sagernet/sing/common/network"
 )
 
+func TestURLTestCloseBeforeGroupStart(t *testing.T) {
+	// NewURLTestGroup can fail validation before Start stores a group. Closing
+	// that partially initialized wrapper must remain safe and idempotent.
+	s := &URLTest{providerSource: &groupProviderSource{}}
+	if err := s.Close(); err != nil {
+		t.Fatalf("close before start: %v", err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatalf("second close before start: %v", err)
+	}
+}
+
 func TestSelectDashboardOutboundsSamplesRecentAndStale(t *testing.T) {
 	history := urltest.NewHistoryStorage()
 	outbounds := make([]adapter.Outbound, 0, 20)
