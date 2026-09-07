@@ -19,6 +19,15 @@ type OutboundOptionsRegistry interface {
 	CreateOptions(outboundType string) (any, bool)
 }
 
+// OutboundSupportRegistry is implemented by registries that distinguish a
+// real constructor from a schema-only stub used by a minimal build. Providers
+// use this optional capability to discard protocols that can be decoded but
+// cannot actually be instantiated in the current binary.
+type OutboundSupportRegistry interface {
+	OutboundOptionsRegistry
+	IsSupported(outboundType string) bool
+}
+
 type _Outbound struct {
 	Type    string `json:"type"`
 	Tag     string `json:"tag,omitempty"`

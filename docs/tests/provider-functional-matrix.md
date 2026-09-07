@@ -45,7 +45,7 @@
 
 ## 协议筛选语义
 
-订阅解析先逐成员尝试（Sing-box JSON、Clash YAML、SIP-008 和 URI 列表），再使用当前构建实际注册的 outbound/endpoint 类型表作最终门禁。单个坏成员不会使整份订阅失效；当所有成员都不可解析或不在本构建中时，provider 返回明确的 `no supported servers found` 错误。协议错误按成员限频记录，避免刷新风暴污染日志；日志只保留 `provider/序号/tag/type/原因码`，不会回显订阅 URI、查询参数或凭据。接口内的 typed-nil 选项也会被门禁丢弃，防止后续具体协议覆盖逻辑崩溃。
+订阅解析先逐成员尝试（Sing-box JSON、Clash YAML、SIP-008 和 URI 列表），再使用当前构建实际注册的 outbound/endpoint 类型表作最终门禁。单个坏成员不会使整份订阅失效；当所有成员都不可解析或不在本构建中时，provider 返回明确的 `no supported servers found` 错误。协议错误按成员限频记录，避免刷新风暴污染日志；日志只保留 `provider/序号/tag/type/原因码`，不会回显订阅 URI、查询参数或凭据。接口内的 typed-nil 选项也会被门禁丢弃，防止后续具体协议覆盖逻辑崩溃。精简构建保留的 schema-only stub（例如未编译的 QUIC/Naive/WireGuard）会再经过 `IsSupported` 能力门，构造器不可用的协议不会进入组。
 
 ## 执行门
 

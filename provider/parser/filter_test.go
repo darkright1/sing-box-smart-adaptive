@@ -33,6 +33,32 @@ func (parserEndpointRegistry) CreateOptions(protocol string) (any, bool) {
 	return new(option.WireGuardEndpointOptions), true
 }
 
+type parserStubOutboundRegistry struct{}
+
+func (parserStubOutboundRegistry) OptionTypes() []string { return []string{C.TypeNaive} }
+
+func (parserStubOutboundRegistry) CreateOptions(protocol string) (any, bool) {
+	if protocol != C.TypeNaive {
+		return nil, false
+	}
+	return new(option.NaiveOutboundOptions), true
+}
+
+func (parserStubOutboundRegistry) IsSupported(string) bool { return false }
+
+type parserStubEndpointRegistry struct{}
+
+func (parserStubEndpointRegistry) OptionTypes() []string { return []string{C.TypeWireGuard} }
+
+func (parserStubEndpointRegistry) CreateOptions(protocol string) (any, bool) {
+	if protocol != C.TypeWireGuard {
+		return nil, false
+	}
+	return new(option.WireGuardEndpointOptions), true
+}
+
+func (parserStubEndpointRegistry) IsSupported(string) bool { return false }
+
 func parserContext() context.Context {
 	ctx := service.ContextWith[option.OutboundOptionsRegistry](context.Background(), parserOutboundRegistry{})
 	return service.ContextWith[option.EndpointOptionsRegistry](ctx, parserEndpointRegistry{})
@@ -115,6 +141,21 @@ func TestFilterSupportedMembersDropsTypedNilOptions(t *testing.T) {
 	}, "test")
 	if len(outbounds) != 0 || len(endpoints) != 0 {
 		t.Fatalf("typed nil options must be discarded: outbounds=%d endpoints=%d", len(outbounds), len(endpoints))
+	}
+}
+
+func TestFilterSupportedMembersDropsSchemaOnlyStubs(t *testing.T) {
+	ctx := service.ContextWith[option.OutboundOptionsRegistry](context.Background(), parserStubOutboundRegistry{})
+	ctx = service.ContextWith[option.OutboundSupportRegistry](ctx, parserStubOutboundRegistry{})
+	ctx = service.ContextWith[option.EndpointOptionsRegistry](ctx, parserStubEndpointRegistry{})
+	ctx = service.ContextWith[option.EndpointSupportRegistry](ctx, parserStubEndpointRegistry{})
+	outbounds, endpoints := filterSupportedMembers(ctx, []option.Outbound{{
+		Type: C.TypeNaive, Tag: "stub", Options: new(option.NaiveOutboundOptions),
+	}}, []option.Endpoint{{
+		Type: C.TypeWireGuard, Tag: "stub", Options: new(option.WireGuardEndpointOptions),
+	}}, "test")
+	if len(outbounds) != 0 || len(endpoints) != 0 {
+		t.Fatalf("schema-only stubs must be discarded: outbounds=%d endpoints=%d", len(outbounds), len(endpoints))
 	}
 }
 

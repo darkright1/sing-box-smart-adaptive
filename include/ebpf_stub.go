@@ -21,7 +21,7 @@ func registerEBPFInbound(registry *inbound.Registry) {
 }
 
 func registerEBPFOutbound(registry *outbound.Registry) {
-	outbound.Register[option.EBPFOutboundOptions](registry, C.TypeEBPF, func(context.Context, adapter.Router, log.ContextLogger, string, option.EBPFOutboundOptions) (adapter.Outbound, error) {
+	outbound.RegisterUnsupported[option.EBPFOutboundOptions](registry, C.TypeEBPF, func(context.Context, adapter.Router, log.ContextLogger, string, option.EBPFOutboundOptions) (adapter.Outbound, error) {
 		return nil, E.New("eBPF outbound is not included in this build")
 	})
 }

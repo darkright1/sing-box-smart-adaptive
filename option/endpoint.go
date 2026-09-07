@@ -15,6 +15,14 @@ type EndpointOptionsRegistry interface {
 	CreateOptions(endpointType string) (any, bool)
 }
 
+// EndpointSupportRegistry is the endpoint counterpart of
+// OutboundSupportRegistry. Minimal builds keep schema stubs for useful error
+// messages, but providers must not expose those stubs as usable endpoints.
+type EndpointSupportRegistry interface {
+	EndpointOptionsRegistry
+	IsSupported(endpointType string) bool
+}
+
 type _Endpoint struct {
 	Type    string `json:"type"`
 	Tag     string `json:"tag,omitempty"`

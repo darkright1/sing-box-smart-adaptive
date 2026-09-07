@@ -8,6 +8,7 @@ import (
 
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/log"
+	"github.com/sagernet/sing-box/option"
 	"github.com/sagernet/sing/common"
 	E "github.com/sagernet/sing/common/exceptions"
 )
@@ -23,10 +24,26 @@ func Register[Options any](registry *Registry, outboundType string, constructor 
 			options = rawOptions.(*Options)
 		}
 		return constructor(ctx, router, logger, tag, common.PtrValueOrDefault(options))
-	})
+	}, true)
+}
+
+// RegisterUnsupported keeps a schema entry for a protocol that is not present
+// in this build. Decoding can still produce a useful, bounded error, while
+// provider filtering can distinguish it from a constructible protocol.
+func RegisterUnsupported[Options any](registry *Registry, outboundType string, constructor ConstructorFunc[Options]) {
+	registry.register(outboundType, func() any {
+		return new(Options)
+	}, func(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, rawOptions any) (adapter.Outbound, error) {
+		var options *Options
+		if rawOptions != nil {
+			options = rawOptions.(*Options)
+		}
+		return constructor(ctx, router, logger, tag, common.PtrValueOrDefault(options))
+	}, false)
 }
 
 var _ adapter.OutboundRegistry = (*Registry)(nil)
+var _ option.OutboundSupportRegistry = (*Registry)(nil)
 
 type (
 	optionsConstructorFunc func() any
@@ -37,12 +54,14 @@ type Registry struct {
 	access       sync.Mutex
 	optionsType  map[string]optionsConstructorFunc
 	constructors map[string]constructorFunc
+	supported    map[string]bool
 }
 
 func NewRegistry() *Registry {
 	return &Registry{
 		optionsType:  make(map[string]optionsConstructorFunc),
 		constructors: make(map[string]constructorFunc),
+		supported:    make(map[string]bool),
 	}
 }
 
@@ -62,6 +81,13 @@ func (r *Registry) CreateOptions(outboundType string) (any, bool) {
 	return optionsConstructor(), true
 }
 
+func (r *Registry) IsSupported(outboundType string) bool {
+	r.access.Lock()
+	defer r.access.Unlock()
+	supported, loaded := r.supported[outboundType]
+	return loaded && supported
+}
+
 func (r *Registry) CreateOutbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, outboundType string, options any) (adapter.Outbound, error) {
 	r.access.Lock()
 	defer r.access.Unlock()
@@ -72,9 +98,10 @@ func (r *Registry) CreateOutbound(ctx context.Context, router adapter.Router, lo
 	return constructor(ctx, router, logger, tag, options)
 }
 
-func (r *Registry) register(outboundType string, optionsConstructor optionsConstructorFunc, constructor constructorFunc) {
+func (r *Registry) register(outboundType string, optionsConstructor optionsConstructorFunc, constructor constructorFunc, supported bool) {
 	r.access.Lock()
 	defer r.access.Unlock()
 	r.optionsType[outboundType] = optionsConstructor
 	r.constructors[outboundType] = constructor
+	r.supported[outboundType] = supported
 }
