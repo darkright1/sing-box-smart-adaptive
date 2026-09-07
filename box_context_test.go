@@ -36,8 +36,13 @@ func TestContextRegistersProtocolCapabilityViews(t *testing.T) {
 	}
 }
 
-func TestContextProviderParserDropsSchemaOnlyProtocol(t *testing.T) {
+func TestContextProviderParserHonorsProtocolCapability(t *testing.T) {
 	ctx := include.Context(context.Background())
+	capabilities := service.FromContext[option.OutboundSupportRegistry](ctx)
+	if capabilities == nil {
+		t.Fatal("box context did not expose outbound capabilities")
+	}
+	naiveSupported := capabilities.IsSupported("naive")
 	outbounds, endpoints, err := providerparser.ParseSubscription(ctx, `{
   "outbounds": [
     {"type":"socks", "tag":"valid", "server":"127.0.0.1", "server_port":1080},
@@ -47,7 +52,11 @@ func TestContextProviderParserDropsSchemaOnlyProtocol(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(endpoints) != 0 || len(outbounds) != 1 || outbounds[0].Tag != "valid" {
+	expectedOutbounds := 1
+	if naiveSupported {
+		expectedOutbounds = 2
+	}
+	if len(endpoints) != 0 || len(outbounds) != expectedOutbounds || outbounds[0].Tag != "valid" {
 		t.Fatalf("production context did not filter schema-only protocol: outbounds=%+v endpoints=%+v", outbounds, endpoints)
 	}
 }
