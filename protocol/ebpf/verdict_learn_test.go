@@ -43,7 +43,11 @@ func TestEvaluateVerdictLearn_Port53(t *testing.T) {
 
 func TestEvaluateVerdictLearn_Sniff(t *testing.T) {
 	opts := verdictLearnOptions{mode: "learn", ttl: time.Minute, allowWithSniff: false}
-	meta := adapter.InboundContext{Protocol: "tls", Domain: "example.com"}
+	meta := adapter.InboundContext{
+		Protocol:     "tls",
+		Domain:       "example.com",
+		VerdictScope: adapter.RouteVerdictScopeDestinationIP,
+	}
 	ok, reason := evaluateVerdictLearn(opts, stubDirectDialer{empty: true}, meta,
 		netip.MustParseAddrPort("1.2.3.4:443"))
 	if ok || reason != verdictSkipSniff {
@@ -59,7 +63,8 @@ func TestEvaluateVerdictLearn_Sniff(t *testing.T) {
 
 func TestEvaluateVerdictLearn_NonDirect(t *testing.T) {
 	opts := verdictLearnOptions{mode: "learn", ttl: time.Minute}
-	ok, reason := evaluateVerdictLearn(opts, stubDirectDialer{empty: false}, adapter.InboundContext{},
+	meta := adapter.InboundContext{VerdictScope: adapter.RouteVerdictScopeDestinationIP}
+	ok, reason := evaluateVerdictLearn(opts, stubDirectDialer{empty: false}, meta,
 		netip.MustParseAddrPort("1.2.3.4:443"))
 	if ok || reason != verdictSkipNonDirect {
 		t.Fatalf("want skip non-direct, ok=%v reason=%d", ok, reason)
@@ -68,13 +73,16 @@ func TestEvaluateVerdictLearn_NonDirect(t *testing.T) {
 
 func TestEvaluateVerdictLearn_ProcessUser(t *testing.T) {
 	opts := verdictLearnOptions{mode: "learn", ttl: time.Minute}
-	meta := adapter.InboundContext{User: "alice"}
+	meta := adapter.InboundContext{User: "alice", VerdictScope: adapter.RouteVerdictScopeDestinationIP}
 	ok, reason := evaluateVerdictLearn(opts, stubDirectDialer{empty: true}, meta,
 		netip.MustParseAddrPort("1.2.3.4:443"))
 	if ok || reason != verdictSkipProcessUser {
 		t.Fatalf("want skip process/user, ok=%v reason=%d", ok, reason)
 	}
-	meta = adapter.InboundContext{ProcessInfo: &adapter.ConnectionOwner{ProcessID: 1}}
+	meta = adapter.InboundContext{
+		ProcessInfo:  &adapter.ConnectionOwner{ProcessID: 1},
+		VerdictScope: adapter.RouteVerdictScopeDestinationIP,
+	}
 	ok, reason = evaluateVerdictLearn(opts, stubDirectDialer{empty: true}, meta,
 		netip.MustParseAddrPort("1.2.3.4:443"))
 	if ok || reason != verdictSkipProcessUser {
@@ -84,7 +92,8 @@ func TestEvaluateVerdictLearn_ProcessUser(t *testing.T) {
 
 func TestEvaluateVerdictLearn_OK(t *testing.T) {
 	opts := verdictLearnOptions{mode: "learn", ttl: time.Minute}
-	ok, reason := evaluateVerdictLearn(opts, stubDirectDialer{empty: true}, adapter.InboundContext{},
+	meta := adapter.InboundContext{VerdictScope: adapter.RouteVerdictScopeDestinationIP}
+	ok, reason := evaluateVerdictLearn(opts, stubDirectDialer{empty: true}, meta,
 		netip.MustParseAddrPort("1.2.3.4:443"))
 	if !ok || reason != verdictSkipNone {
 		t.Fatalf("want ok, ok=%v reason=%d", ok, reason)
