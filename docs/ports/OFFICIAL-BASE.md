@@ -10,8 +10,9 @@
 3. **Never port**: reF1nd cilium eBPF stack as a whole-tree overlay.
 
 ## Branch `adaptive/official-v1.14.0-smart-ebpf`
-- Base: official stable tag `v1.14.0` commit `0b8995879f29a9b98ee027bc17b75e101445b238`
-- Version: `1.14.0` (project revision is recorded in the binary build metadata)
+- Base: official SagerNet `v1.14.x` stable line (upstream tags are merged explicitly;
+  inspect `git describe --tags` for the exact revision in a checkout)
+- Version: `1.14.x` (project revision is recorded in the binary build metadata)
 - Default tags include `with_ebpf` and `with_connection_history`
 
 ## Coherence model (must stay true)

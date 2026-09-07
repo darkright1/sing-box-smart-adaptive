@@ -1,7 +1,7 @@
 # sing-box Smart eBPF Data Plane v3 设计方案
 
 > 目标读者：负责实现的 Grok / 工程人员  
-> 基线：`luange/sing-box-smart-adaptive`，分支 `adaptive/beta17-smart-clean`  
+> 基线：`luange/sing-box-smart-adaptive`，分支 `adaptive/official-v1.14.0-smart-ebpf`
 > 原则：参考 dae 的架构思想，不复制其 AGPL 源码；保持本项目独立实现和现有 ABI 可迁移。
 
 ## 1. 目标
@@ -32,11 +32,12 @@ v3 不是再堆一组开关，而是把透明代理明确拆成两个平面：
 - 已编译的 UID/cgroup 身份（仅本机流量）。
 - DHCP、ND、广播、多播、本机管理地址等安全规则。
 
-不能天然做到：
+不能在首个数据包上天然做到：
 
-- 尚未出现 DNS 关联的域名规则。
+- 尚未出现可信 DNS 关联的域名规则（v3 可嗅探明文 UDP/53 应答，再由用户态
+  完整规则判定后晋升；DoH/DoT、加密 DNS 和无关联首包仍回控制面）。
 - TLS/HTTP sniff 后才能知道的服务族。
-- FakeIP 反向映射尚未发布到内核的流量。
+- FakeIP 反向映射尚未以当前 generation 发布到内核的流量。
 - 依赖完整 sing-box rule-set 组合、logical rule 或动态 provider 状态的规则。
 
 这些流量必须先进入控制面一次。控制面判定后，才允许发布 exact-flow verdict。
@@ -204,7 +205,8 @@ enum sb_v3_verdict {
 - 指定 DNS 服务器 `:53` 内核直通只是一项显式策略，不等同于所有 DNS 绕过控制面。
 - 需要域名 PBR 时，DNS 回答必须被控制面或可信 DNS observer 看见。
 - DNS coalescing、缓存和 UDP socket 复用留在用户态 DNS 模块，不在 TC 复制 DNS parser。
-- TC 只消费已经发布的关联结果。
+- TC 只消费已经发布且未过期、无 DIRECT/PROXY 冲突的关联结果；v3 的
+  `v3_dns_observe` 仅是有界、只读的提示队列，解析失败一律回控制面。
 
 ## 9. Exact-flow 学习
 

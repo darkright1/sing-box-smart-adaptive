@@ -73,7 +73,8 @@ network/site/transport 做稳定分散。它不是每条连接真随机，因此
 
 ```bash
 git fetch sagernet
-git merge sagernet/v1.14.0-beta.XX   # 或 cherry-pick
+# 只合并官方稳定标签（示例）
+git merge sagernet/v1.14.0   # 或 cherry-pick
 # 冲突优先保留官方行为，再重放 protocol/ebpf、group/smart、provider、history 胶水
 ```
 
