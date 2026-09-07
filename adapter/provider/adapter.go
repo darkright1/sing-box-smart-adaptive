@@ -768,7 +768,7 @@ func (a *Adapter) UpdateEndpoints(oldOpts []option.Endpoint, newOpts []option.En
 	a.endpointDialIDs = make(map[string]string, len(newTags))
 	for i, tag := range newTags {
 		if i < len(newOpts) {
-			normalized, normalizeErr := nodeidentity.CanonicalEndpointOptions(newOpts[i].Options)
+			normalized, normalizeErr := nodeidentity.CanonicalEndpointOptionsForType(newOpts[i].Type, newOpts[i].Options)
 			if normalizeErr != nil {
 				normalized = map[string]any{"opaque_options_type": fmt.Sprintf("%T", newOpts[i].Options)}
 			}
