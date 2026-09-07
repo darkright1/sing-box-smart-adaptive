@@ -229,13 +229,16 @@ func uniqueProviderTag(baseTag, identity string, seen map[string]bool) string {
 
 func (a *Adapter) UpdateOutbounds(oldOpts []option.Outbound, newOpts []option.Outbound) {
 	newTags := a.resolveOutboundTags(newOpts)
+	oldTags := a.resolveOutboundTags(oldOpts)
 	var (
 		oldOptByTag    = make(map[string]option.Outbound)
 		outbounds      = make([]adapter.Outbound, 0, len(newOpts))
 		outboundsByTag = make(map[string]adapter.Outbound)
 	)
-	for _, opt := range oldOpts {
-		oldOptByTag[opt.Tag] = opt
+	for i, opt := range oldOpts {
+		if i < len(oldTags) {
+			oldOptByTag[oldTags[i]] = opt
+		}
 	}
 	activeTags := a.activeOutboundTags()
 	previousOutbounds := a.activeOutboundSnapshot()
@@ -245,7 +248,7 @@ func (a *Adapter) UpdateOutbounds(oldOpts []option.Outbound, newOpts []option.Ou
 		outbound, exist := a.outbound.Outbound(tag)
 		_, active := activeTags[tag]
 		previousOutbound := outbound
-		if !exist || !active || !reflect.DeepEqual(opt, oldOptByTag[opt.Tag]) {
+		if !exist || !active || !reflect.DeepEqual(opt, oldOptByTag[tag]) {
 			opt = stripTCPFastOpenForAnyTLS(opt)
 			err := a.outbound.Create(
 				adapter.WithContext(a.ctx, &adapter.InboundContext{
@@ -620,13 +623,16 @@ func (a *Adapter) resolveEndpointTags(newOpts []option.Endpoint) []string {
 
 func (a *Adapter) UpdateEndpoints(oldOpts []option.Endpoint, newOpts []option.Endpoint) {
 	newTags := a.resolveEndpointTags(newOpts)
+	oldTags := a.resolveEndpointTags(oldOpts)
 	var (
 		oldOptByTag    = make(map[string]option.Endpoint)
 		endpoints      []adapter.Outbound
 		endpointsByTag = make(map[string]adapter.Outbound)
 	)
-	for _, opt := range oldOpts {
-		oldOptByTag[opt.Tag] = opt
+	for i, opt := range oldOpts {
+		if i < len(oldTags) {
+			oldOptByTag[oldTags[i]] = opt
+		}
 	}
 	activeTags := a.activeEndpointTags()
 	a.removeUselessEndpoints(newTags)
@@ -635,7 +641,7 @@ func (a *Adapter) UpdateEndpoints(oldOpts []option.Endpoint, newOpts []option.En
 		ep, exist := a.endpoint.Get(tag)
 		_, active := activeTags[tag]
 		previousEndpoint := ep
-		if !exist || !active || !reflect.DeepEqual(opt, oldOptByTag[opt.Tag]) {
+		if !exist || !active || !reflect.DeepEqual(opt, oldOptByTag[tag]) {
 			err := a.endpoint.Create(
 				adapter.WithContext(a.ctx, &adapter.InboundContext{
 					Outbound: tag,
