@@ -28,11 +28,14 @@ type HistoryStorage struct {
 
 // HistoryKey identifies a URL-test observation without using a provider's
 // display alias as the identity. PathIdentity is credential-free and stable
-// across provider refreshes; ProbeTarget is a digest of the test URL so query
-// strings or tokens are never retained in the in-memory key; Network keeps
-// TCP4/TCP6 (and future families) from sharing measurements accidentally.
+// across provider refreshes, while DialIdentity keeps full authenticated
+// URLTest results separate when two credentials share one network path.
+// ProbeTarget is a digest of the test URL so query strings or tokens are never
+// retained in the in-memory key; Network keeps TCP4/TCP6 (and future families)
+// from sharing measurements accidentally.
 type HistoryKey struct {
 	PathIdentity string
+	DialIdentity string
 	ProbeTarget  string
 	Network      string
 }
@@ -41,13 +44,17 @@ type HistoryKey struct {
 // outbounds use their tag as a stable fallback; provider members expose the
 // stronger OutboundWithEndpointIdentity contract.
 func KeyForOutbound(outbound adapter.Outbound, link, network string) HistoryKey {
-	identity := ""
+	pathIdentity := ""
+	dialIdentity := ""
 	if outbound != nil {
 		if identified, ok := outbound.(adapter.OutboundWithEndpointIdentity); ok {
-			identity = identified.EndpointIdentity()
+			pathIdentity = identified.EndpointIdentity()
 		}
-		if identity == "" {
-			identity = outbound.Tag()
+		if identified, ok := outbound.(adapter.OutboundWithDialIdentity); ok {
+			dialIdentity = identified.DialIdentity()
+		}
+		if pathIdentity == "" {
+			pathIdentity = outbound.Tag()
 		}
 	}
 	if link == "" {
@@ -58,7 +65,8 @@ func KeyForOutbound(outbound adapter.Outbound, link, network string) HistoryKey 
 		network = N.NetworkTCP
 	}
 	return HistoryKey{
-		PathIdentity: identity,
+		PathIdentity: pathIdentity,
+		DialIdentity: dialIdentity,
 		ProbeTarget:  hex.EncodeToString(targetDigest[:]),
 		Network:      network,
 	}
@@ -119,7 +127,7 @@ func (s *HistoryStorage) LoadURLTestHistoryKey(key HistoryKey, legacyTag string)
 	if history := s.keyedHistory[key]; history != nil {
 		return history
 	}
-	if key.PathIdentity == "" || key.PathIdentity == legacyTag {
+	if (key.PathIdentity == "" || key.PathIdentity == legacyTag) && key.DialIdentity == "" {
 		return s.delayHistory[legacyTag]
 	}
 	return nil
@@ -145,7 +153,7 @@ func (s *HistoryStorage) DeleteURLTestHistoryKey(key HistoryKey, legacyTag strin
 	}
 	s.access.Lock()
 	delete(s.keyedHistory, key)
-	if key.PathIdentity == "" || key.PathIdentity == legacyTag {
+	if (key.PathIdentity == "" || key.PathIdentity == legacyTag) && key.DialIdentity == "" {
 		delete(s.delayHistory, legacyTag)
 	}
 	s.notifyUpdated()
@@ -154,8 +162,9 @@ func (s *HistoryStorage) DeleteURLTestHistoryKey(key HistoryKey, legacyTag strin
 
 // LoadLatestURLTestHistoryForOutbound is used by dashboards and group status
 // APIs that do not know which probe URL produced an observation. It only scans
-// the matching path identity and network, so a duplicate provider alias cannot
-// leak another node's history into the display.
+// the matching path identity, dial identity, and network, so a duplicate
+// provider alias or credential variant cannot leak another node's history into
+// the display.
 func (s *HistoryStorage) LoadLatestURLTestHistoryForOutbound(outbound adapter.Outbound, legacyTag, network string) *adapter.URLTestHistory {
 	if s == nil {
 		return nil
@@ -171,7 +180,7 @@ func (s *HistoryStorage) LoadLatestURLTestHistoryKey(key HistoryKey, legacyTag s
 	defer s.access.RUnlock()
 	var latest *adapter.URLTestHistory
 	for candidateKey, history := range s.keyedHistory {
-		if candidateKey.PathIdentity != key.PathIdentity || candidateKey.Network != key.Network {
+		if candidateKey.PathIdentity != key.PathIdentity || candidateKey.DialIdentity != key.DialIdentity || candidateKey.Network != key.Network {
 			continue
 		}
 		if latest == nil || history.Time.After(latest.Time) {
@@ -181,7 +190,7 @@ func (s *HistoryStorage) LoadLatestURLTestHistoryKey(key HistoryKey, legacyTag s
 	if latest != nil {
 		return latest
 	}
-	if key.PathIdentity == "" || key.PathIdentity == legacyTag {
+	if (key.PathIdentity == "" || key.PathIdentity == legacyTag) && key.DialIdentity == "" {
 		return s.delayHistory[legacyTag]
 	}
 	return nil

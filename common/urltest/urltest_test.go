@@ -52,6 +52,16 @@ func TestIdentityHistorySeparatesProbeContext(t *testing.T) {
 	}
 }
 
+func TestIdentityHistorySeparatesAuthenticatedCredentials(t *testing.T) {
+	storage := NewHistoryStorage()
+	keyA := HistoryKey{PathIdentity: "path", DialIdentity: "credential-a", ProbeTarget: "target", Network: "tcp"}
+	keyB := HistoryKey{PathIdentity: "path", DialIdentity: "credential-b", ProbeTarget: "target", Network: "tcp"}
+	storage.StoreURLTestHistoryKey(keyA, "HK", &adapter.URLTestHistory{Time: time.Now(), Delay: 25})
+	if storage.LoadURLTestHistoryKey(keyB, "HK") != nil {
+		t.Fatal("different authenticated dial identities reused URL-test history")
+	}
+}
+
 func TestLegacyHistoryFallbackOnlyForStableTag(t *testing.T) {
 	storage := NewHistoryStorage()
 	history := &adapter.URLTestHistory{Time: time.Now(), Delay: 12}
