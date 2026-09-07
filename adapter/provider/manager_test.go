@@ -50,6 +50,11 @@ type managerTestRegistry struct {
 	provider adapter.Provider
 }
 
+type managerUncomparableProvider struct {
+	*managerTestProvider
+	state []byte
+}
+
 func (managerTestRegistry) OptionTypes() []string            { return []string{"test"} }
 func (managerTestRegistry) CreateOptions(string) (any, bool) { return nil, true }
 func (r managerTestRegistry) CreateProvider(context.Context, adapter.Router, log.Factory, string, string, any) (adapter.Provider, error) {
@@ -72,6 +77,44 @@ func TestManagerCloseReleasesProvidersBeforeStart(t *testing.T) {
 	}
 	if len(m.Providers()) != 0 {
 		t.Fatal("manager retained providers after close")
+	}
+	m.closeAccess.Lock()
+	if len(m.closeInflight) != 0 {
+		t.Fatalf("close in-flight table retained %d providers", len(m.closeInflight))
+	}
+	m.closeAccess.Unlock()
+}
+
+func TestManagerSupportsUncomparableProviderValues(t *testing.T) {
+	base := &managerTestProvider{tag: "value"}
+	provider := managerUncomparableProvider{managerTestProvider: base, state: []byte{1, 2, 3}}
+	m := NewManager(context.Background(), logger.NOP(), nil)
+	m.providers = []adapter.Provider{provider}
+	m.providerByTag[provider.Tag()] = provider
+	if err := m.Remove(provider.Tag()); err != nil {
+		t.Fatalf("remove uncomparable provider: %v", err)
+	}
+	if base.closeSeen != 1 {
+		t.Fatalf("uncomparable provider close count=%d, want 1", base.closeSeen)
+	}
+}
+
+func TestManagerReplacesUncomparableProviderValue(t *testing.T) {
+	base := &managerTestProvider{tag: "value"}
+	old := managerUncomparableProvider{managerTestProvider: base, state: []byte{1, 2, 3}}
+	newProvider := &managerTestProvider{tag: old.Tag()}
+	m := NewManager(context.Background(), logger.NOP(), managerTestRegistry{provider: newProvider})
+	m.providers = []adapter.Provider{old}
+	m.providerByTag[old.Tag()] = old
+	if err := m.Create(context.Background(), nil, nil, old.Tag(), "test", nil); err != nil {
+		t.Fatalf("replace uncomparable provider: %v", err)
+	}
+	current, ok := m.Get(old.Tag())
+	if !ok || current != newProvider {
+		t.Fatalf("replacement was not authoritative: %v %v", current, ok)
+	}
+	if base.closeSeen != 1 {
+		t.Fatalf("replaced uncomparable provider close count=%d, want 1", base.closeSeen)
 	}
 }
 
@@ -156,8 +199,8 @@ func TestManagerStartHookCanReenterCreate(t *testing.T) {
 	m.providers = []adapter.Provider{first}
 	m.providerByTag[first.Tag()] = first
 	first.startFn = func() {
-		if err := m.Create(context.Background(), nil, nil, nested.Tag(), "test", nil); err != nil {
-			t.Errorf("reentrant create failed: %v", err)
+		if err := m.Create(context.Background(), nil, nil, nested.Tag(), "test", nil); err == nil {
+			t.Error("reentrant create must be rejected while start is transactional")
 		}
 	}
 
@@ -171,8 +214,38 @@ func TestManagerStartHookCanReenterCreate(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("provider start hook re-entry deadlocked")
 	}
-	if _, ok := m.Get(nested.Tag()); !ok {
-		t.Fatal("reentrant provider was not published")
+	if _, ok := m.Get(nested.Tag()); ok {
+		t.Fatal("reentrant provider was published during an incomplete start")
+	}
+	if nested.closeSeen != 1 {
+		t.Fatalf("reentrant provider close count=%d, want 1", nested.closeSeen)
+	}
+}
+
+func TestManagerStartRejectsRemoveAndClose(t *testing.T) {
+	provider := &managerTestProvider{tag: "provider"}
+	m := NewManager(context.Background(), logger.NOP(), nil)
+	m.providers = []adapter.Provider{provider}
+	m.providerByTag[provider.Tag()] = provider
+	provider.startFn = func() {
+		if err := m.Remove(provider.Tag()); err == nil {
+			t.Error("reentrant remove must be rejected while start is transactional")
+		}
+		if err := m.Close(); err == nil {
+			t.Error("reentrant close must be rejected while start is transactional")
+		}
+	}
+	if err := m.Start(adapter.StartStateStart); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := m.Get(provider.Tag()); !ok {
+		t.Fatal("provider was removed during an incomplete start")
+	}
+	if err := m.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if provider.closeSeen != 1 {
+		t.Fatalf("provider close count=%d, want 1", provider.closeSeen)
 	}
 }
 

@@ -4,6 +4,7 @@ import (
 	"context"
 	"io"
 	"os"
+	"reflect"
 	"sync"
 
 	"github.com/sagernet/sing-box/adapter"
@@ -29,7 +30,7 @@ type Manager struct {
 	operation     sync.Mutex
 	access        sync.Mutex
 	closeAccess   sync.Mutex
-	closeOnce     map[adapter.Provider]*providerCloseResult
+	closeInflight map[adapter.Provider]*providerClosePromise
 	generation    uint64
 	started       bool
 	starting      bool
@@ -39,9 +40,8 @@ type Manager struct {
 	callbacks     list.List[adapter.ProviderManagerUpdateCallback]
 }
 
-type providerCloseResult struct {
-	once sync.Once
-	err  error
+type providerClosePromise struct {
+	err error
 }
 
 func NewManager(ctx context.Context, logger logger.ContextLogger, registry adapter.ProviderRegistry) *Manager {
@@ -50,7 +50,7 @@ func NewManager(ctx context.Context, logger logger.ContextLogger, registry adapt
 		logger:        logger,
 		registry:      registry,
 		providerByTag: make(map[string]adapter.Provider),
-		closeOnce:     make(map[adapter.Provider]*providerCloseResult),
+		closeInflight: make(map[adapter.Provider]*providerClosePromise),
 	}
 }
 
@@ -71,11 +71,6 @@ func (m *Manager) Start(stage adapter.StartStage) error {
 	generation := m.generation
 	m.starting = true
 	providers := append([]adapter.Provider(nil), m.providers...)
-	if stage == adapter.StartStateStart {
-		for _, provider := range providers {
-			m.resetCloseState(provider)
-		}
-	}
 	m.access.Unlock()
 	m.operation.Unlock()
 	if stage == adapter.StartStateStart && len(providers) > 0 {
@@ -105,6 +100,11 @@ func (m *Manager) Start(stage adapter.StartStage) error {
 				m.starting = false
 				m.started = previousStarted
 				m.stage = previousStage
+			} else {
+				// A future lifecycle mutation may invalidate this transaction
+				// without owning the rollback state. Never leave the manager stuck
+				// in starting=true after an invalidated attempt.
+				m.starting = false
 			}
 			m.access.Unlock()
 			m.operation.Unlock()
@@ -121,6 +121,10 @@ func (m *Manager) commitStart(generation uint64, stage adapter.StartStage) error
 	m.access.Lock()
 	defer m.access.Unlock()
 	if m.generation != generation {
+		// The authoritative state was changed by another transaction. That
+		// transaction owns the resulting started/stage values; clear only our
+		// in-progress marker so future mutations are not permanently rejected.
+		m.starting = false
 		return E.New("provider manager changed while starting stage ", stage)
 	}
 	m.starting = false
@@ -133,6 +137,11 @@ func (m *Manager) Close() error {
 	m.operation.Lock()
 	monitor := taskmonitor.New(m.logger, C.StopTimeout)
 	m.access.Lock()
+	if m.starting {
+		m.access.Unlock()
+		m.operation.Unlock()
+		return E.New("provider manager is starting; retry close")
+	}
 	m.generation++
 	m.starting = false
 	m.started = false
@@ -196,6 +205,11 @@ func (m *Manager) Get(tag string) (adapter.Provider, bool) {
 func (m *Manager) Remove(tag string) error {
 	m.operation.Lock()
 	m.access.Lock()
+	if m.starting {
+		m.access.Unlock()
+		m.operation.Unlock()
+		return E.New("provider manager is starting; retry provider removal")
+	}
 	provider, found := m.providerByTag[tag]
 	if !found {
 		m.access.Unlock()
@@ -204,12 +218,13 @@ func (m *Manager) Remove(tag string) error {
 	}
 	delete(m.providerByTag, tag)
 	index := common.Index(m.providers, func(it adapter.Provider) bool {
-		return it == provider
+		return sameProvider(it, provider)
 	})
 	if index == -1 {
 		panic("invalid provider index")
 	}
 	m.providers = append(m.providers[:index], m.providers[index+1:]...)
+	m.generation++
 	m.access.Unlock()
 	m.operation.Unlock()
 	m.notifyProviderCallbacks()
@@ -225,9 +240,14 @@ func (m *Manager) Create(ctx context.Context, router adapter.Router, logFactory 
 	if err != nil {
 		return err
 	}
-	m.resetCloseState(provider)
 	m.operation.Lock()
 	m.access.Lock()
+	if m.starting {
+		m.access.Unlock()
+		m.operation.Unlock()
+		_ = m.closeProvider(provider)
+		return E.New("provider manager is starting; retry provider creation")
+	}
 	started := m.started
 	stage := m.stage
 	existsProvider := m.providerByTag[tag]
@@ -254,7 +274,7 @@ func (m *Manager) Create(ctx context.Context, router adapter.Router, logFactory 
 	// concurrent Close or replacement may have completed while the new
 	// provider was starting; never publish into that newer state.
 	currentProvider := m.providerByTag[tag]
-	if m.generation != generation || currentProvider != existsProvider {
+	if m.generation != generation || !sameProvider(currentProvider, existsProvider) {
 		m.access.Unlock()
 		m.operation.Unlock()
 		_ = m.closeProvider(provider)
@@ -262,7 +282,7 @@ func (m *Manager) Create(ctx context.Context, router adapter.Router, logFactory 
 	}
 	if existsProvider != nil {
 		existsIndex := common.Index(m.providers, func(it adapter.Provider) bool {
-			return it == existsProvider
+			return sameProvider(it, existsProvider)
 		})
 		if existsIndex == -1 {
 			panic("invalid provider index")
@@ -271,6 +291,7 @@ func (m *Manager) Create(ctx context.Context, router adapter.Router, logFactory 
 	}
 	m.providers = append(m.providers, provider)
 	m.providerByTag[tag] = provider
+	m.generation++
 	m.access.Unlock()
 	m.operation.Unlock()
 	m.notifyProviderCallbacks()
@@ -297,26 +318,54 @@ func (m *Manager) closeProvider(provider adapter.Provider) error {
 	if provider == nil {
 		return nil
 	}
-	m.closeAccess.Lock()
-	result := m.closeOnce[provider]
-	if result == nil {
-		result = new(providerCloseResult)
-		m.closeOnce[provider] = result
+	providerType := reflect.TypeOf(provider)
+	if providerType == nil || !providerType.Comparable() {
+		// The Provider interface does not require comparable concrete values. Do
+		// not turn an extensibility edge case into a runtime hash panic; unusual
+		// value providers are closed directly because they cannot be keyed for
+		// in-flight deduplication.
+		return common.Close(provider)
 	}
+	m.closeAccess.Lock()
+	if m.closeInflight == nil {
+		// Keep the zero-value Manager safe for tests and embedders that construct
+		// it without NewManager. This table is only an in-flight coordination
+		// structure and must not become a historical provider cache.
+		m.closeInflight = make(map[adapter.Provider]*providerClosePromise)
+	}
+	if _, loaded := m.closeInflight[provider]; loaded {
+		// A provider Close callback may re-enter Remove/Close for the same
+		// provider. Waiting here would self-deadlock; the first closer remains
+		// authoritative and owns the result.
+		m.closeAccess.Unlock()
+		return nil
+	}
+	promise := new(providerClosePromise)
+	m.closeInflight[provider] = promise
 	m.closeAccess.Unlock()
-	result.once.Do(func() {
-		result.err = common.Close(provider)
-	})
-	return result.err
+	promise.err = common.Close(provider)
+	m.closeAccess.Lock()
+	delete(m.closeInflight, provider)
+	m.closeAccess.Unlock()
+	return promise.err
 }
 
-func (m *Manager) resetCloseState(provider adapter.Provider) {
-	if provider == nil {
-		return
+func sameProvider(a, b adapter.Provider) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
 	}
-	m.closeAccess.Lock()
-	delete(m.closeOnce, provider)
-	m.closeAccess.Unlock()
+	ta, tb := reflect.TypeOf(a), reflect.TypeOf(b)
+	if ta != tb {
+		return false
+	}
+	if ta.Comparable() {
+		return a == b
+	}
+	// Non-comparable value providers cannot expose object identity through an
+	// interface. The manager's authoritative key is the unique provider tag;
+	// generation validation handles replacement races before this fallback is
+	// used for slice removal.
+	return a.Tag() == b.Tag()
 }
 
 func startProvider(ctx context.Context, provider adapter.Provider, startContext *adapter.HTTPStartContext) error {

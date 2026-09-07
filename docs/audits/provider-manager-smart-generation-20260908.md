@@ -19,9 +19,12 @@ published once before the trailing rebuild.
 
 Manager transitions now reserve state, run external hooks without the operation
 mutex, and commit only after success. Failed starts close every attempted
-provider in reverse order and restore the previous lifecycle state. Provider
-cleanup is idempotent within an activation cycle, while reactivation resets the
-cleanup guard. Manager callbacks are always notified after releasing transition
+provider in reverse order and restore the previous lifecycle state. Create,
+Remove, and Close mutations are rejected while a start transaction is active;
+callers can retry after the transaction completes, so no provider can be
+published without its start hook or be closed and then started again. Provider
+cleanup uses a short-lived in-flight table rather than retaining every closed
+provider. Manager callbacks are always notified after releasing transition
 locks, and replacement cleanup failures are warnings because publication is
 already authoritative. Create also checks the manager generation before commit,
 so a concurrent Close cannot repopulate a closed manager.
