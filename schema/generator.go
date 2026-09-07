@@ -22,6 +22,7 @@ var (
 	textUnmarshalerType    = reflect.TypeFor[encoding.TextUnmarshaler]()
 
 	durationType           = reflect.TypeFor[badoption.Duration]()
+	regexpType             = reflect.TypeFor[badoption.Regexp]()
 	addrType               = reflect.TypeFor[badoption.Addr]()
 	prefixType             = reflect.TypeFor[badoption.Prefix]()
 	prefixableType         = reflect.TypeFor[badoption.Prefixable]()
@@ -77,6 +78,11 @@ func (g *generator) Describe(valueType reflect.Type) (*Node, error) {
 		return g.Define("Duration", func() (*Node, error) {
 			return DurationNode(), nil
 		})
+	case regexpType:
+		// badoption.Regexp is a JSON string that is compiled and validated at
+		// decode time. Exposing it as a string keeps generated schemas usable
+		// for provider/group include and exclude fields.
+		return StringNode(), nil
 	case addrType, prefixType, prefixableType:
 		return StringNode(), nil
 	case httpHeaderType:
