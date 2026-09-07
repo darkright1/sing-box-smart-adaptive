@@ -61,7 +61,7 @@ func (h *IdentityHasher) FromCanonicalOptions(outboundType string, options any) 
 // one server/SNI without merging their independent NodeIDs or persisting any
 // secret material.
 func (h *IdentityHasher) FromEndpointOptions(outboundType string, options any) (NodeID, error) {
-	value, err := canonicalEndpointValue(options)
+	value, err := canonicalEndpointValue(outboundType, options)
 	if err != nil {
 		return NodeID{}, err
 	}
@@ -81,8 +81,8 @@ func (h *IdentityHasher) FromEndpointOptions(outboundType string, options any) (
 	return id, nil
 }
 
-func canonicalEndpointValue(input any) (any, error) {
-	return nodeidentity.CanonicalEndpointOptions(input)
+func canonicalEndpointValue(outboundType string, input any) (any, error) {
+	return nodeidentity.CanonicalEndpointOptionsForType(outboundType, input)
 }
 
 func (h *IdentityHasher) FromRuntimeDescriptor(candidateType, tag string, networks, dependencies []string) NodeID {

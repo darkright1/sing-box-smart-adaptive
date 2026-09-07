@@ -1,6 +1,9 @@
 package nodeidentity
 
-import "testing"
+import (
+	"encoding/json"
+	"testing"
+)
 
 func TestCanonicalEndpointOptionsStripsNestedCredentials(t *testing.T) {
 	value, err := CanonicalEndpointOptions(map[string]any{
@@ -42,5 +45,68 @@ func TestCanonicalEndpointOptionsKeepsNonCredentialHeaders(t *testing.T) {
 	}
 	if _, ok := headers["Authorization"]; ok {
 		t.Fatal("authorization header was retained")
+	}
+}
+
+func TestProtocolProjectionCoversCredentialVariants(t *testing.T) {
+	first, err := CanonicalEndpointOptionsForType("ssh", map[string]any{
+		"server": "edge.example", "server_port": 22, "user": "alice",
+		"password": "one", "private_key_path": "/keys/a", "host_key": []any{"ssh-ed25519"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := CanonicalEndpointOptionsForType("ssh", map[string]any{
+		"server": "edge.example", "server_port": 22, "user": "bob",
+		"password": "two", "private_key_path": "/keys/b", "host_key": []any{"ssh-ed25519"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstJSON, _ := json.Marshal(first)
+	secondJSON, _ := json.Marshal(second)
+	if string(firstJSON) != string(secondJSON) {
+		t.Fatalf("SSH credential variants must share path projection: %s != %s", firstJSON, secondJSON)
+	}
+}
+
+func TestProtocolProjectionPreservesNonCredentialTokenFields(t *testing.T) {
+	value, err := CanonicalEndpointOptionsForType("http", map[string]any{
+		"server":        "edge.example",
+		"authorization": "routing-metadata",
+		"headers":       map[string]any{"Token": "routing-hint", "Authorization": "secret"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	headers := value.(map[string]any)["headers"].(map[string]any)
+	if headers["Token"] != "routing-hint" {
+		t.Fatalf("custom Token header was removed: %#v", headers)
+	}
+	if _, ok := headers["Authorization"]; ok {
+		t.Fatalf("authorization header was retained: %#v", headers)
+	}
+	if value.(map[string]any)["authorization"] != "routing-metadata" {
+		t.Fatal("non-header authorization metadata was removed")
+	}
+}
+
+func TestProtocolProjectionKeepsOpenVPNAuthAlgorithm(t *testing.T) {
+	first, err := CanonicalEndpointOptionsForType("openvpn", map[string]any{
+		"server": "edge.example", "remote_port": 1194, "auth": "SHA256", "password": "one",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := CanonicalEndpointOptionsForType("openvpn", map[string]any{
+		"server": "edge.example", "remote_port": 1194, "auth": "SHA512", "password": "two",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstJSON, _ := json.Marshal(first)
+	secondJSON, _ := json.Marshal(second)
+	if string(firstJSON) == string(secondJSON) {
+		t.Fatalf("OpenVPN auth algorithm must remain part of path projection: %s", firstJSON)
 	}
 }

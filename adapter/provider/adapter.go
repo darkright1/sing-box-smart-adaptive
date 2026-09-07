@@ -265,7 +265,7 @@ func (a *Adapter) resolveEndpointTags(newOpts []option.Endpoint) []string {
 // across provider reloads (order-independent). Avoids " (2)" churn that breaks
 // smart pins/filters when the subscription list reorders.
 func providerOutboundIdentity(opt option.Outbound) string {
-	normalized, err := nodeidentity.CanonicalEndpointOptions(opt.Options)
+	normalized, err := nodeidentity.CanonicalEndpointOptionsForType(opt.Type, opt.Options)
 	if err != nil {
 		// Do not silently fall back to raw options: that changes the identity
 		// contract on an exceptional marshal path and can retain credential

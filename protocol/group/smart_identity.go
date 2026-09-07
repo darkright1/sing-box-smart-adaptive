@@ -94,7 +94,7 @@ func probeIdentityFromProviders(candidate adapter.Outbound, providers map[string
 		}
 		// Normalize typed options once; the shared helper also applies the
 		// credential filter to nested fields.
-		normalizedOptions, err := nodeidentity.CanonicalEndpointOptions(outboundOptions.Options)
+		normalizedOptions, err := nodeidentity.CanonicalEndpointOptionsForType(outboundOptions.Type, outboundOptions.Options)
 		if err != nil {
 			continue
 		}

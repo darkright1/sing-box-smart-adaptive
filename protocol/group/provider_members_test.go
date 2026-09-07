@@ -328,38 +328,6 @@ func TestGroupProviderSourceUseAllSkipsAggregateViews(t *testing.T) {
 	source.close()
 }
 
-func TestAppendProviderMembersSuffixesSameNameNodes(t *testing.T) {
-	outbounds := make(map[string]adapter.Outbound)
-	explicitTags := []string{"HK-香港 01", "DIRECT"}
-	source, _ := newTestProviderSource(t, option.GroupCommonOption{
-		Providers: []string{"prov-a", "prov-b"},
-	})
-	if err := source.register(func(string) error { return nil }); err != nil {
-		t.Fatal(err)
-	}
-	tags := appendProviderMembers(explicitTags, outbounds, source, "")
-
-	// The explicit collision is kept untouched and the provider member gains
-	// a suffix instead of being dropped.
-	joined := ""
-	for _, tag := range tags {
-		joined += tag + "\n"
-	}
-	for _, want := range []string{"HK-香港 01\n", "HK-香港 01 #2", "DIRECT\n", "HK-香港 02\n", "JP-日本 01\n"} {
-		if !containsLine(joined, want) {
-			t.Fatalf("missing %q in tags:\n%s", want, joined)
-		}
-	}
-	// The renamed entry dials through the real member.
-	if renamed, ok := outbounds["HK-香港 01 #2"]; !ok || renamed.Tag() != "HK-香港 01 #2" {
-		t.Fatalf("renamed outbound missing: %v", ok)
-	}
-	// explicit(2) + provider(3) + suffixed duplicate(1)
-	if len(tags) != 6 {
-		t.Fatalf("tags=%v", tags)
-	}
-}
-
 func TestRenameProviderMembersUsesStableEndpointIdentity(t *testing.T) {
 	newMembers := func(reverse bool) []adapter.Outbound {
 		a := &providerTestNode{tag: "HK", identity: "endpoint-a"}
@@ -394,38 +362,4 @@ func TestRenameProviderMembersUsesStableEndpointIdentity(t *testing.T) {
 	if firstByIdentity["endpoint-a"] != "HK" || firstByIdentity["endpoint-b"] != "HK #2" {
 		t.Fatalf("unexpected stable suffix assignment: %v", firstByIdentity)
 	}
-}
-
-func containsLine(joined, want string) bool {
-	for _, line := range splitLines(joined) {
-		if line == want || (len(want) > 0 && want[len(want)-1] == '\n' && line+"\n" == want) {
-			return true
-		}
-		if line == trimNewline(want) {
-			return true
-		}
-	}
-	return false
-}
-
-func splitLines(s string) []string {
-	var out []string
-	start := 0
-	for i := 0; i < len(s); i++ {
-		if s[i] == '\n' {
-			out = append(out, s[start:i])
-			start = i + 1
-		}
-	}
-	if start < len(s) {
-		out = append(out, s[start:])
-	}
-	return out
-}
-
-func trimNewline(s string) string {
-	for len(s) > 0 && s[len(s)-1] == '\n' {
-		s = s[:len(s)-1]
-	}
-	return s
 }

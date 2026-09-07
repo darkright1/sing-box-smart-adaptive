@@ -568,18 +568,3 @@ func providerMemberDialIdentity(member adapter.Outbound) string {
 	}
 	return providerMemberIdentity(member)
 }
-
-// appendProviderMembers merges provider members into the group's explicit
-// tag list and outbound map. Same-name nodes are suffixed, never dropped.
-func appendProviderMembers(explicitTags []string, outbounds map[string]adapter.Outbound, source *groupProviderSource, updatedTag string) []string {
-	_, members := source.memberOutbounds(updatedTag)
-	occupied := make(map[string]struct{}, len(explicitTags)+len(members))
-	for _, tag := range explicitTags {
-		occupied[tag] = struct{}{}
-	}
-	providerTags, renamed := renameProviderMembers(members, occupied)
-	for _, member := range renamed {
-		outbounds[member.Tag()] = member
-	}
-	return append(explicitTags, providerTags...)
-}
