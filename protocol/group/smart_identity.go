@@ -18,6 +18,10 @@ import (
 )
 
 func (s *Smart) probeIdentityLocked(candidate adapter.Outbound) string {
+	return probeIdentityFromProviders(candidate, s.providers)
+}
+
+func probeIdentityFromProviders(candidate adapter.Outbound, providers map[string]adapter.Provider) string {
 	if candidate == nil {
 		return ""
 	}
@@ -29,7 +33,7 @@ func (s *Smart) probeIdentityLocked(candidate adapter.Outbound) string {
 			return identity
 		}
 	}
-	for _, provider := range s.providers {
+	for _, provider := range providers {
 		if provider == nil {
 			continue
 		}

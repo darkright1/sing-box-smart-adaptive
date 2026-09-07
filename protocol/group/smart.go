@@ -434,6 +434,7 @@ type Smart struct {
 
 	provider              adapter.ProviderManager
 	providerAccess        sync.Mutex
+	providerRevision      uint64
 	providers             map[string]adapter.Provider
 	providerHandles       map[string]*list.Element[adapter.ProviderUpdateCallback]
 	providerObserver      adapter.ProviderManagerObserver
@@ -876,6 +877,7 @@ func (s *Smart) Start() error {
 		s.providerHandles = make(map[string]*list.Element[adapter.ProviderUpdateCallback])
 	}
 	s.providerTags = providerTags
+	s.providerRevision++
 	for _, tag := range providerTags {
 		s.providers[tag] = resolved[tag]
 		s.providerHandles[tag] = nil
@@ -997,6 +999,9 @@ func (s *Smart) onProviderManagerUpdated() {
 		changed = true
 	}
 	s.providerTags = desiredTags
+	if changed {
+		s.providerRevision++
+	}
 	s.providerAccess.Unlock()
 	for index, provider := range removedProviders {
 		if provider != nil && removedHandles[index] != nil {
@@ -4763,6 +4768,9 @@ func (s *Smart) onProviderUpdated(tag string) error {
 	// callback cannot read a map while it is being replaced.
 	s.providerAccess.Lock()
 	_, loaded := s.providers[tag]
+	if loaded {
+		s.providerRevision++
+	}
 	s.providerAccess.Unlock()
 	if s.closing.Load() {
 		return nil
@@ -4790,8 +4798,6 @@ func (s *Smart) rebuildCandidates(updatedProvider string) error {
 	if s.closing.Load() {
 		return nil
 	}
-	s.providerAccess.Lock()
-	defer s.providerAccess.Unlock()
 	if s.closing.Load() {
 		return nil
 	}
@@ -4803,30 +4809,83 @@ func (s *Smart) rebuildCandidates(updatedProvider string) error {
 		}
 		roots = append(roots, candidate)
 	}
-	for _, providerTag := range s.providerTags {
-		if providerTag != updatedProvider && s.outboundsCache[providerTag] != nil {
-			roots = append(roots, s.outboundsCache[providerTag]...)
-			continue
-		}
+
+	// Snapshot provider ownership and immutable filters first. Provider methods
+	// must run without providerAccess: a provider is allowed to synchronize its
+	// own callback list or synchronously notify consumers while producing its
+	// outbound snapshot.
+	type providerSnapshot struct {
+		tag      string
+		provider adapter.Provider
+		cached   []adapter.Outbound
+		refresh  bool
+	}
+	s.providerAccess.Lock()
+	providerTags := append([]string(nil), s.providerTags...)
+	providerRevision := s.providerRevision
+	providerSnapshots := make([]providerSnapshot, 0, len(providerTags))
+	providerByTag := make(map[string]adapter.Provider, len(providerTags))
+	for _, providerTag := range providerTags {
 		provider := s.providers[providerTag]
-		if provider == nil {
-			continue
+		providerByTag[providerTag] = provider
+		cached, cachedOK := s.outboundsCache[providerTag]
+		providerSnapshots = append(providerSnapshots, providerSnapshot{
+			tag:      providerTag,
+			provider: provider,
+			cached:   append([]adapter.Outbound(nil), cached...),
+			refresh:  updatedProvider == "" || providerTag == updatedProvider || !cachedOK,
+		})
+	}
+	exclude := s.exclude
+	include := s.include
+	manualExclude := s.manualExclude
+	s.providerAccess.Unlock()
+
+	for _, snapshot := range providerSnapshots {
+		cache := snapshot.cached
+		if snapshot.refresh && snapshot.provider != nil {
+			cache = make([]adapter.Outbound, 0)
+			for _, candidate := range snapshot.provider.Outbounds() {
+				if candidate == nil {
+					continue
+				}
+				if exclude != nil && exclude.MatchString(candidate.Tag()) {
+					continue
+				}
+				if manualExclude.Match(candidate.Tag()) {
+					continue
+				}
+				if include != nil && !include.MatchString(candidate.Tag()) {
+					continue
+				}
+				cache = append(cache, candidate)
+			}
+			s.providerAccess.Lock()
+			if !s.closing.Load() && s.providers[snapshot.tag] == snapshot.provider {
+				s.outboundsCache[snapshot.tag] = append([]adapter.Outbound(nil), cache...)
+			}
+			s.providerAccess.Unlock()
 		}
-		var cache []adapter.Outbound
-		for _, candidate := range provider.Outbounds() {
-			if s.exclude != nil && s.exclude.MatchString(candidate.Tag()) {
-				continue
-			}
-			if s.manualExclude.Match(candidate.Tag()) {
-				continue
-			}
-			if s.include != nil && !s.include.MatchString(candidate.Tag()) {
-				continue
-			}
-			cache = append(cache, candidate)
-		}
-		s.outboundsCache[providerTag] = cache
 		roots = append(roots, cache...)
+	}
+
+	// A use_all_providers reconciliation may have completed while provider code
+	// was running. Do not publish a catalog assembled from retired providers;
+	// the reconciliation callback will perform the current rebuild.
+	s.providerAccess.Lock()
+	providerSetCurrent := len(providerTags) == len(s.providerTags)
+	providerSetCurrent = providerSetCurrent && providerRevision == s.providerRevision
+	if providerSetCurrent {
+		for index, providerTag := range s.providerTags {
+			if providerTags[index] != providerTag || s.providers[providerTag] != providerByTag[providerTag] {
+				providerSetCurrent = false
+				break
+			}
+		}
+	}
+	s.providerAccess.Unlock()
+	if !providerSetCurrent {
+		return nil
 	}
 	var candidates []adapter.Outbound
 	seen := make(map[string]bool)
@@ -4842,6 +4901,9 @@ func (s *Smart) rebuildCandidates(updatedProvider string) error {
 	keepProfiles := make(map[string]struct{}, len(candidates))
 	keepPolicyIDs := make([]uint64, 0, len(candidates))
 	seenPolicyIDs := make(map[uint64]struct{}, len(candidates))
+	// probeIdentityLocked reads the provider map. Keep the lock only around the
+	// identity snapshot; all provider-owned Outbounds calls above are lock-free.
+	s.providerAccess.Lock()
 	for _, candidate := range candidates {
 		tag := candidate.Tag()
 		identity := s.probeIdentityLocked(candidate)
@@ -4858,6 +4920,7 @@ func (s *Smart) rebuildCandidates(updatedProvider string) error {
 			}
 		}
 	}
+	s.providerAccess.Unlock()
 	// Close can begin after the provider snapshot above. Check before and after
 	// taking the catalog lock so a late callback cannot repopulate a retired
 	// Smart group after Close has cleared its candidates.
