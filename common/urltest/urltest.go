@@ -91,6 +91,8 @@ func (s *HistoryStorage) NotifyUpdated() {
 	s.notifyUpdated()
 }
 
+// Deprecated: use LoadURLTestHistoryKey for provider-aware callers. This
+// method remains for static outbounds and external compatibility.
 func (s *HistoryStorage) LoadURLTestHistory(tag string) *adapter.URLTestHistory {
 	if s == nil {
 		return nil
@@ -100,6 +102,8 @@ func (s *HistoryStorage) LoadURLTestHistory(tag string) *adapter.URLTestHistory 
 	return s.delayHistory[tag]
 }
 
+// Deprecated: use LoadURLTestHistoryKey for provider-aware callers. This
+// method remains for static outbounds and external compatibility.
 func (s *HistoryStorage) DeleteURLTestHistory(tag string) {
 	s.access.Lock()
 	delete(s.delayHistory, tag)
@@ -107,6 +111,8 @@ func (s *HistoryStorage) DeleteURLTestHistory(tag string) {
 	s.access.Unlock()
 }
 
+// Deprecated: use StoreURLTestHistoryKey for provider-aware callers. This
+// method remains for static outbounds and external compatibility.
 func (s *HistoryStorage) StoreURLTestHistory(tag string, history *adapter.URLTestHistory) {
 	s.access.Lock()
 	s.delayHistory[tag] = history
