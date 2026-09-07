@@ -2,7 +2,9 @@ package urltest
 
 import (
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
+	"encoding/hex"
 	"net"
 	"net/http"
 	"net/url"
@@ -20,12 +22,52 @@ import (
 type HistoryStorage struct {
 	access       sync.RWMutex
 	delayHistory map[string]*adapter.URLTestHistory
+	keyedHistory map[HistoryKey]*adapter.URLTestHistory
 	updateHooks  []*observable.Subscriber[struct{}]
+}
+
+// HistoryKey identifies a URL-test observation without using a provider's
+// display alias as the identity. PathIdentity is credential-free and stable
+// across provider refreshes; ProbeTarget is a digest of the test URL so query
+// strings or tokens are never retained in the in-memory key; Network keeps
+// TCP4/TCP6 (and future families) from sharing measurements accidentally.
+type HistoryKey struct {
+	PathIdentity string
+	ProbeTarget  string
+	Network      string
+}
+
+// KeyForOutbound creates an identity-aware history key. Ordinary static
+// outbounds use their tag as a stable fallback; provider members expose the
+// stronger OutboundWithEndpointIdentity contract.
+func KeyForOutbound(outbound adapter.Outbound, link, network string) HistoryKey {
+	identity := ""
+	if outbound != nil {
+		if identified, ok := outbound.(adapter.OutboundWithEndpointIdentity); ok {
+			identity = identified.EndpointIdentity()
+		}
+		if identity == "" {
+			identity = outbound.Tag()
+		}
+	}
+	if link == "" {
+		link = "https://www.gstatic.com/generate_204"
+	}
+	targetDigest := sha256.Sum256([]byte(link))
+	if network == "" {
+		network = N.NetworkTCP
+	}
+	return HistoryKey{
+		PathIdentity: identity,
+		ProbeTarget:  hex.EncodeToString(targetDigest[:]),
+		Network:      network,
+	}
 }
 
 func NewHistoryStorage() *HistoryStorage {
 	return &HistoryStorage{
 		delayHistory: make(map[string]*adapter.URLTestHistory),
+		keyedHistory: make(map[HistoryKey]*adapter.URLTestHistory),
 	}
 }
 
@@ -62,6 +104,87 @@ func (s *HistoryStorage) StoreURLTestHistory(tag string, history *adapter.URLTes
 	s.delayHistory[tag] = history
 	s.notifyUpdated()
 	s.access.Unlock()
+}
+
+// LoadURLTestHistoryKey loads an identity-aware observation. The legacy tag
+// fallback is deliberately disabled for identified provider members: a reused
+// duplicate suffix must never inherit another endpoint's old latency. Static
+// outbounds retain compatibility with the historical tag-only cache.
+func (s *HistoryStorage) LoadURLTestHistoryKey(key HistoryKey, legacyTag string) *adapter.URLTestHistory {
+	if s == nil {
+		return nil
+	}
+	s.access.RLock()
+	defer s.access.RUnlock()
+	if history := s.keyedHistory[key]; history != nil {
+		return history
+	}
+	if key.PathIdentity == "" || key.PathIdentity == legacyTag {
+		return s.delayHistory[legacyTag]
+	}
+	return nil
+}
+
+func (s *HistoryStorage) StoreURLTestHistoryKey(key HistoryKey, legacyTag string, history *adapter.URLTestHistory) {
+	if s == nil {
+		return
+	}
+	s.access.Lock()
+	if history == nil {
+		delete(s.keyedHistory, key)
+	} else {
+		s.keyedHistory[key] = history
+	}
+	s.notifyUpdated()
+	s.access.Unlock()
+}
+
+func (s *HistoryStorage) DeleteURLTestHistoryKey(key HistoryKey, legacyTag string) {
+	if s == nil {
+		return
+	}
+	s.access.Lock()
+	delete(s.keyedHistory, key)
+	if key.PathIdentity == "" || key.PathIdentity == legacyTag {
+		delete(s.delayHistory, legacyTag)
+	}
+	s.notifyUpdated()
+	s.access.Unlock()
+}
+
+// LoadLatestURLTestHistoryForOutbound is used by dashboards and group status
+// APIs that do not know which probe URL produced an observation. It only scans
+// the matching path identity and network, so a duplicate provider alias cannot
+// leak another node's history into the display.
+func (s *HistoryStorage) LoadLatestURLTestHistoryForOutbound(outbound adapter.Outbound, legacyTag, network string) *adapter.URLTestHistory {
+	if s == nil {
+		return nil
+	}
+	return s.LoadLatestURLTestHistoryKey(KeyForOutbound(outbound, "", network), legacyTag)
+}
+
+func (s *HistoryStorage) LoadLatestURLTestHistoryKey(key HistoryKey, legacyTag string) *adapter.URLTestHistory {
+	if s == nil {
+		return nil
+	}
+	s.access.RLock()
+	defer s.access.RUnlock()
+	var latest *adapter.URLTestHistory
+	for candidateKey, history := range s.keyedHistory {
+		if candidateKey.PathIdentity != key.PathIdentity || candidateKey.Network != key.Network {
+			continue
+		}
+		if latest == nil || history.Time.After(latest.Time) {
+			latest = history
+		}
+	}
+	if latest != nil {
+		return latest
+	}
+	if key.PathIdentity == "" || key.PathIdentity == legacyTag {
+		return s.delayHistory[legacyTag]
+	}
+	return nil
 }
 
 func (s *HistoryStorage) notifyUpdated() {

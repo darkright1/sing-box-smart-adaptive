@@ -23,6 +23,7 @@ import (
 	"github.com/sagernet/sing/common/batch"
 	E "github.com/sagernet/sing/common/exceptions"
 	F "github.com/sagernet/sing/common/format"
+	N "github.com/sagernet/sing/common/network"
 	"github.com/sagernet/sing/common/x/list"
 	"github.com/sagernet/sing/service"
 )
@@ -641,10 +642,12 @@ func (a *Adapter) healthcheck(ctx context.Context) (map[string]uint16, error) {
 			t, err := urltest.URLTest(probeCtx, a.link, detour)
 			if err != nil {
 				a.logger.Debug("outbound ", tag, " unavailable: ", err)
-				a.history.DeleteURLTestHistory(tag)
+				key := urltest.KeyForOutbound(detour, a.link, N.NetworkTCP)
+				a.history.DeleteURLTestHistoryKey(key, tag)
 			} else {
 				a.logger.Debug("outbound ", tag, " available: ", t, "ms")
-				a.history.StoreURLTestHistory(tag, &adapter.URLTestHistory{
+				key := urltest.KeyForOutbound(detour, a.link, N.NetworkTCP)
+				a.history.StoreURLTestHistoryKey(key, tag, &adapter.URLTestHistory{
 					Time:  time.Now(),
 					Delay: t,
 				})

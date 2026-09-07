@@ -70,7 +70,12 @@ func proxyInfo(server *Server, detour adapter.Outbound) *badjson.JSONObject {
 	info.Put("type", clashType)
 	info.Put("name", detour.Tag())
 	info.Put("udp", common.Contains(detour.Network(), N.NetworkUDP))
-	delayHistory := server.urlTestHistory.LoadURLTestHistory(group.RealTag(server.outbound, detour))
+	realTag := group.RealTag(server.outbound, detour)
+	leaf, loaded := server.outbound.Outbound(realTag)
+	if !loaded {
+		leaf = detour
+	}
+	delayHistory := server.urlTestHistory.LoadLatestURLTestHistoryForOutbound(leaf, realTag, N.NetworkTCP)
 	if delayHistory != nil {
 		info.Put("history", []*adapter.URLTestHistory{delayHistory})
 	} else {
@@ -308,10 +313,15 @@ func getProxyDelay(server *Server) func(w http.ResponseWriter, r *http.Request) 
 		delay, err := urltest.URLTest(ctx, url, proxy)
 		defer func() {
 			realTag := group.RealTag(server.outbound, proxy)
+			leaf, loaded := server.outbound.Outbound(realTag)
+			if !loaded {
+				leaf = proxy
+			}
+			key := urltest.KeyForOutbound(leaf, url, N.NetworkTCP)
 			if err != nil {
-				server.urlTestHistory.DeleteURLTestHistory(realTag)
+				server.urlTestHistory.DeleteURLTestHistoryKey(key, realTag)
 			} else {
-				server.urlTestHistory.StoreURLTestHistory(realTag, &adapter.URLTestHistory{
+				server.urlTestHistory.StoreURLTestHistoryKey(key, realTag, &adapter.URLTestHistory{
 					Time:  time.Now(),
 					Delay: delay,
 				})

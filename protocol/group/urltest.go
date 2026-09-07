@@ -353,7 +353,8 @@ func (s *URLTest) DialContext(ctx context.Context, network string, destination M
 		return group.interruptGroup.NewConn(conn, interrupt.IsExternalConnectionFromContext(ctx)), nil
 	}
 	s.logger.ErrorContext(ctx, err)
-	group.history.DeleteURLTestHistory(RealTag(s.outbound, outbound))
+	key, legacyTag := historyKeyForOutbound(s.outbound, outbound, group.link, N.NetworkTCP)
+	group.history.DeleteURLTestHistoryKey(key, legacyTag)
 	return nil, err
 }
 
@@ -376,7 +377,8 @@ func (s *URLTest) ListenPacket(ctx context.Context, destination M.Socksaddr) (ne
 		return group.interruptGroup.NewPacketConn(conn, interrupt.IsExternalConnectionFromContext(ctx)), nil
 	}
 	s.logger.ErrorContext(ctx, err)
-	group.history.DeleteURLTestHistory(RealTag(s.outbound, outbound))
+	key, legacyTag := historyKeyForOutbound(s.outbound, outbound, group.link, N.NetworkTCP)
+	group.history.DeleteURLTestHistoryKey(key, legacyTag)
 	return nil, err
 }
 
@@ -539,7 +541,8 @@ func (g *URLTestGroup) Select(network string) (adapter.Outbound, bool) {
 	var minDelay uint16
 	var minOutbound adapter.Outbound
 	if selected != nil {
-		if history := g.history.LoadURLTestHistory(RealTag(g.outbound, selected)); history != nil {
+		key, legacyTag := historyKeyForOutbound(g.outbound, selected, g.link, N.NetworkTCP)
+		if history := g.history.LoadURLTestHistoryKey(key, legacyTag); history != nil {
 			if g.containsOutbound(selected, network) {
 				minOutbound = selected
 				minDelay = history.Delay
@@ -551,7 +554,8 @@ func (g *URLTestGroup) Select(network string) (adapter.Outbound, bool) {
 		if !common.Contains(detour.Network(), network) {
 			continue
 		}
-		history := g.history.LoadURLTestHistory(RealTag(g.outbound, detour))
+		key, legacyTag := historyKeyForOutbound(g.outbound, detour, g.link, N.NetworkTCP)
+		history := g.history.LoadURLTestHistoryKey(key, legacyTag)
 		if history == nil {
 			continue
 		}
@@ -722,7 +726,8 @@ func urlTestOutbounds(ctx context.Context, outboundManager adapter.OutboundManag
 	testBatch.test(outbounds, link, interval, force)
 	b.Wait()
 	for _, outboundGroup := range testBatch.groups {
-		groupHistory := history.LoadURLTestHistory(RealTag(outboundManager, outboundGroup))
+		key, legacyTag := historyKeyForOutbound(outboundManager, outboundGroup, "", N.NetworkTCP)
+		groupHistory := history.LoadLatestURLTestHistoryKey(key, legacyTag)
 		if groupHistory != nil {
 			testBatch.result[outboundGroup.Tag()] = groupHistory.Delay
 		}
@@ -773,7 +778,7 @@ func selectDashboardOutbounds(history *urltest.HistoryStorage, outbounds []adapt
 	for _, outbound := range outbounds {
 		var itemHistory *adapter.URLTestHistory
 		if history != nil {
-			itemHistory = history.LoadURLTestHistory(outbound.Tag())
+			itemHistory = history.LoadLatestURLTestHistoryForOutbound(outbound, outbound.Tag(), N.NetworkTCP)
 		}
 		items = append(items, candidate{outbound: outbound, history: itemHistory})
 	}
@@ -874,7 +879,8 @@ func (b *urlTestBatch) test(outbounds []adapter.Outbound, link string, interval 
 				return member
 			})), link, interval, force)
 		default:
-			history := b.history.LoadURLTestHistory(tag)
+			key, legacyTag := historyKeyForOutbound(b.outbound, detour, link, N.NetworkTCP)
+			history := b.history.LoadURLTestHistoryKey(key, legacyTag)
 			if !force && history != nil && time.Since(history.Time) < interval {
 				continue
 			}
@@ -901,10 +907,10 @@ func (b *urlTestBatch) test(outbounds []adapter.Outbound, link string, interval 
 				}
 				if testResult.err != nil {
 					b.logger.Debug("outbound ", tag, " unavailable: ", testResult.err)
-					b.history.DeleteURLTestHistory(tag)
+					b.history.DeleteURLTestHistoryKey(key, legacyTag)
 				} else {
 					b.logger.Debug("outbound ", tag, " available: ", testResult.delay, "ms")
-					b.history.StoreURLTestHistory(tag, &adapter.URLTestHistory{
+					b.history.StoreURLTestHistoryKey(key, legacyTag, &adapter.URLTestHistory{
 						Time:  time.Now(),
 						Delay: testResult.delay,
 					})

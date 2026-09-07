@@ -290,7 +290,8 @@ func (s *LoadBalance) DialContext(ctx context.Context, network string, destinati
 		return group.interruptGroup.NewConnEx(conn, interrupt.IsExternalConnectionFromContext(ctx), interrupt.IsProviderConnectionFromContext(ctx)), nil
 	}
 	s.logger.ErrorContext(ctx, err)
-	group.history.DeleteURLTestHistory(RealTag(s.outbound, outbound))
+	key, legacyTag := historyKeyForOutbound(s.outbound, outbound, group.link, N.NetworkTCP)
+	group.history.DeleteURLTestHistoryKey(key, legacyTag)
 	go group.CheckOutbounds(true)
 	return nil, err
 }
@@ -312,7 +313,8 @@ func (s *LoadBalance) ListenPacket(ctx context.Context, destination M.Socksaddr)
 		return group.interruptGroup.NewPacketConnEx(conn, interrupt.IsExternalConnectionFromContext(ctx), interrupt.IsProviderConnectionFromContext(ctx)), nil
 	}
 	s.logger.ErrorContext(ctx, err)
-	group.history.DeleteURLTestHistory(RealTag(s.outbound, outbound))
+	key, legacyTag := historyKeyForOutbound(s.outbound, outbound, group.link, N.NetworkTCP)
+	group.history.DeleteURLTestHistoryKey(key, legacyTag)
 	go group.CheckOutbounds(true)
 	return nil, err
 }
@@ -627,7 +629,8 @@ func (g *LoadBalanceGroup) urlTest(ctx context.Context, force bool) (map[string]
 		if checked[realTag] {
 			continue
 		}
-		history := g.history.LoadURLTestHistory(realTag)
+		key, legacyTag := historyKeyForOutbound(g.outbound, detour, g.link, N.NetworkTCP)
+		history := g.history.LoadURLTestHistoryKey(key, legacyTag)
 		if !force && history != nil && time.Since(history.Time) < g.interval {
 			continue
 		}
@@ -642,10 +645,10 @@ func (g *LoadBalanceGroup) urlTest(ctx context.Context, force bool) (map[string]
 			t, err := urltest.URLTest(testCtx, g.link, p)
 			if err != nil {
 				g.logger.Debug("outbound ", tag, " unavailable: ", err)
-				g.history.DeleteURLTestHistory(realTag)
+				g.history.DeleteURLTestHistoryKey(key, legacyTag)
 			} else {
 				g.logger.Debug("outbound ", tag, " available: ", t, "ms")
-				g.history.StoreURLTestHistory(realTag, &adapter.URLTestHistory{
+				g.history.StoreURLTestHistoryKey(key, legacyTag, &adapter.URLTestHistory{
 					Time:  time.Now(),
 					Delay: t,
 				})
@@ -704,7 +707,8 @@ func (g *LoadBalanceGroup) UnwrapPreMatch(metadata *adapter.InboundContext, matc
 // died since; Surge re-benchmarks before trusting it again. Untested members
 // are not alive here — strategies keep their own recovery fallbacks.
 func (g *LoadBalanceGroup) AliveForTestUrl(proxy adapter.Outbound) bool {
-	if history := g.history.LoadURLTestHistory(RealTag(g.outbound, proxy)); history != nil {
+	key, legacyTag := historyKeyForOutbound(g.outbound, proxy, g.link, N.NetworkTCP)
+	if history := g.history.LoadURLTestHistoryKey(key, legacyTag); history != nil {
 		// A zero Time never occurs in production (StoreURLTestHistory stamps
 		// now); treat it as plain tested for hand-built storages.
 		return history.Time.IsZero() || time.Since(history.Time) < g.alivenessWindow()

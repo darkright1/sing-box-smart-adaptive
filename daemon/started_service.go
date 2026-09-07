@@ -22,6 +22,7 @@ import (
 	"github.com/sagernet/sing-box/protocol/group"
 	"github.com/sagernet/sing/common"
 	"github.com/sagernet/sing/common/memory"
+	N "github.com/sagernet/sing/common/network"
 	"github.com/sagernet/sing/common/observable"
 	"github.com/sagernet/sing/common/x/list"
 	"github.com/sagernet/sing/service"
@@ -615,7 +616,12 @@ func (s *StartedService) readGroups() *Groups {
 			var item GroupItem
 			item.Tag = itemTag
 			item.Type = itemOutbound.Type()
-			if history := historyStorage.LoadURLTestHistory(group.RealTag(boxService.outboundManager, itemOutbound)); history != nil {
+			realTag := group.RealTag(boxService.outboundManager, itemOutbound)
+			leaf, loaded := boxService.outboundManager.Outbound(realTag)
+			if !loaded {
+				leaf = itemOutbound
+			}
+			if history := historyStorage.LoadLatestURLTestHistoryForOutbound(leaf, realTag, N.NetworkTCP); history != nil {
 				item.UrlTestTime = history.Time.Unix()
 				item.UrlTestDelay = int32(history.Delay)
 			}
@@ -751,10 +757,11 @@ func (s *StartedService) URLTest(ctx context.Context, request *URLTestRequest) (
 	} else {
 		go func() {
 			t, err := urltest.URLTest(boxService.ctx, "", outbound)
+			key := urltest.KeyForOutbound(outbound, "", N.NetworkTCP)
 			if err != nil {
-				historyStorage.DeleteURLTestHistory(outboundTag)
+				historyStorage.DeleteURLTestHistoryKey(key, outboundTag)
 			} else {
-				historyStorage.StoreURLTestHistory(outboundTag, &adapter.URLTestHistory{
+				historyStorage.StoreURLTestHistoryKey(key, outboundTag, &adapter.URLTestHistory{
 					Time:  time.Now(),
 					Delay: t,
 				})
@@ -1190,7 +1197,12 @@ func (s *StartedService) SubscribeOutbounds(_ *emptypb.Empty, server grpc.Server
 					Tag:  ob.Tag(),
 					Type: ob.Type(),
 				}
-				if history := historyStorage.LoadURLTestHistory(group.RealTag(boxService.outboundManager, ob)); history != nil {
+				realTag := group.RealTag(boxService.outboundManager, ob)
+				leaf, loaded := boxService.outboundManager.Outbound(realTag)
+				if !loaded {
+					leaf = ob
+				}
+				if history := historyStorage.LoadLatestURLTestHistoryForOutbound(leaf, realTag, N.NetworkTCP); history != nil {
 					item.UrlTestTime = history.Time.Unix()
 					item.UrlTestDelay = int32(history.Delay)
 				}
@@ -1201,7 +1213,7 @@ func (s *StartedService) SubscribeOutbounds(_ *emptypb.Empty, server grpc.Server
 					Tag:  ep.Tag(),
 					Type: ep.Type(),
 				}
-				if history := historyStorage.LoadURLTestHistory(group.RealTag(boxService.outboundManager, ep)); history != nil {
+				if history := historyStorage.LoadLatestURLTestHistoryForOutbound(ep, group.RealTag(boxService.outboundManager, ep), N.NetworkTCP); history != nil {
 					item.UrlTestTime = history.Time.Unix()
 					item.UrlTestDelay = int32(history.Delay)
 				}
