@@ -4849,13 +4849,10 @@ func (s *Smart) rebuildCandidates(updatedProvider string) error {
 				if candidate == nil {
 					continue
 				}
-				if exclude != nil && exclude.MatchString(candidate.Tag()) {
-					continue
-				}
 				if manualExclude.Match(candidate.Tag()) {
 					continue
 				}
-				if include != nil && !include.MatchString(candidate.Tag()) {
+				if !providerMemberAllowed(candidate.Tag(), include, exclude) {
 					continue
 				}
 				cache = append(cache, candidate)

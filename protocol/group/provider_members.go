@@ -89,6 +89,18 @@ func (s *groupProviderSource) hasLocked() bool {
 	return len(s.providerTags) > 0 || s.useAllProviders
 }
 
+// providerMemberAllowed is the single membership filter contract shared by
+// every group type. Provider refresh code must apply include first as a
+// positive selector and exclude as a hard veto; keeping this decision here
+// prevents Smart's health-aware catalog from drifting from selector,
+// url-test, or load-balance.
+func providerMemberAllowed(tag string, include, exclude *regexp.Regexp) bool {
+	if exclude != nil && exclude.MatchString(tag) {
+		return false
+	}
+	return include == nil || include.MatchString(tag)
+}
+
 // register subscribes to provider updates and resolves the configured tags.
 func (s *groupProviderSource) register(callback adapter.ProviderUpdateCallback) error {
 	if s == nil {
@@ -397,10 +409,7 @@ func (s *groupProviderSource) memberOutbounds(updatedTag string) (tags []string,
 					continue
 				}
 				tag := detour.Tag()
-				if exclude != nil && exclude.MatchString(tag) {
-					continue
-				}
-				if include != nil && !include.MatchString(tag) {
+				if !providerMemberAllowed(tag, include, exclude) {
 					continue
 				}
 				members = append(members, detour)

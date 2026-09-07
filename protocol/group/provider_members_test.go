@@ -122,6 +122,27 @@ func mustRegex(t *testing.T, expr string) *badoption.Regexp {
 	return (*badoption.Regexp)(regexp.MustCompile(expr))
 }
 
+func TestProviderMemberAllowedSharedContract(t *testing.T) {
+	include := regexp.MustCompile(`HK|香港`)
+	exclude := regexp.MustCompile(`Gcore|排除`)
+	cases := []struct {
+		tag  string
+		want bool
+	}{
+		{tag: "HK-香港 01", want: true},
+		{tag: "HK-Gcore 02", want: false},
+		{tag: "US-美国 01", want: false},
+	}
+	for _, test := range cases {
+		if got := providerMemberAllowed(test.tag, include, exclude); got != test.want {
+			t.Fatalf("providerMemberAllowed(%q)=%v, want %v", test.tag, got, test.want)
+		}
+	}
+	if !providerMemberAllowed("anything", nil, nil) {
+		t.Fatal("nil filters must allow every provider member")
+	}
+}
+
 func TestGroupProviderSourceIncludeRegex(t *testing.T) {
 	source, manager := newTestProviderSource(t, option.GroupCommonOption{
 		Providers: []string{"prov-a", "prov-b"},
