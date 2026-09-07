@@ -2,6 +2,18 @@
 
 只记录相对 **SagerNet 官方 tag** 的本仓库变更。上游 changelog 见 `docs/changelog.md`。
 
+## Unreleased — provider protocol capability filtering
+
+- Parse Sing-box JSON, Clash YAML, SIP-008 and raw URI subscriptions member by
+  member; malformed, unknown, schema-only and unsupported protocols are skipped
+  without discarding valid members.
+- Emit bounded, redacted provider diagnostics with provider/index/tag/type and a
+  reason code; subscription URLs, query strings and credentials are never logged.
+- Apply the same capability gate at every public parser boundary and reject an
+  all-invalid subscription with `no supported servers found`.
+- Guard raw URI parsing from legacy panic paths so a malformed line cannot abort a
+  provider refresh.
+
 ## Unreleased — connection close diagnostics
 
 - Record a bounded, race-safe `closeReason` for routed TCP/UDP history entries.
