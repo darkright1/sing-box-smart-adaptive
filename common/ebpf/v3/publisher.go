@@ -277,7 +277,7 @@ func (b *MemoryBackend) MergeDynamicDirect(prefix netip.Prefix, ttl time.Duratio
 		b.dynamicDirects[prefix] = expires
 		return nil
 	}
-	return fmt.Errorf("invalid static prefix family")
+	return fmt.Errorf("invalid dynamic direct prefix family")
 }
 
 // MergeStaticDirect is kept as a source-compatible wrapper for older tests and

@@ -55,10 +55,7 @@ func warnIgnoredProviderMember(providerTag, kind string, index int, tag, protoco
 	providerTag = safeProviderText(providerTag)
 	tag = safeProviderText(tag)
 	protocol = safeProviderText(protocol)
-	message := "invalid member"
-	if reason != nil {
-		message = safeProviderText(reason.Error())
-	}
+	message := providerErrorReason(reason)
 	key := providerTag + "|" + kind + "|" + fmt.Sprint(index) + "|" + tag + "|" + protocol + "|" + message
 	if _, loaded := ignoredProviderMemberOnce.LoadOrStore(key, struct{}{}); loaded {
 		return
@@ -74,7 +71,7 @@ func warnProviderParserError(providerTag, parserName string, err error) {
 	if err == nil {
 		return
 	}
-	message := safeProviderText(err.Error())
+	message := providerErrorReason(err)
 	key := "parser|" + safeProviderText(providerTag) + "|" + parserName + "|" + message
 	if _, loaded := ignoredProviderMemberOnce.LoadOrStore(key, struct{}{}); loaded {
 		return
@@ -97,6 +94,52 @@ func safeProviderText(value string) string {
 		return value[:256] + "..."
 	}
 	return value
+}
+
+// providerErrorReason intentionally discards parser error text. JSON/YAML and
+// URL parsers are allowed to echo the offending value (which may contain a
+// password, token, signed query, or full subscription URI). Provider logs need
+// a stable diagnostic category, not the secret-bearing payload. The member
+// index/tag/type in the caller still identifies the bad entry for remediation.
+func providerErrorReason(err error) string {
+	if err == nil {
+		return "invalid member"
+	}
+	message := strings.ToLower(safeProviderText(err.Error()))
+	switch {
+	case strings.Contains(message, "unsupported"),
+		strings.Contains(message, "unknown outbound type"),
+		strings.Contains(message, "unknown endpoint type"),
+		strings.Contains(message, "unsupported scheme"):
+		return "unsupported protocol"
+	case strings.Contains(message, "missing"):
+		return "missing required field"
+	case strings.Contains(message, "expected"),
+		strings.Contains(message, "unmarshal"),
+		strings.Contains(message, "parse"),
+		strings.Contains(message, "invalid"),
+		strings.Contains(message, "malformed"),
+		strings.Contains(message, "bad "):
+		return "malformed or invalid member"
+	case strings.Contains(message, "no supported"),
+		strings.Contains(message, "no servers"):
+		return "no supported members"
+	default:
+		return "invalid member"
+	}
+}
+
+func nilProviderOptions(value any) bool {
+	if value == nil {
+		return true
+	}
+	rv := reflect.ValueOf(value)
+	switch rv.Kind() {
+	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Pointer, reflect.Slice:
+		return rv.IsNil()
+	default:
+		return false
+	}
 }
 
 // filterSupportedMembers is the final provider boundary. Parsers may support
@@ -130,7 +173,7 @@ func filterSupportedMembers(ctx context.Context, outbounds []option.Outbound, en
 		// A parser must never hand a nil options payload to overrideOutbounds:
 		// that path intentionally uses concrete option types for zero-copy
 		// overrides and would otherwise panic in a minimal/no-registry context.
-		if item.Options == nil {
+		if nilProviderOptions(item.Options) {
 			warnIgnoredProviderMember(providerTag, "outbound", index, item.Tag, item.Type, E.New("unparseable options"))
 			continue
 		}
@@ -154,7 +197,7 @@ func filterSupportedMembers(ctx context.Context, outbounds []option.Outbound, en
 			}
 		}
 		// Keep the same nil invariant for endpoint options.
-		if item.Options == nil {
+		if nilProviderOptions(item.Options) {
 			warnIgnoredProviderMember(providerTag, "endpoint", index, item.Tag, item.Type, E.New("unparseable options"))
 			continue
 		}

@@ -2,6 +2,8 @@ package parser
 
 import (
 	"context"
+	"errors"
+	"strings"
 	"testing"
 
 	C "github.com/sagernet/sing-box/constant"
@@ -99,5 +101,35 @@ func TestFilterSupportedMembersAlwaysDropsNilOptions(t *testing.T) {
 	}, []option.Endpoint{{Type: C.TypeWireGuard, Tag: "broken-endpoint"}}, "test")
 	if len(outbounds) != 0 || len(endpoints) != 0 {
 		t.Fatalf("nil option members must be discarded without registries: outbounds=%d endpoints=%d", len(outbounds), len(endpoints))
+	}
+}
+
+func TestFilterSupportedMembersDropsTypedNilOptions(t *testing.T) {
+	ctx := parserContext()
+	var outboundOptions *option.SOCKSOutboundOptions
+	var endpointOptions *option.WireGuardEndpointOptions
+	outbounds, endpoints := filterSupportedMembers(ctx, []option.Outbound{
+		{Type: C.TypeSOCKS, Tag: "typed-nil", Options: outboundOptions},
+	}, []option.Endpoint{
+		{Type: C.TypeWireGuard, Tag: "typed-nil", Options: endpointOptions},
+	}, "test")
+	if len(outbounds) != 0 || len(endpoints) != 0 {
+		t.Fatalf("typed nil options must be discarded: outbounds=%d endpoints=%d", len(outbounds), len(endpoints))
+	}
+}
+
+func TestProviderErrorReasonDoesNotEchoSubscriptionPayload(t *testing.T) {
+	// URL and structured parsers commonly include the offending value in the
+	// returned error. Logging that text would expose credentials or signed query
+	// parameters, so the provider boundary must emit only a reason category.
+	err := errors.New(`parse "vless://user:secret@example.invalid:443/path?token=private"`)
+	reason := providerErrorReason(err)
+	if reason != "malformed or invalid member" {
+		t.Fatalf("unexpected reason: %q", reason)
+	}
+	for _, forbidden := range []string{"vless://", "secret", "token", "private", "example.invalid"} {
+		if strings.Contains(reason, forbidden) {
+			t.Fatalf("reason echoed sensitive payload %q: %q", forbidden, reason)
+		}
 	}
 }

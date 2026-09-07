@@ -1000,7 +1000,7 @@ func (b *V3Backend) MergeDynamicDirect(prefix netip.Prefix, ttl time.Duration) e
 	var err error
 	prefix, err = ebpfv3.CanonicalPrefix(prefix)
 	if err != nil {
-		return E.Cause(err, "invalid static prefix")
+		return E.Cause(err, "invalid dynamic direct prefix")
 	}
 	b.access.Lock()
 	defer b.access.Unlock()
@@ -1059,7 +1059,7 @@ func (b *V3Backend) DeleteMergedStaticDirect(prefix netip.Prefix) error {
 	var err error
 	prefix, err = ebpfv3.CanonicalPrefix(prefix)
 	if err != nil {
-		return E.Cause(err, "invalid static prefix")
+		return E.Cause(err, "invalid dynamic direct prefix")
 	}
 	b.access.Lock()
 	defer b.access.Unlock()
