@@ -9,6 +9,12 @@ on:
       - "common/ebpf/**"
       - "experimental/**"
       - "provider/parser/**"
+      - "provider/**"
+      - "adapter/provider/**"
+      - "option/provider.go"
+      - "option/group.go"
+      - "constant/provider.go"
+      - "include/registry.go"
       - "route/rule/**"
       - "daemon/**"
       - "smart-engine/**"
@@ -133,3 +139,27 @@ jobs:
           zig build test -Dcpu=baseline
           zig build -Dtarget=x86_64-linux-gnu -Dcpu=baseline -Doptimize=ReleaseFast
           zig build -Dtarget=aarch64-linux-gnu -Dcpu=baseline -Doptimize=ReleaseFast
+
+  schema:
+    name: Provider schema coverage
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: 1.26.7
+      - name: Generate schema on Linux
+        run: |
+          set -euo pipefail
+          go run -ldflags "$(cat release/LDFLAGS)" --tags "$(tr -d ' \n' < release/DEFAULT_BUILD_TAGS_OTHERS)" ./cmd/sing-box schema -o /tmp/schema.json
+          test -s /tmp/schema.json
+          grep -q 'ProviderAggregateOptions' /tmp/schema.json
+          grep -q 'use_all_providers' /tmp/schema.json
+      - name: Upload generated schema
+        uses: actions/upload-artifact@v4
+        with:
+          name: v1.14.0-provider-schema
+          path: /tmp/schema.json
+          if-no-files-found: error
