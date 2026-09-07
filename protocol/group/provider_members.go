@@ -3,6 +3,7 @@ package group
 import (
 	"context"
 	"regexp"
+	"sort"
 	"strconv"
 	"sync"
 
@@ -94,23 +95,83 @@ func (s *groupProviderSource) register(callback adapter.ProviderUpdateCallback) 
 		return nil
 	}
 	s.access.Lock()
-	defer s.access.Unlock()
 	if !s.hasLocked() {
+		s.access.Unlock()
 		return nil
 	}
 	if s.closed {
+		s.access.Unlock()
 		return E.New("outbound provider source is closed")
 	}
 	if s.registered {
+		s.access.Unlock()
 		return nil
 	}
-	if s.manager == nil {
+	manager := s.manager
+	useAll := s.useAllProviders
+	configuredTags := append([]string(nil), s.providerTags...)
+	s.access.Unlock()
+	if manager == nil {
 		return E.New("missing outbound provider manager")
 	}
+	// ProviderManager is an interface owned by another lifecycle. Resolve it
+	// outside source.access: a custom manager is allowed to synchronously notify
+	// observers from Providers/Get, and source callbacks must never re-enter its
+	// own mutex while we hold ours.
+	resolved, providerTags, err := resolveProviderSet(manager, useAll, configuredTags)
+	if err != nil {
+		return err
+	}
+	s.access.Lock()
+	if s.closed {
+		s.access.Unlock()
+		return E.New("outbound provider source is closed")
+	}
+	if s.registered {
+		s.access.Unlock()
+		return nil
+	}
+	// Publish the resolved set before calling provider code. Provider callback
+	// registration is external and may synchronously notify; holding the source
+	// mutex across that call can deadlock the callback while it rebuilds a group.
+	// Handles are attached by attachProviderCallback after the lock is released.
+	for _, tag := range providerTags {
+		s.providers[tag] = resolved[tag]
+		s.handles[tag] = nil
+	}
+	s.providerTags = providerTags
+	s.callback = callback
+	s.registered = true
+	manager = s.manager
+	useAll = s.useAllProviders
+	s.access.Unlock()
+	for _, tag := range providerTags {
+		s.attachProviderCallback(tag, resolved[tag], callback)
+	}
+	if useAll {
+		if observer, ok := manager.(adapter.ProviderManagerObserver); ok {
+			handle := observer.RegisterProviderCallback(s.onProviderManagerUpdated)
+			s.access.Lock()
+			if s.closed || !s.registered {
+				s.access.Unlock()
+				if handle != nil {
+					observer.UnregisterProviderCallback(handle)
+				}
+				return nil
+			}
+			s.managerObserver = observer
+			s.managerHandle = handle
+			s.access.Unlock()
+		}
+	}
+	return nil
+}
+
+func resolveProviderSet(manager adapter.ProviderManager, useAll bool, configuredTags []string) (map[string]adapter.Provider, []string, error) {
 	resolved := make(map[string]adapter.Provider)
 	var providerTags []string
-	if s.useAllProviders {
-		for _, provider := range s.manager.Providers() {
+	if useAll {
+		for _, provider := range manager.Providers() {
 			if provider == nil || provider.Tag() == "" {
 				continue
 			}
@@ -121,36 +182,40 @@ func (s *groupProviderSource) register(callback adapter.ProviderUpdateCallback) 
 			providerTags = append(providerTags, tag)
 			resolved[tag] = provider
 		}
-	} else {
-		for i, tag := range s.providerTags {
-			if _, exists := resolved[tag]; exists {
-				continue
-			}
-			provider, loaded := s.manager.Get(tag)
-			if !loaded {
-				return E.New("outbound provider ", i, " not found: ", tag)
-			}
-			providerTags = append(providerTags, tag)
-			resolved[tag] = provider
+		return resolved, providerTags, nil
+	}
+	for i, tag := range configuredTags {
+		if _, exists := resolved[tag]; exists {
+			continue
 		}
-	}
-	// Resolve every provider before registering any callback. A malformed
-	// configuration must not leave a partially subscribed source behind.
-	for _, tag := range providerTags {
-		provider := resolved[tag]
-		s.providers[tag] = provider
-		s.handles[tag] = provider.RegisterCallback(callback)
-	}
-	s.providerTags = providerTags
-	s.callback = callback
-	if s.useAllProviders {
-		if observer, ok := s.manager.(adapter.ProviderManagerObserver); ok {
-			s.managerObserver = observer
-			s.managerHandle = observer.RegisterProviderCallback(s.onProviderManagerUpdated)
+		provider, loaded := manager.Get(tag)
+		if !loaded || provider == nil {
+			return nil, nil, E.New("outbound provider ", i, " not found: ", tag)
 		}
+		providerTags = append(providerTags, tag)
+		resolved[tag] = provider
 	}
-	s.registered = true
-	return nil
+	return resolved, providerTags, nil
+}
+
+// attachProviderCallback performs the provider call without holding source
+// state. A provider is allowed to notify synchronously from RegisterCallback;
+// in that case the callback observes the already-published provider set.
+func (s *groupProviderSource) attachProviderCallback(tag string, provider adapter.Provider, callback adapter.ProviderUpdateCallback) {
+	if provider == nil {
+		return
+	}
+	handle := provider.RegisterCallback(callback)
+	s.access.Lock()
+	if s.closed || !s.registered || s.providers[tag] != provider {
+		s.access.Unlock()
+		if handle != nil {
+			provider.UnregisterCallback(handle)
+		}
+		return
+	}
+	s.handles[tag] = handle
+	s.access.Unlock()
 }
 
 // onProviderManagerUpdated reconciles use_all_providers without polling. The
@@ -165,21 +230,25 @@ func (s *groupProviderSource) onProviderManagerUpdated() {
 		s.access.Unlock()
 		return
 	}
-	desired := make(map[string]adapter.Provider)
-	var providerTags []string
-	for _, provider := range s.manager.Providers() {
-		if provider == nil || provider.Tag() == "" {
-			continue
-		}
-		tag := provider.Tag()
-		if _, exists := desired[tag]; exists {
-			continue
-		}
-		desired[tag] = provider
-		providerTags = append(providerTags, tag)
+	manager := s.manager
+	s.access.Unlock()
+	// Providers is an external manager call; never hold source.access while
+	// resolving the new set.
+	desired, providerTags, err := resolveProviderSet(manager, true, nil)
+	if err != nil {
+		return
+	}
+	s.access.Lock()
+	if s.closed || !s.registered || !s.useAllProviders || s.manager != manager {
+		s.access.Unlock()
+		return
 	}
 	var removedProviders []adapter.Provider
 	var removedHandles []*list.Element[adapter.ProviderUpdateCallback]
+	var addedProviders []struct {
+		tag      string
+		provider adapter.Provider
+	}
 	changed := false
 	for tag, provider := range s.providers {
 		desiredProvider, exists := desired[tag]
@@ -199,7 +268,11 @@ func (s *groupProviderSource) onProviderManagerUpdated() {
 		}
 		provider := desired[tag]
 		s.providers[tag] = provider
-		s.handles[tag] = provider.RegisterCallback(s.callback)
+		s.handles[tag] = nil
+		addedProviders = append(addedProviders, struct {
+			tag      string
+			provider adapter.Provider
+		}{tag: tag, provider: provider})
 		changed = true
 	}
 	s.providerTags = providerTags
@@ -209,6 +282,9 @@ func (s *groupProviderSource) onProviderManagerUpdated() {
 		if provider != nil && removedHandles[index] != nil {
 			provider.UnregisterCallback(removedHandles[index])
 		}
+	}
+	for _, added := range addedProviders {
+		s.attachProviderCallback(added.tag, added.provider, callback)
 	}
 	if changed && callback != nil {
 		_ = callback("")
@@ -274,43 +350,88 @@ func (s *groupProviderSource) memberOutbounds(updatedTag string) (tags []string,
 		return nil, nil
 	}
 	s.access.Lock()
-	defer s.access.Unlock()
 	if s.closed {
+		s.access.Unlock()
 		return nil, nil
 	}
-	for _, providerTag := range s.providerTags {
-		if updatedTag != "" && providerTag != updatedTag && s.outboundsCache[providerTag] != nil {
-			cached := s.outboundsCache[providerTag]
-			for _, detour := range cached {
+	providerTags := append([]string(nil), s.providerTags...)
+	type providerSnapshot struct {
+		tag      string
+		provider adapter.Provider
+		cached   []adapter.Outbound
+		useCache bool
+		refresh  bool
+	}
+	snapshots := make([]providerSnapshot, 0, len(providerTags))
+	for _, providerTag := range providerTags {
+		provider := s.providers[providerTag]
+		cached, useCache := s.outboundsCache[providerTag]
+		// An empty update tag means a complete rebuild (startup, or a
+		// membership change that can affect every provider).  Incremental
+		// callbacks refresh only the provider that reported the change and
+		// reuse the immutable filtered cache for all others.
+		refresh := updatedTag == "" || providerTag == updatedTag || !useCache
+		snapshots = append(snapshots, providerSnapshot{
+			tag:      providerTag,
+			provider: provider,
+			cached:   append([]adapter.Outbound(nil), cached...),
+			useCache: useCache,
+			refresh:  refresh,
+		})
+	}
+	exclude, include := s.exclude, s.include
+	s.access.Unlock()
+
+	// Provider.Outbounds is external code and may take its own lifecycle lock or
+	// synchronously notify listeners. Read it outside source.access, then publish
+	// the immutable cache only if the provider is still owned by this source.
+	for _, snapshot := range snapshots {
+		members := snapshot.cached
+		if !snapshot.useCache {
+			members = nil
+		}
+		if snapshot.provider != nil && snapshot.refresh {
+			members = make([]adapter.Outbound, 0)
+			for _, detour := range snapshot.provider.Outbounds() {
 				if detour == nil {
 					continue
 				}
-				tags = append(tags, detour.Tag())
-				outbounds = append(outbounds, detour)
+				tag := detour.Tag()
+				if exclude != nil && exclude.MatchString(tag) {
+					continue
+				}
+				if include != nil && !include.MatchString(tag) {
+					continue
+				}
+				members = append(members, detour)
 			}
+			s.access.Lock()
+			if !s.closed && s.providers[snapshot.tag] == snapshot.provider {
+				s.outboundsCache[snapshot.tag] = append([]adapter.Outbound(nil), members...)
+			}
+			s.access.Unlock()
+		}
+		s.access.Lock()
+		owned := !s.closed && (snapshot.provider == nil || s.providers[snapshot.tag] == snapshot.provider)
+		s.access.Unlock()
+		if !owned {
 			continue
 		}
-		provider := s.providers[providerTag]
-		if provider == nil {
-			continue
-		}
-		var cache []adapter.Outbound
-		for _, detour := range provider.Outbounds() {
+		for _, detour := range members {
 			if detour == nil {
 				continue
 			}
-			tag := detour.Tag()
-			if s.exclude != nil && s.exclude.MatchString(tag) {
-				continue
-			}
-			if s.include != nil && !s.include.MatchString(tag) {
-				continue
-			}
-			tags = append(tags, tag)
+			tags = append(tags, detour.Tag())
 			outbounds = append(outbounds, detour)
-			cache = append(cache, detour)
 		}
-		s.outboundsCache[providerTag] = cache
+	}
+	s.access.Lock()
+	closed := s.closed
+	// A close or manager reconciliation that happened while provider code ran
+	// invalidates the assembled view; the next callback will rebuild it.
+	s.access.Unlock()
+	if closed {
+		return nil, nil
 	}
 	return tags, outbounds
 }
@@ -320,36 +441,80 @@ func (s *groupProviderSource) memberOutbounds(updatedTag string) (tags []string,
 // key on the renamed tag while dialing still goes through the real member.
 type renamedOutbound struct {
 	adapter.Outbound
-	tag string
+	tag      string
+	identity string
 }
 
-func (o *renamedOutbound) Tag() string { return o.tag }
+func (o *renamedOutbound) Tag() string              { return o.tag }
+func (o *renamedOutbound) EndpointIdentity() string { return o.identity }
 
 // renameProviderMembers assigns every provider member a unique, panel-visible
 // tag. When a member collides with an occupied tag (an explicit member, or a
 // same-named node from another provider) it keeps its name and gains a
 // " #N" suffix, matching how clash renames duplicate provider nodes.
 func renameProviderMembers(members []adapter.Outbound, occupied map[string]struct{}) (tags []string, renamed []adapter.Outbound) {
-	for _, member := range members {
+	// Assign suffixes by endpoint identity, not by provider enumeration order.
+	// Refreshes are allowed to reorder a subscription; the display tag must not
+	// make a different endpoint inherit the previous selector/history entry.
+	indicesByTag := make(map[string][]int)
+	for index, member := range members {
+		if member != nil {
+			indicesByTag[member.Tag()] = append(indicesByTag[member.Tag()], index)
+		}
+	}
+	assigned := make(map[int]string, len(members))
+	for baseTag, indices := range indicesByTag {
+		sort.SliceStable(indices, func(i, j int) bool {
+			left, right := members[indices[i]], members[indices[j]]
+			return providerMemberIdentity(left) < providerMemberIdentity(right)
+		})
+		nextSuffix := 1
+		if _, taken := occupied[baseTag]; taken {
+			nextSuffix = 2
+		}
+		for _, index := range indices {
+			tag := baseTag
+			if nextSuffix > 1 {
+				tag = baseTag + " #" + strconv.Itoa(nextSuffix)
+			}
+			for {
+				if _, taken := occupied[tag]; !taken {
+					break
+				}
+				nextSuffix++
+				tag = baseTag + " #" + strconv.Itoa(nextSuffix)
+			}
+			occupied[tag] = struct{}{}
+			assigned[index] = tag
+			nextSuffix++
+		}
+	}
+	for index, member := range members {
 		if member == nil {
 			continue
 		}
-		tag := member.Tag()
-		if _, taken := occupied[tag]; taken {
-			for n := 2; ; n++ {
-				candidate := tag + " #" + strconv.Itoa(n)
-				if _, taken := occupied[candidate]; !taken {
-					member = &renamedOutbound{Outbound: member, tag: candidate}
-					tag = candidate
-					break
-				}
-			}
+		tag := assigned[index]
+		if tag != member.Tag() {
+			member = &renamedOutbound{Outbound: member, tag: tag, identity: providerMemberIdentity(member)}
 		}
-		occupied[tag] = struct{}{}
 		tags = append(tags, tag)
 		renamed = append(renamed, member)
 	}
 	return tags, renamed
+}
+
+func providerMemberIdentity(member adapter.Outbound) string {
+	if member == nil {
+		return ""
+	}
+	if identified, ok := member.(adapter.OutboundWithEndpointIdentity); ok {
+		if identity := identified.EndpointIdentity(); identity != "" {
+			return identity
+		}
+	}
+	// Legacy providers do not expose structured options. Their tag is the only
+	// safe identity available; it still avoids order-dependent suffix churn.
+	return member.Tag()
 }
 
 // appendProviderMembers merges provider members into the group's explicit

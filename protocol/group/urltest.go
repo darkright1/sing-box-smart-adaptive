@@ -116,11 +116,13 @@ func (s *URLTest) rebuildSnapshot(providerTag string) *groupOutboundSnapshot {
 
 func (s *URLTest) Start() error {
 	s.stateAccess.Lock()
-	defer s.stateAccess.Unlock()
 	if s.closed {
+		s.stateAccess.Unlock()
 		return E.New("url-test is closed")
 	}
-	for i, tag := range s.baseTags {
+	baseTags := append([]string(nil), s.baseTags...)
+	s.stateAccess.Unlock()
+	for i, tag := range baseTags {
 		_, loaded := s.outbound.Outbound(tag)
 		if !loaded {
 			return E.New("outbound ", i, " not found: ", tag)
@@ -144,7 +146,15 @@ func (s *URLTest) Start() error {
 		s.providerSource.close()
 		return err
 	}
+	s.stateAccess.Lock()
+	if s.closed {
+		s.stateAccess.Unlock()
+		_ = group.Close()
+		s.providerSource.close()
+		return E.New("url-test is closed")
+	}
 	s.group = group
+	s.stateAccess.Unlock()
 	return nil
 }
 
@@ -162,11 +172,13 @@ func (s *URLTest) Close() error {
 		return nil
 	}
 	s.closed = true
-	s.providerSource.close()
 	group := s.group
 	s.group = nil
 	s.membership.Store(newGroupOutboundSnapshot(nil, nil))
 	s.stateAccess.Unlock()
+	// Provider unregistration can execute provider-owned synchronization and
+	// must not run while URLTest's state lock is held.
+	s.providerSource.close()
 	return common.Close(group)
 }
 
@@ -255,21 +267,29 @@ func (s *URLTest) CheckOutbounds() {
 
 func (s *URLTest) onProviderUpdated(tag string) error {
 	s.stateAccess.Lock()
-	if s.closed || !s.providerSource.has() {
+	if s.closed {
 		s.stateAccess.Unlock()
+		return E.New("outbound provider not found: ", tag)
+	}
+	s.stateAccess.Unlock()
+	if !s.providerSource.has() {
 		return E.New("outbound provider not found: ", tag)
 	}
 	if tag != "" && !s.providerSource.hasProvider(tag) {
-		s.stateAccess.Unlock()
 		return E.New("outbound provider not found: ", tag)
 	}
-	group := s.group
-	if group == nil {
+	snapshot := s.rebuildSnapshot(tag)
+	s.stateAccess.Lock()
+	if s.closed {
 		s.stateAccess.Unlock()
 		return nil
 	}
-	snapshot := s.rebuildSnapshot(tag)
+	group := s.group
 	s.membership.Store(snapshot)
+	s.stateAccess.Unlock()
+	if group == nil {
+		return nil
+	}
 	outbounds := make([]adapter.Outbound, 0, len(snapshot.tags))
 	for _, memberTag := range snapshot.tags {
 		if detour := snapshot.outbounds[memberTag]; detour != nil {
@@ -277,7 +297,6 @@ func (s *URLTest) onProviderUpdated(tag string) error {
 		}
 	}
 	group.replaceOutbounds(outbounds)
-	s.stateAccess.Unlock()
 	go group.CheckOutbounds(s.ctx, true)
 	return nil
 }
@@ -452,9 +471,22 @@ func (g *URLTestGroup) Touch() {
 	}
 	ticker := time.NewTicker(g.interval)
 	g.ticker = ticker
-	g.pauseCallback = pause.RegisterTicker(g.pause, ticker, g.interval, nil)
-	go g.loopCheck(ticker, g.close)
 	g.access.Unlock()
+	// pause.Manager is an external callback registry. Register outside the
+	// group lock so a synchronous callback cannot re-enter Touch/Close.
+	go g.loopCheck(ticker, g.close)
+	callback := pause.RegisterTicker(g.pause, ticker, g.interval, nil)
+	g.access.Lock()
+	if g.closed || g.ticker != ticker {
+		g.access.Unlock()
+		ticker.Stop()
+		if callback != nil {
+			g.pause.UnregisterCallback(callback)
+		}
+	} else {
+		g.pauseCallback = callback
+		g.access.Unlock()
+	}
 	if needsProbe {
 		// Match Surge's cold start: the first configured member is usable
 		// immediately; the complete test round runs in the background.
@@ -464,20 +496,26 @@ func (g *URLTestGroup) Touch() {
 
 func (g *URLTestGroup) Close() error {
 	g.access.Lock()
-	defer g.access.Unlock()
 	if g.closed {
+		g.access.Unlock()
 		return nil
 	}
 	g.closed = true
 	if g.ticker == nil {
 		close(g.close)
+		g.access.Unlock()
 		return nil
 	}
-	g.ticker.Stop()
+	ticker := g.ticker
 	g.ticker = nil
-	g.pause.UnregisterCallback(g.pauseCallback)
+	callback := g.pauseCallback
 	g.pauseCallback = nil
 	close(g.close)
+	g.access.Unlock()
+	ticker.Stop()
+	if callback != nil {
+		g.pause.UnregisterCallback(callback)
+	}
 	return nil
 }
 
@@ -568,13 +606,18 @@ func (g *URLTestGroup) loopCheck(ticker *time.Ticker, closeChan <-chan struct{})
 		if time.Since(g.lastActive.Load()) > g.idleTimeout {
 			g.access.Lock()
 			if g.ticker == ticker {
-				g.ticker.Stop()
 				g.ticker = nil
-				g.pause.UnregisterCallback(g.pauseCallback)
+				callback := g.pauseCallback
 				g.pauseCallback = nil
+				g.access.Unlock()
+				ticker.Stop()
+				if callback != nil {
+					g.pause.UnregisterCallback(callback)
+				}
+				return
 			}
 			g.access.Unlock()
-			return
+			continue
 		}
 		g.CheckOutbounds(g.ctx, false)
 	}
@@ -589,6 +632,12 @@ func (g *URLTestGroup) URLTest(ctx context.Context) (map[string]uint16, error) {
 }
 
 func (g *URLTestGroup) urlTest(ctx context.Context, force bool) (map[string]uint16, error) {
+	g.access.Lock()
+	closed := g.closed
+	g.access.Unlock()
+	if closed {
+		return map[string]uint16{}, nil
+	}
 	if g.checking.Swap(true) {
 		return make(map[string]uint16), nil
 	}

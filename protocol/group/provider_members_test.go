@@ -14,14 +14,17 @@ import (
 )
 
 type fakeProvider struct {
-	tag       string
-	nodes     []adapter.Outbound
-	callbacks blist.List[adapter.ProviderUpdateCallback]
+	tag              string
+	nodes            []adapter.Outbound
+	notifyOnRegister bool
+	callbacks        blist.List[adapter.ProviderUpdateCallback]
+	outboundsCalls   int
 }
 
 func (p *fakeProvider) Type() string { return "provider" }
 func (p *fakeProvider) Tag() string  { return p.tag }
 func (p *fakeProvider) Outbounds() []adapter.Outbound {
+	p.outboundsCalls++
 	return p.nodes
 }
 func (p *fakeProvider) Outbound(tag string) (adapter.Outbound, bool) {
@@ -37,7 +40,11 @@ func (p *fakeProvider) HealthCheck(ctx context.Context) (map[string]uint16, erro
 	return nil, nil
 }
 func (p *fakeProvider) RegisterCallback(callback adapter.ProviderUpdateCallback) *blist.Element[adapter.ProviderUpdateCallback] {
-	return p.callbacks.PushBack(callback)
+	element := p.callbacks.PushBack(callback)
+	if p.notifyOnRegister {
+		_ = callback(p.tag)
+	}
+	return element
 }
 func (p *fakeProvider) UnregisterCallback(element *blist.Element[adapter.ProviderUpdateCallback]) {
 	p.callbacks.Remove(element)
@@ -86,10 +93,12 @@ func (m *fakeProviderManager) notifyProviderUpdate() {
 
 type providerTestNode struct {
 	adapter.Outbound
-	tag string
+	tag      string
+	identity string
 }
 
-func (n *providerTestNode) Tag() string { return n.tag }
+func (n *providerTestNode) Tag() string              { return n.tag }
+func (n *providerTestNode) EndpointIdentity() string { return n.identity }
 
 func newTestProviderSource(t *testing.T, options option.GroupCommonOption) (*groupProviderSource, *fakeProviderManager) {
 	t.Helper()
@@ -155,7 +164,7 @@ func TestGroupProviderSourceExcludeRegex(t *testing.T) {
 }
 
 func TestGroupProviderSourceIncrementalUpdate(t *testing.T) {
-	source, _ := newTestProviderSource(t, option.GroupCommonOption{
+	source, manager := newTestProviderSource(t, option.GroupCommonOption{
 		Providers: []string{"prov-a", "prov-b"},
 	})
 	if err := source.register(func(string) error { return nil }); err != nil {
@@ -165,6 +174,13 @@ func TestGroupProviderSourceIncrementalUpdate(t *testing.T) {
 	_, second := source.memberOutbounds("prov-b")
 	if len(first) != 4 || len(second) != 4 {
 		t.Fatalf("first=%d second=%d, want 4/4", len(first), len(second))
+	}
+	providers := manager.Providers()
+	if got := providers[0].(*fakeProvider).outboundsCalls; got != 1 {
+		t.Fatalf("prov-a Outbounds calls=%d, want 1 (incremental update must use cache)", got)
+	}
+	if got := providers[1].(*fakeProvider).outboundsCalls; got != 2 {
+		t.Fatalf("prov-b Outbounds calls=%d, want 2 (initial + updated refresh)", got)
 	}
 }
 
@@ -185,6 +201,29 @@ func TestGroupProviderSourceCloseUnregistersCallbacks(t *testing.T) {
 			t.Fatalf("callbacks after close=%d, want 0", got)
 		}
 	}
+}
+
+func TestGroupProviderSourceRegisterAllowsSynchronousProviderNotification(t *testing.T) {
+	source := newGroupProviderSource(context.Background(), option.GroupCommonOption{Providers: []string{"prov-a"}})
+	provider := &fakeProvider{tag: "prov-a", notifyOnRegister: true}
+	manager := &fakeProviderManager{providers: []adapter.Provider{provider}}
+	source.manager = manager
+	done := make(chan error, 1)
+	go func() {
+		done <- source.register(func(string) error {
+			_, _ = source.memberOutbounds("")
+			return nil
+		})
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("provider callback registration deadlocked on synchronous notification")
+	}
+	source.close()
 }
 
 func TestGroupProviderSourceTracksUseAllProviderChanges(t *testing.T) {
@@ -249,6 +288,42 @@ func TestAppendProviderMembersSuffixesSameNameNodes(t *testing.T) {
 	// explicit(2) + provider(3) + suffixed duplicate(1)
 	if len(tags) != 6 {
 		t.Fatalf("tags=%v", tags)
+	}
+}
+
+func TestRenameProviderMembersUsesStableEndpointIdentity(t *testing.T) {
+	newMembers := func(reverse bool) []adapter.Outbound {
+		a := &providerTestNode{tag: "HK", identity: "endpoint-a"}
+		b := &providerTestNode{tag: "HK", identity: "endpoint-b"}
+		if reverse {
+			return []adapter.Outbound{b, a}
+		}
+		return []adapter.Outbound{a, b}
+	}
+	firstTags, first := renameProviderMembers(newMembers(false), map[string]struct{}{})
+	secondTags, second := renameProviderMembers(newMembers(true), map[string]struct{}{})
+	if len(first) != 2 || len(second) != 2 {
+		t.Fatalf("unexpected member count: %d/%d", len(first), len(second))
+	}
+	identityTags := func(members []adapter.Outbound) map[string]string {
+		result := make(map[string]string, len(members))
+		for _, member := range members {
+			identified, ok := member.(adapter.OutboundWithEndpointIdentity)
+			if !ok {
+				t.Fatalf("member %q lost endpoint identity", member.Tag())
+			}
+			result[identified.EndpointIdentity()] = member.Tag()
+		}
+		return result
+	}
+	firstByIdentity := identityTags(first)
+	secondByIdentity := identityTags(second)
+	if firstByIdentity["endpoint-a"] != secondByIdentity["endpoint-a"] ||
+		firstByIdentity["endpoint-b"] != secondByIdentity["endpoint-b"] {
+		t.Fatalf("display suffixes changed after provider reorder: first=%v second=%v", firstTags, secondTags)
+	}
+	if firstByIdentity["endpoint-a"] != "HK" || firstByIdentity["endpoint-b"] != "HK #2" {
+		t.Fatalf("unexpected stable suffix assignment: %v", firstByIdentity)
 	}
 }
 

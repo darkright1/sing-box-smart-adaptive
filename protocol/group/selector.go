@@ -137,11 +137,14 @@ func (s *Selector) Network() []string {
 
 func (s *Selector) Start() error {
 	s.stateAccess.Lock()
-	defer s.stateAccess.Unlock()
 	if s.closed {
+		s.stateAccess.Unlock()
 		return E.New("selector is closed")
 	}
-	for i, tag := range s.baseTags {
+	baseTags := append([]string(nil), s.baseTags...)
+	defaultTag := s.defaultTag
+	s.stateAccess.Unlock()
+	for i, tag := range baseTags {
 		if _, loaded := s.outbound.Outbound(tag); !loaded {
 			return E.New("outbound ", i, " not found: ", tag)
 		}
@@ -152,46 +155,63 @@ func (s *Selector) Start() error {
 		}
 	}
 	snapshot := s.rebuildSnapshot("")
+	var cachedTag string
+	if s.Tag() != "" {
+		if cacheFile := service.FromContext[adapter.CacheFile](s.ctx); cacheFile != nil {
+			cachedTag = cacheFile.LoadSelected(s.Tag())
+		}
+	}
+	s.stateAccess.Lock()
+	if s.closed {
+		s.stateAccess.Unlock()
+		s.providerSource.close()
+		return E.New("selector is closed")
+	}
 	s.membership.Store(snapshot)
 
-	if s.Tag() != "" {
-		cacheFile := service.FromContext[adapter.CacheFile](s.ctx)
-		if cacheFile != nil {
-			selected := cacheFile.LoadSelected(s.Tag())
-			if selected != "" {
-				detour, loaded := snapshot.outbounds[selected]
-				if loaded {
-					s.selected.Store(detour)
-					return nil
-				}
-			}
+	if cachedTag != "" {
+		if detour, loaded := snapshot.outbounds[cachedTag]; loaded {
+			s.selected.Store(detour)
+			s.stateAccess.Unlock()
+			return nil
 		}
 	}
 
-	if s.defaultTag != "" {
-		detour, loaded := snapshot.outbounds[s.defaultTag]
+	var startErr error
+	if defaultTag != "" {
+		detour, loaded := snapshot.outbounds[defaultTag]
 		if !loaded {
-			s.providerSource.close()
-			return E.New("default outbound not found: ", s.defaultTag)
+			startErr = E.New("default outbound not found: ", defaultTag)
+		} else {
+			s.selected.Store(detour)
 		}
-		s.selected.Store(detour)
-		return nil
+	} else {
+		s.setFallbackLocked(snapshot)
 	}
-
-	s.setFallbackLocked(snapshot)
+	s.stateAccess.Unlock()
+	if startErr != nil {
+		s.providerSource.close()
+		return startErr
+	}
 	return nil
 }
 
 func (s *Selector) onProviderUpdated(tag string) error {
 	s.stateAccess.Lock()
-	defer s.stateAccess.Unlock()
 	if s.closed || !s.providerSource.has() {
+		s.stateAccess.Unlock()
 		return E.New("outbound provider not found: ", tag)
 	}
+	s.stateAccess.Unlock()
 	if tag != "" && !s.providerSource.hasProvider(tag) {
 		return E.New("outbound provider not found: ", tag)
 	}
 	snapshot := s.rebuildSnapshot(tag)
+	s.stateAccess.Lock()
+	defer s.stateAccess.Unlock()
+	if s.closed {
+		return nil
+	}
 	s.membership.Store(snapshot)
 	s.setFallbackLocked(snapshot)
 	return nil
@@ -227,16 +247,19 @@ func (s *Selector) SelectPreMatchOutbound(metadata *adapter.InboundContext, sele
 
 func (s *Selector) SelectOutbound(tag string) bool {
 	s.stateAccess.Lock()
-	defer s.stateAccess.Unlock()
 	snapshot := s.snapshot()
 	if snapshot == nil {
+		s.stateAccess.Unlock()
 		return false
 	}
 	detour, loaded := snapshot.outbounds[tag]
 	if !loaded {
+		s.stateAccess.Unlock()
 		return false
 	}
-	if s.selected.Swap(detour) == detour {
+	changed := s.selected.Swap(detour) != detour
+	s.stateAccess.Unlock()
+	if !changed {
 		return true
 	}
 	if s.Tag() != "" {
@@ -262,10 +285,12 @@ func (s *Selector) Close() error {
 		return nil
 	}
 	s.closed = true
-	s.providerSource.close()
 	s.membership.Store(newGroupOutboundSnapshot(nil, nil))
 	s.selected.Store(nil)
 	s.stateAccess.Unlock()
+	// Provider unregistration is external lifecycle code and may call back
+	// synchronously; never hold selector stateAccess across it.
+	s.providerSource.close()
 	return nil
 }
 

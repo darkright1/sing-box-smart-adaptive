@@ -6,7 +6,6 @@ import (
 	"math/rand"
 	"net"
 	"net/netip"
-	"regexp"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -61,7 +60,7 @@ type LoadBalance struct {
 	outbound                     adapter.OutboundManager
 	connection                   adapter.ConnectionManager
 	logger                       log.ContextLogger
-	tags                         []string
+	baseTags                     []string
 	link                         string
 	interval                     time.Duration
 	idleTimeout                  time.Duration
@@ -70,16 +69,10 @@ type LoadBalance struct {
 	interruptExternalConnections bool
 	strategy                     string
 	persistent                   bool
-
-	provider       adapter.ProviderManager
-	providers      map[string]adapter.Provider
-	outboundsCache map[string][]adapter.Outbound
-	cancel         context.CancelFunc
-
-	providerTags    []string
-	exclude         *regexp.Regexp
-	include         *regexp.Regexp
-	useAllProviders bool
+	providerSource               *groupProviderSource
+	stateAccess                  sync.RWMutex
+	closed                       bool
+	cancel                       context.CancelFunc
 }
 
 func NewLoadBalance(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.LoadBalanceOutboundOptions) (adapter.Outbound, error) {
@@ -101,7 +94,7 @@ func NewLoadBalance(ctx context.Context, router adapter.Router, logger log.Conte
 		outbound:                     service.FromContext[adapter.OutboundManager](ctx),
 		connection:                   service.FromContext[adapter.ConnectionManager](ctx),
 		logger:                       logger,
-		tags:                         options.Outbounds,
+		baseTags:                     append([]string(nil), options.Outbounds...),
 		link:                         options.URL,
 		interval:                     time.Duration(options.Interval),
 		ttl:                          time.Duration(options.TTL),
@@ -110,95 +103,123 @@ func NewLoadBalance(ctx context.Context, router adapter.Router, logger log.Conte
 		strategy:                     strategy,
 		persistent:                   options.Persistent,
 
-		provider:       service.FromContext[adapter.ProviderManager](ctx),
-		providers:      make(map[string]adapter.Provider),
-		outboundsCache: make(map[string][]adapter.Outbound),
-
-		providerTags:    options.Providers,
-		exclude:         (*regexp.Regexp)(options.Exclude),
-		include:         (*regexp.Regexp)(options.Include),
-		useAllProviders: options.UseAllProviders,
+		providerSource: newGroupProviderSource(ctx, options.GroupCommonOption),
 	}
 	return outbound, nil
 }
 
 func (s *LoadBalance) Start() error {
-	if s.useAllProviders {
-		var providerTags []string
-		for _, provider := range s.provider.Providers() {
-			providerTags = append(providerTags, provider.Tag())
-			s.providers[provider.Tag()] = provider
-			provider.RegisterCallback(s.onProviderUpdated)
-		}
-		s.providerTags = providerTags
-	} else {
-		for i, tag := range s.providerTags {
-			provider, loaded := s.provider.Get(tag)
-			if !loaded {
-				return E.New("outbound provider ", i, " not found: ", tag)
-			}
-			s.providers[tag] = provider
-			provider.RegisterCallback(s.onProviderUpdated)
-		}
+	s.stateAccess.Lock()
+	if s.closed {
+		s.stateAccess.Unlock()
+		return E.New("load-balance is closed")
 	}
-	if len(s.tags)+len(s.providerTags) == 0 {
+	baseTags := append([]string(nil), s.baseTags...)
+	s.stateAccess.Unlock()
+	if len(baseTags) == 0 && !s.providerSource.has() {
 		return E.New("missing outbound and provider tags")
 	}
-
-	outbounds := make([]adapter.Outbound, 0, len(s.tags))
-	for i, tag := range s.tags {
-		detour, loaded := s.outbound.Outbound(tag)
+	for i, tag := range baseTags {
+		_, loaded := s.outbound.Outbound(tag)
 		if !loaded {
 			return E.New("outbound ", i, " not found: ", tag)
 		}
-		outbounds = append(outbounds, detour)
 	}
-	if len(s.tags) == 0 {
+	if s.providerSource.has() {
+		if err := s.providerSource.register(s.onProviderUpdated); err != nil {
+			return err
+		}
+	}
+	outbounds := s.rebuildOutbounds("")
+	if len(outbounds) == 0 && len(baseTags) == 0 {
 		detour, _ := s.outbound.Outbound("Compatible")
-		s.tags = append(s.tags, detour.Tag())
-		outbounds = append(outbounds, detour)
+		if detour != nil {
+			outbounds = append(outbounds, detour)
+		}
+	}
+	if len(outbounds) == 0 {
+		s.providerSource.close()
+		return E.New("missing load-balance outbounds")
 	}
 	group, err := NewLoadBalanceGroup(s.ctx, s.outbound, s.logger, outbounds, s.link, s.interval, s.idleTimeout, s.ttl, s.interruptExternalConnections, s.strategy, s.persistent)
 	if err != nil {
+		s.providerSource.close()
 		return err
 	}
+	s.stateAccess.Lock()
+	if s.closed {
+		s.stateAccess.Unlock()
+		_ = group.Close()
+		s.providerSource.close()
+		return E.New("load-balance closed during start")
+	}
 	s.group = group
+	s.stateAccess.Unlock()
 	return nil
 }
 
 func (s *LoadBalance) PostStart() error {
-	s.group.PostStart()
+	if group := s.groupRef(); group != nil {
+		group.PostStart()
+	}
 	return nil
 }
 
 func (s *LoadBalance) Close() error {
-	return common.Close(
-		common.PtrOrNil(s.group),
-	)
+	s.stateAccess.Lock()
+	if s.closed {
+		s.stateAccess.Unlock()
+		return nil
+	}
+	s.closed = true
+	group := s.group
+	s.group = nil
+	if s.cancel != nil {
+		s.cancel()
+		s.cancel = nil
+	}
+	s.stateAccess.Unlock()
+	s.providerSource.close()
+	return common.Close(group)
+}
+
+func (s *LoadBalance) groupRef() *LoadBalanceGroup {
+	s.stateAccess.RLock()
+	defer s.stateAccess.RUnlock()
+	return s.group
 }
 
 func (s *LoadBalance) Now() string {
-	if s.group == nil {
+	group := s.groupRef()
+	if group == nil {
 		return ""
 	}
-	return s.group.LastUsedTag()
+	return group.LastUsedTag()
 }
 
 func (s *LoadBalance) All() []string {
+	group := s.groupRef()
+	if group == nil {
+		return nil
+	}
 	var all []string
-	for _, outbound := range s.group.outboundsSnapshot() {
+	for _, outbound := range group.outboundsSnapshot() {
 		all = append(all, outbound.Tag())
 	}
 	return all
 }
 
 func (s *LoadBalance) SelectPreMatchOutbound(metadata *adapter.InboundContext, selectOutbound func(adapter.Outbound) (adapter.Outbound, adapter.PreMatchAction)) (adapter.Outbound, adapter.PreMatchAction) {
-	s.group.Touch()
+	group := s.groupRef()
+	if group == nil {
+		return nil, adapter.PreMatchContinue
+	}
+	group.Touch()
 	var (
 		preMatchOutbound adapter.Outbound
 		preMatchAction   adapter.PreMatchAction
 	)
-	s.group.UnwrapPreMatch(metadata, func(outbound adapter.Outbound) bool {
+	group.UnwrapPreMatch(metadata, func(outbound adapter.Outbound) bool {
 		preMatchOutbound, preMatchAction = selectOutbound(outbound)
 		return preMatchOutbound != nil
 	})
@@ -206,22 +227,31 @@ func (s *LoadBalance) SelectPreMatchOutbound(metadata *adapter.InboundContext, s
 }
 
 func (s *LoadBalance) URLTest(ctx context.Context) (map[string]uint16, error) {
-	return s.group.URLTest(ctx)
+	if group := s.groupRef(); group != nil {
+		return group.URLTest(ctx)
+	}
+	return map[string]uint16{}, nil
 }
 
 // DashboardURLTest keeps a panel refresh on the same bounded sampled path as
 // the other automatic groups.  It must not turn a nested load-balance group
 // into a full provider fan-out.
 func (s *LoadBalance) DashboardURLTest(ctx context.Context) (map[string]uint16, error) {
-	return DashboardURLTestOutbounds(ctx, s.outbound, s.group.history, s.logger, s.group.outboundsSnapshot(), s.group.link), nil
+	group := s.groupRef()
+	if group == nil {
+		return map[string]uint16{}, nil
+	}
+	return DashboardURLTestOutbounds(ctx, s.outbound, group.history, s.logger, group.outboundsSnapshot(), group.link), nil
 }
 
 func (s *LoadBalance) CheckOutbounds() {
-	s.group.CheckOutbounds(true)
+	if group := s.groupRef(); group != nil {
+		group.CheckOutbounds(true)
+	}
 }
 
 func (s *LoadBalance) InterfaceUpdated(_ context.Context) {
-	group := s.group
+	group := s.groupRef()
 	if group == nil {
 		return
 	}
@@ -232,45 +262,58 @@ func (s *LoadBalance) InterfaceUpdated(_ context.Context) {
 }
 
 func (s *LoadBalance) isGroupActive() bool {
-	if !s.group.started {
+	group := s.groupRef()
+	if group == nil {
 		return false
 	}
-	return time.Since(s.group.lastActive.Load()) <= s.group.idleTimeout
+	group.access.Lock()
+	started := group.started
+	idleTimeout := group.idleTimeout
+	group.access.Unlock()
+	return started && time.Since(group.lastActive.Load()) <= idleTimeout
 }
 
 func (s *LoadBalance) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
-	s.group.Touch()
+	group := s.groupRef()
+	if group == nil {
+		return nil, E.New("load-balance is not started")
+	}
+	group.Touch()
 	metadata := adapter.ContextFrom(ctx)
-	outbound := s.group.Unwrap(metadata, true)
+	outbound := group.Unwrap(metadata, true)
 	if outbound == nil || !common.Contains(outbound.Network(), network) {
 		return nil, E.New("missing supported outbound")
 	}
 	adapter.NoteRealOutbound(ctx, outbound)
 	conn, err := outbound.DialContext(ctx, network, destination)
 	if err == nil {
-		return s.group.interruptGroup.NewConnEx(conn, interrupt.IsExternalConnectionFromContext(ctx), interrupt.IsProviderConnectionFromContext(ctx)), nil
+		return group.interruptGroup.NewConnEx(conn, interrupt.IsExternalConnectionFromContext(ctx), interrupt.IsProviderConnectionFromContext(ctx)), nil
 	}
 	s.logger.ErrorContext(ctx, err)
-	s.group.history.DeleteURLTestHistory(RealTag(s.outbound, outbound))
-	go s.group.CheckOutbounds(true)
+	group.history.DeleteURLTestHistory(RealTag(s.outbound, outbound))
+	go group.CheckOutbounds(true)
 	return nil, err
 }
 
 func (s *LoadBalance) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {
-	s.group.Touch()
+	group := s.groupRef()
+	if group == nil {
+		return nil, E.New("load-balance is not started")
+	}
+	group.Touch()
 	metadata := adapter.ContextFrom(ctx)
-	outbound := s.group.Unwrap(metadata, true)
+	outbound := group.Unwrap(metadata, true)
 	if outbound == nil || !common.Contains(outbound.Network(), N.NetworkUDP) {
 		return nil, E.New("missing supported outbound")
 	}
 	adapter.NoteRealOutbound(ctx, outbound)
 	conn, err := outbound.ListenPacket(ctx, destination)
 	if err == nil {
-		return s.group.interruptGroup.NewPacketConnEx(conn, interrupt.IsExternalConnectionFromContext(ctx), interrupt.IsProviderConnectionFromContext(ctx)), nil
+		return group.interruptGroup.NewPacketConnEx(conn, interrupt.IsExternalConnectionFromContext(ctx), interrupt.IsProviderConnectionFromContext(ctx)), nil
 	}
 	s.logger.ErrorContext(ctx, err)
-	s.group.history.DeleteURLTestHistory(RealTag(s.outbound, outbound))
-	go s.group.CheckOutbounds(true)
+	group.history.DeleteURLTestHistory(RealTag(s.outbound, outbound))
+	go group.CheckOutbounds(true)
 	return nil, err
 }
 
@@ -285,63 +328,57 @@ func (s *LoadBalance) NewPacketConnection(ctx context.Context, conn N.PacketConn
 }
 
 func (s *LoadBalance) onProviderUpdated(tag string) error {
-	_, loaded := s.providers[tag]
-	if !loaded {
+	s.stateAccess.RLock()
+	closed := s.closed
+	group := s.group
+	s.stateAccess.RUnlock()
+	if closed || group == nil {
+		return nil
+	}
+	if tag != "" && !s.providerSource.hasProvider(tag) {
 		return E.New("outbound provider not found: ", tag)
 	}
-	var (
-		tags      = s.Dependencies()
-		outbounds []adapter.Outbound
-	)
-	for _, tag := range tags {
-		detour, _ := s.outbound.Outbound(tag)
-		outbounds = append(outbounds, detour)
+	outbounds := s.rebuildOutbounds(tag)
+	if len(outbounds) == 0 {
+		return E.New("load-balance provider update removed all outbounds")
 	}
-	for _, providerTag := range s.providerTags {
-		if providerTag != tag && s.outboundsCache[providerTag] != nil {
-			for _, detour := range s.outboundsCache[providerTag] {
-				tags = append(tags, detour.Tag())
-				outbounds = append(outbounds, detour)
-			}
-			continue
-		}
-		provider := s.providers[providerTag]
-		var cache []adapter.Outbound
-		for _, detour := range provider.Outbounds() {
-			tag := detour.Tag()
-			if s.exclude != nil && s.exclude.MatchString(tag) {
-				continue
-			}
-			if s.include != nil && !s.include.MatchString(tag) {
-				continue
-			}
-			tags = append(tags, tag)
-			cache = append(cache, detour)
-		}
-		outbounds = append(outbounds, cache...)
-		s.outboundsCache[providerTag] = cache
-	}
-	if len(tags) == 0 {
-		detour, _ := s.outbound.Outbound("Compatible")
-		tags = append(tags, detour.Tag())
-		outbounds = append(outbounds, detour)
-	}
-	s.tags = tags
-	s.group.replaceOutbounds(outbounds)
+	group.replaceOutbounds(outbounds)
 	if s.isGroupActive() {
-		s.group.access.Lock()
-		if s.group.ticker != nil {
-			s.group.ticker.Reset(s.group.interval)
+		group.access.Lock()
+		if group.ticker != nil {
+			group.ticker.Reset(group.interval)
 		}
-		s.group.access.Unlock()
+		group.access.Unlock()
 		ctx, cancel := context.WithCancel(s.ctx)
+		s.stateAccess.Lock()
 		if s.cancel != nil {
 			s.cancel()
 		}
 		s.cancel = cancel
+		s.stateAccess.Unlock()
 		s.URLTest(ctx)
 	}
 	return nil
+}
+
+func (s *LoadBalance) rebuildOutbounds(updatedProvider string) []adapter.Outbound {
+	s.stateAccess.RLock()
+	baseTags := append([]string(nil), s.baseTags...)
+	s.stateAccess.RUnlock()
+	outbounds := make([]adapter.Outbound, 0, len(baseTags))
+	occupied := make(map[string]struct{}, len(baseTags))
+	for _, tag := range baseTags {
+		if detour, loaded := s.outbound.Outbound(tag); loaded && detour != nil {
+			outbounds = append(outbounds, detour)
+			occupied[tag] = struct{}{}
+		}
+	}
+	if s.providerSource.has() {
+		_, members := s.providerSource.memberOutbounds(updatedProvider)
+		_, renamed := renameProviderMembers(members, occupied)
+		outbounds = append(outbounds, renamed...)
+	}
+	return outbounds
 }
 
 type outboundMatcher = func(outbound adapter.Outbound) bool
@@ -373,6 +410,7 @@ type LoadBalanceGroup struct {
 	ticker                       *time.Ticker
 	close                        chan struct{}
 	started                      bool
+	closed                       bool
 	lastActive                   common.TypedValue[time.Time]
 	strategyFn                   strategyFn
 	// snapshotCache is rebuilt only in replaceOutbounds; strategy functions
@@ -448,27 +486,47 @@ func NewLoadBalanceGroup(ctx context.Context, outboundManager adapter.OutboundMa
 
 func (g *LoadBalanceGroup) PostStart() {
 	g.access.Lock()
+	if g.closed {
+		g.access.Unlock()
+		return
+	}
 	g.started = true
 	g.lastActive.Store(time.Now())
 	g.access.Unlock()
 }
 
 func (g *LoadBalanceGroup) Touch() {
-	if !g.started {
-		return
-	}
 	lastCheck := g.lastCheck.Load()
 	needsProbe := lastCheck == 0 || time.Since(time.Unix(0, lastCheck)) >= g.interval
 	g.access.Lock()
+	if !g.started || g.closed {
+		g.access.Unlock()
+		return
+	}
 	g.lastActive.Store(time.Now())
 	if g.ticker != nil {
 		g.access.Unlock()
 		return
 	}
-	g.ticker = time.NewTicker(g.interval)
-	go g.loopCheck()
-	g.pauseCallback = pause.RegisterTicker(g.pause, g.ticker, g.interval, nil)
+	ticker := time.NewTicker(g.interval)
+	g.ticker = ticker
 	g.access.Unlock()
+	// RegisterTicker is an external callback registry; do not call it while
+	// holding the group lock. A concurrent Close can win this race, in which
+	// case the callback is immediately unregistered below.
+	go g.loopCheck(ticker, g.close)
+	callback := pause.RegisterTicker(g.pause, ticker, g.interval, nil)
+	g.access.Lock()
+	if g.closed || g.ticker != ticker {
+		g.access.Unlock()
+		ticker.Stop()
+		if callback != nil {
+			g.pause.UnregisterCallback(callback)
+		}
+	} else {
+		g.pauseCallback = callback
+		g.access.Unlock()
+	}
 	if needsProbe {
 		// Surge uses the first configured member immediately and evaluates the
 		// group in the background on first use.  Do not block the first user
@@ -479,34 +537,58 @@ func (g *LoadBalanceGroup) Touch() {
 
 func (g *LoadBalanceGroup) Close() error {
 	g.access.Lock()
-	defer g.access.Unlock()
-	if g.ticker == nil {
+	if g.closed {
+		g.access.Unlock()
 		return nil
 	}
-	g.ticker.Stop()
-	g.pause.UnregisterCallback(g.pauseCallback)
+	g.closed = true
+	g.started = false
+	ticker := g.ticker
+	callback := g.pauseCallback
+	g.ticker = nil
+	g.pauseCallback = nil
 	close(g.close)
+	g.access.Unlock()
+	if ticker != nil {
+		ticker.Stop()
+	}
+	if callback != nil {
+		g.pause.UnregisterCallback(callback)
+	}
 	return nil
 }
 
-func (g *LoadBalanceGroup) loopCheck() {
+func (g *LoadBalanceGroup) loopCheck(ticker *time.Ticker, closeChan <-chan struct{}) {
 	if time.Since(g.lastActive.Load()) > g.interval {
 		g.lastActive.Store(time.Now())
 		g.CheckOutbounds(false)
 	}
 	for {
 		select {
-		case <-g.close:
+		case <-closeChan:
 			return
-		case <-g.ticker.C:
+		case <-ticker.C:
+		}
+		g.access.Lock()
+		closed := g.closed
+		g.access.Unlock()
+		if closed {
+			return
 		}
 		if time.Since(g.lastActive.Load()) > g.idleTimeout {
 			g.access.Lock()
-			g.ticker.Stop()
+			if g.ticker != ticker {
+				g.access.Unlock()
+				return
+			}
 			g.ticker = nil
-			g.pause.UnregisterCallback(g.pauseCallback)
+			callback := g.pauseCallback
 			g.pauseCallback = nil
 			g.access.Unlock()
+			ticker.Stop()
+			if callback != nil {
+				g.pause.UnregisterCallback(callback)
+			}
 			return
 		}
 		g.CheckOutbounds(false)
@@ -526,6 +608,12 @@ func (g *LoadBalanceGroup) URLTest(ctx context.Context) (map[string]uint16, erro
 
 func (g *LoadBalanceGroup) urlTest(ctx context.Context, force bool) (map[string]uint16, error) {
 	result := make(map[string]uint16)
+	g.access.Lock()
+	closed := g.closed
+	g.access.Unlock()
+	if closed {
+		return result, nil
+	}
 	if g.checking.Swap(true) {
 		return result, nil
 	}
@@ -586,6 +674,12 @@ func (g *LoadBalanceGroup) outboundsSnapshot() []adapter.Outbound {
 }
 
 func (g *LoadBalanceGroup) replaceOutbounds(outbounds []adapter.Outbound) {
+	g.access.Lock()
+	if g.closed {
+		g.access.Unlock()
+		return
+	}
+	g.access.Unlock()
 	g.outboundsAccess.Lock()
 	g.snapshotCache = append([]adapter.Outbound(nil), outbounds...)
 	g.outbounds = g.snapshotCache

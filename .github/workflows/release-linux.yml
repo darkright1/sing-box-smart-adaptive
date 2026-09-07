@@ -20,8 +20,11 @@ on:
         type: boolean
         default: true
 
+# Artifact-only manual runs must not receive repository write permission. The
+# release job below opts into contents: write only when publish_release=true or
+# a SemVer tag push invokes it.
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: release-linux-${{ github.ref }}
@@ -194,6 +197,8 @@ jobs:
     name: Publish GitHub Release
     needs: [validate, ebpf]
     if: ${{ github.event_name == 'push' || inputs.publish_release }}
+    permissions:
+      contents: write
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
