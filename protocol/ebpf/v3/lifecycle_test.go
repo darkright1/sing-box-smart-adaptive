@@ -107,7 +107,7 @@ func (m *memSink) PublishStaticDirect(prefixes []netip.Prefix, generation uint32
 	}
 	return nil
 }
-func (m *memSink) MergeStaticDirect(prefix netip.Prefix) error {
+func (m *memSink) MergeDynamicDirect(prefix netip.Prefix, _ time.Duration) error {
 	if prefix.IsValid() {
 		m.merged++
 	}
@@ -288,7 +288,7 @@ func TestLifecycleMergeStaticDirectMirrorsSinkAndModel(t *testing.T) {
 	if sink.merged != 1 {
 		t.Fatalf("sink merges=%d", sink.merged)
 	}
-	if got := lc.Backend().LookupStatic(prefix.Addr(), ebpfv3.ProtocolTCP, 443); got == nil {
+	if got := lc.Backend().LookupDynamicDirect(prefix.Addr(), ebpfv3.ProtocolTCP, 443); got == nil {
 		t.Fatal("memory model did not receive merged policy")
 	}
 }
@@ -428,15 +428,13 @@ func TestLifecycleRevokeMergedStaticDirect(t *testing.T) {
 	if err := lc.MergeStaticDirect(promoted); err != nil {
 		t.Fatal(err)
 	}
-	active := lc.backend.Control.ActiveBank & 1
-	key, _ := ebpfv3.PrefixToLPM4(promoted)
-	if _, ok := lc.backend.Policy4[active][key]; !ok {
+	if got := lc.backend.LookupDynamicDirect(promoted.Addr(), ebpfv3.ProtocolTCP, 443); got == nil {
 		t.Fatal("promoted prefix missing after merge")
 	}
 	if err := lc.RevokeMergedStaticDirect(promoted); err != nil {
 		t.Fatal(err)
 	}
-	if _, ok := lc.backend.Policy4[active][key]; ok {
+	if got := lc.backend.LookupDynamicDirect(promoted.Addr(), ebpfv3.ProtocolTCP, 443); got != nil {
 		t.Fatal("revoked prefix still in memory bank")
 	}
 	if len(sink.revoked) != 1 || sink.revoked[0] != promoted {

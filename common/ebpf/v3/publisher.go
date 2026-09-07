@@ -141,10 +141,10 @@ type MemoryBackend struct {
 	Flows       map[FlowKey]FlowValue
 	DNS         *DNSHintTable
 	MACPolicies map[MACKey]MACPolicyValue
-	// mergedDirects[bank] records prefixes merged into the active bank via
-	// MergeStaticDirect (learn→promote). Only these are revocable through
-	// DeleteMergedStaticDirect; snapshot-published rules are protected.
-	mergedDirects   [2]map[netip.Prefix]struct{}
+	// dynamicDirects records learned prefixes outside the static policy banks.
+	// The memory model mirrors the production map split so tests cannot hide a
+	// static/dynamic capacity or generation regression.
+	dynamicDirects  map[netip.Prefix]time.Time
 	Publisher       *BankPublisher
 	Stats           [StatsCount]uint64
 	flowLimit       int
@@ -163,9 +163,7 @@ func NewMemoryBackend() *MemoryBackend {
 	b.Policy4[1] = make(map[LPM4Key]PolicyValue)
 	b.Policy6[0] = make(map[LPM6Key]PolicyValue)
 	b.Policy6[1] = make(map[LPM6Key]PolicyValue)
-	for bank := range b.mergedDirects {
-		b.mergedDirects[bank] = make(map[netip.Prefix]struct{})
-	}
+	b.dynamicDirects = make(map[netip.Prefix]time.Time)
 	bank, gen := b.Publisher.Snapshot()
 	b.Control = Control{
 		ABIVersion:       ABIVersion,
@@ -226,66 +224,66 @@ func (b *MemoryBackend) PublishStatic(policies []CompiledPolicy) error {
 	gen, bank := b.Publisher.Commit()
 	b.Control.ActiveBank = bank
 	b.Control.PolicyGeneration = gen
-	// The freshly activated bank was rebuilt from the snapshot; promotions
-	// merged into it no longer exist.
-	b.mergedDirects[bank] = make(map[netip.Prefix]struct{})
+	// A generation commit invalidates all learned dynamic rows. They are
+	// represented separately from the static snapshot in the memory model too.
+	clear(b.dynamicDirects)
 	b.invalidateGenerationMaps(gen)
 	b.Stats[25] = uint64(gen) // RELOAD_GENERATION index if aligned — best-effort
 	return nil
 }
 
-// MergeStaticDirect adds one learned DIRECT prefix to the active bank without
-// changing policy_generation. It mirrors the kernel-side DNS/prefill merge so
-// the in-process audit model never silently falls behind the live map.
-func (b *MemoryBackend) MergeStaticDirect(prefix netip.Prefix) error {
+// MergeDynamicDirect adds one learned DIRECT prefix to the separate dynamic
+// map without changing policy_generation. The TTL is checked in the same
+// monotonic time domain as the kernel model.
+func (b *MemoryBackend) MergeDynamicDirect(prefix netip.Prefix, ttl time.Duration) error {
 	if b == nil || b.Publisher == nil {
 		return fmt.Errorf("nil memory backend")
+	}
+	if ttl <= 0 {
+		ttl = 5 * time.Minute
 	}
 	var err error
 	prefix, err = CanonicalPrefix(prefix)
 	if err != nil {
 		return err
 	}
-	active := b.Control.ActiveBank & 1
-	value := PolicyValue{
-		Verdict:    uint8(VerdictDirect),
-		Source:     uint8(SourceStatic),
-		Confidence: ConfidenceStrong,
-		ReasonCode: uint16(ReasonStaticDirect),
-		Generation: b.Control.PolicyGeneration,
-	}
 	addr := prefix.Addr().Unmap()
-	if addr.Is4() {
-		key, err := PrefixToLPM4(prefix)
-		if err != nil {
-			return err
+	expires := time.Now().Add(ttl)
+	now := time.Now()
+	for learnedPrefix, learnedExpiry := range b.dynamicDirects {
+		if !learnedExpiry.After(now) {
+			delete(b.dynamicDirects, learnedPrefix)
 		}
-		if _, ok := b.Policy4[active][key]; ok {
+	}
+	if addr.Is4() {
+		if existing, ok := b.dynamicDirects[prefix]; ok && existing.After(now) {
+			b.dynamicDirects[prefix] = expires
 			return nil
 		}
-		if len(b.Policy4[active]) >= DefaultPolicyLPM {
-			return fmt.Errorf("static policy exceeds eBPF LPM map capacity")
+		if len(b.dynamicDirects) >= DefaultDynamicDirect {
+			return fmt.Errorf("dynamic direct policy exceeds eBPF map capacity")
 		}
-		b.Policy4[active][key] = value
-		b.mergedDirects[active][prefix] = struct{}{}
+		b.dynamicDirects[prefix] = expires
 		return nil
 	}
 	if addr.Is6() {
-		key, err := PrefixToLPM6(prefix)
-		if err != nil {
-			return err
-		}
-		if _, ok := b.Policy6[active][key]; ok {
+		if existing, ok := b.dynamicDirects[prefix]; ok && existing.After(now) {
+			b.dynamicDirects[prefix] = expires
 			return nil
 		}
-		if len(b.Policy6[active]) >= DefaultPolicyLPM {
-			return fmt.Errorf("static policy exceeds eBPF LPM map capacity")
+		if len(b.dynamicDirects) >= DefaultDynamicDirect {
+			return fmt.Errorf("dynamic direct policy exceeds eBPF map capacity")
 		}
-		b.Policy6[active][key] = value
-		b.mergedDirects[active][prefix] = struct{}{}
+		b.dynamicDirects[prefix] = expires
 		return nil
 	}
 	return fmt.Errorf("invalid static prefix family")
+}
+
+// MergeStaticDirect is kept as a source-compatible wrapper for older tests and
+// integrations. New code should pass the RR TTL through MergeDynamicDirect.
+func (b *MemoryBackend) MergeStaticDirect(prefix netip.Prefix) error {
+	return b.MergeDynamicDirect(prefix, 5*time.Minute)
 }
 
 // PublishFlow writes bidirectional flow verdicts.
@@ -441,6 +439,41 @@ func (b *MemoryBackend) LookupStatic(dest netip.Addr, protocol uint8, dport uint
 	return nil
 }
 
+// LookupDynamicDirect mirrors the separate expiring dynamic LPM maps used by
+// the kernel. It is kept distinct from LookupStatic so tests exercise the same
+// precedence and lifetime semantics as tc.bpf.c.
+func (b *MemoryBackend) LookupDynamicDirect(dest netip.Addr, protocol uint8, dport uint16) *PolicyValue {
+	if b == nil || !dest.IsValid() {
+		return nil
+	}
+	dest = dest.Unmap()
+	now := time.Now()
+	var (
+		bestPrefix netip.Prefix
+		bestExpiry time.Time
+	)
+	for prefix, expiry := range b.dynamicDirects {
+		if !expiry.After(now) {
+			delete(b.dynamicDirects, prefix)
+			continue
+		}
+		if !prefix.Contains(dest) || (bestPrefix.IsValid() && prefix.Bits() <= bestPrefix.Bits()) {
+			continue
+		}
+		bestPrefix, bestExpiry = prefix, expiry
+	}
+	if !bestPrefix.IsValid() || !bestExpiry.After(now) {
+		return nil
+	}
+	return &PolicyValue{
+		Verdict:    uint8(VerdictDirect),
+		Source:     uint8(SourceStatic),
+		Confidence: ConfidenceStrong,
+		ReasonCode: uint16(ReasonDNSHintDirect),
+		Generation: b.Control.PolicyGeneration,
+	}
+}
+
 // LookupFlow returns active generation flow.
 func (b *MemoryBackend) LookupFlow(key FlowKey) *FlowValue {
 	v, ok := b.Flows[key]
@@ -479,9 +512,8 @@ func (b *MemoryBackend) PublishMACPolicies(entries []MACPolicyEntry) error {
 	return nil
 }
 
-// DeleteMergedStaticDirect removes one learned/promoted /32|/128 DIRECT from
-// the active bank. Only prefixes recorded by MergeStaticDirect are revocable;
-// snapshot-published rules are protected from accidental removal.
+// DeleteMergedStaticDirect is a compatibility façade for removing one learned
+// dynamic DIRECT row. Snapshot-published rules are never touched.
 func (b *MemoryBackend) DeleteMergedStaticDirect(prefix netip.Prefix) error {
 	if b == nil || b.Publisher == nil {
 		return fmt.Errorf("nil memory backend")
@@ -491,24 +523,9 @@ func (b *MemoryBackend) DeleteMergedStaticDirect(prefix netip.Prefix) error {
 	if err != nil {
 		return err
 	}
-	active := b.Control.ActiveBank & 1
-	if _, revocable := b.mergedDirects[active][prefix]; !revocable {
+	if _, revocable := b.dynamicDirects[prefix]; !revocable {
 		return nil
 	}
-	delete(b.mergedDirects[active], prefix)
-	addr := prefix.Addr().Unmap()
-	if addr.Is4() {
-		key, err := PrefixToLPM4(prefix)
-		if err != nil {
-			return err
-		}
-		delete(b.Policy4[active], key)
-		return nil
-	}
-	key, err := PrefixToLPM6(prefix)
-	if err != nil {
-		return err
-	}
-	delete(b.Policy6[active], key)
+	delete(b.dynamicDirects, prefix)
 	return nil
 }

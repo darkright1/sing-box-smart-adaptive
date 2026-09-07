@@ -246,6 +246,7 @@ type smartUseScore struct {
 type smartRank struct {
 	outbound             adapter.Outbound
 	identity             string
+	dialIdentity         string
 	probeKey             string
 	policyID             uint64
 	selectionGeneration  uint64
@@ -259,14 +260,16 @@ type smartRank struct {
 }
 
 // smartCandidateMetadata is built when providers refresh, not while ranking
-// each new connection. Endpoint identity, probe key, policy id and weight
-// rules are immutable until the candidate catalog changes.
+// each new connection. Path identity/probe key are shared for network probing;
+// dial identity/profile/policy are credential-aware for real data-plane health
+// and retry diversity. These immutable fields change only on catalog refresh.
 type smartCandidateMetadata struct {
-	identity  string
-	profileID string
-	probeKey  string
-	policyID  uint64
-	weight    nodeweight.Match
+	identity     string
+	dialIdentity string
+	profileID    string
+	probeKey     string
+	policyID     uint64
+	weight       nodeweight.Match
 }
 
 // smartEndpointID returns the safe, stable identity exposed by Smart status
@@ -284,24 +287,32 @@ func smartEndpointID(identity string, policyID uint64) string {
 }
 
 func (s *Smart) buildCandidateMetadata(tag, identity string) smartCandidateMetadata {
+	return s.buildCandidateMetadataWithDialIdentity(tag, identity, identity)
+}
+
+func (s *Smart) buildCandidateMetadataWithDialIdentity(tag, identity, dialIdentity string) smartCandidateMetadata {
 	probeIdentity := identity
 	if probeIdentity == "" {
 		probeIdentity = tag
 	}
+	if dialIdentity == "" {
+		dialIdentity = probeIdentity
+	}
 	metadata := smartCandidateMetadata{
-		identity:  probeIdentity,
-		profileID: tag,
-		probeKey:  smartProbeKey(probeIdentity, s.probeURL, s.probeTimeout),
-		weight:    s.nodeWeights.Explain(tag),
+		identity:     probeIdentity,
+		dialIdentity: dialIdentity,
+		profileID:    tag,
+		probeKey:     smartProbeKey(probeIdentity, s.probeURL, s.probeTimeout),
+		weight:       s.nodeWeights.Explain(tag),
 	}
-	if identity != "" && identity != tag {
-		metadata.profileID = "endpoint:" + identity
+	if dialIdentity != "" && dialIdentity != tag {
+		metadata.profileID = "dial:" + dialIdentity
 	}
-	// Every candidate must have a stable policy identity. Provider-backed
-	// candidates use their credential-free EndpointProfile identity so aliases
-	// share one Zig state; static/test candidates use their stable tag and must not be
-	// silently omitted from the Zig-only release path.
-	policyIdentity := metadata.identity
+	// Every candidate must have a stable policy identity. Provider-backed aliases
+	// with the same credential share one Zig state; distinct credentials remain
+	// separate even when they use the same network path. Static/test candidates
+	// use their stable tag and must not be silently omitted from Zig-only builds.
+	policyIdentity := metadata.dialIdentity
 	if identity == "" {
 		// Provider duplicate resolvers append " #deadbeef" or " (2)" to a
 		// display tag. Treat those generated aliases as one policy candidate so
@@ -441,11 +452,19 @@ type Smart struct {
 	providerManagerHandle *list.Element[adapter.ProviderManagerUpdateCallback]
 	outboundsCache        map[string][]adapter.Outbound
 	providerTags          []string
-	exclude               *regexp.Regexp
-	include               *regexp.Regexp
-	manualExclude         *nodefilter.Matcher
-	nodeWeights           *nodeweight.Matcher
-	useAllProviders       bool
+	// providerRebuild* coalesce callback bursts without sacrificing the final
+	// snapshot. A provider may publish several callbacks while its own refresh
+	// is still assembling; only the currently running rebuild is allowed to call
+	// provider code, and a trailing pass always consumes the newest revision.
+	providerRebuildAccess  sync.Mutex
+	providerRebuildRunning bool
+	providerRebuildPending bool
+	providerRebuildTag     string
+	exclude                *regexp.Regexp
+	include                *regexp.Regexp
+	manualExclude          *nodefilter.Matcher
+	nodeWeights            *nodeweight.Matcher
+	useAllProviders        bool
 
 	access                 sync.RWMutex
 	candidates             []adapter.Outbound
@@ -1511,11 +1530,11 @@ func (s *Smart) noteCandidateProbe(candidate string, now time.Time) {
 	if s == nil || candidate == "" {
 		return
 	}
-	profileID := s.candidateProfileID(candidate)
-	if profileID == "" {
-		profileID = candidate
+	probeID := s.candidateProbeIdentity(candidate)
+	if probeID == "" {
+		probeID = candidate
 	}
-	s.noteProbeTimestamp(&s.probeLastAt, profileID, now)
+	s.noteProbeTimestamp(&s.probeLastAt, probeID, now)
 }
 
 // noteUDPCandidateProbe keeps UDP coverage independent from TCP coverage. A
@@ -1525,11 +1544,11 @@ func (s *Smart) noteUDPCandidateProbe(candidate string, now time.Time) {
 	if s == nil || candidate == "" {
 		return
 	}
-	profileID := s.candidateProfileID(candidate)
-	if profileID == "" {
-		profileID = candidate
+	probeID := s.candidateProbeIdentity(candidate)
+	if probeID == "" {
+		probeID = candidate
 	}
-	s.noteProbeTimestamp(&s.udpProbeLastAt, profileID, now)
+	s.noteProbeTimestamp(&s.udpProbeLastAt, probeID, now)
 }
 
 func (s *Smart) noteProbeTimestamp(store *map[string]time.Time, profileID string, now time.Time) {
@@ -1595,15 +1614,20 @@ func (s *Smart) selectProbeCandidates(candidates []adapter.Outbound, budget int)
 	}
 	type probeCandidate struct {
 		candidate adapter.Outbound
+		probeID   string
 		usage     float64
 		lastProbe time.Time
 	}
 	items := make([]probeCandidate, 0, len(candidates))
-	seenProfiles := make(map[string]struct{}, len(candidates))
+	seenProbeIDs := make(map[string]struct{}, len(candidates))
 	now := time.Now()
 	s.access.RLock()
 	for _, candidate := range candidates {
 		metadata := s.candidateMetadataByTag[candidate.Tag()]
+		probeID := metadata.identity
+		if probeID == "" {
+			probeID = candidate.Tag()
+		}
 		profileID := metadata.profileID
 		if profileID == "" {
 			profileID = candidate.Tag()
@@ -1612,12 +1636,12 @@ func (s *Smart) selectProbeCandidates(candidates []adapter.Outbound, budget int)
 		// generated aliases.  The shared registry will single-flight those
 		// aliases, but spending this cycle's budget on duplicates would starve
 		// distinct endpoints from the stale/used rotation.
-		if _, exists := seenProfiles[profileID]; exists {
+		if _, exists := seenProbeIDs[probeID]; exists {
 			continue
 		}
-		seenProfiles[profileID] = struct{}{}
+		seenProbeIDs[probeID] = struct{}{}
 		usage := decayedSmartUseScore(s.useScores[profileID], now)
-		items = append(items, probeCandidate{candidate: candidate, usage: usage, lastProbe: s.probeLastAt[profileID]})
+		items = append(items, probeCandidate{candidate: candidate, probeID: probeID, usage: usage, lastProbe: s.probeLastAt[probeID]})
 	}
 	s.access.RUnlock()
 	used := make([]probeCandidate, 0, len(items))
@@ -1649,17 +1673,17 @@ func (s *Smart) selectProbeCandidates(candidates []adapter.Outbound, budget int)
 	usedBudget := min(len(used), max(1, budget/2))
 	for _, item := range used[:usedBudget] {
 		selected = append(selected, item.candidate)
-		seen[item.candidate.Tag()] = struct{}{}
+		seen[item.probeID] = struct{}{}
 	}
 	for _, item := range items {
 		if len(selected) >= budget {
 			break
 		}
-		if _, exists := seen[item.candidate.Tag()]; exists {
+		if _, exists := seen[item.probeID]; exists {
 			continue
 		}
 		selected = append(selected, item.candidate)
-		seen[item.candidate.Tag()] = struct{}{}
+		seen[item.probeID] = struct{}{}
 	}
 	return selected
 }
@@ -1677,13 +1701,14 @@ func (s *Smart) selectUDPProbeCandidates(candidates []adapter.Outbound, budget i
 	}
 	type udpProbeCandidate struct {
 		candidate adapter.Outbound
+		probeID   string
 		profileID string
 		usage     float64
 		lastProbe time.Time
 		rotation  int
 	}
 	items := make([]udpProbeCandidate, 0, len(candidates))
-	seenProfiles := make(map[string]struct{}, len(candidates))
+	seenProbeIDs := make(map[string]struct{}, len(candidates))
 	now := time.Now()
 	s.access.RLock()
 	for index, candidate := range candidates {
@@ -1691,19 +1716,24 @@ func (s *Smart) selectUDPProbeCandidates(candidates []adapter.Outbound, budget i
 			continue
 		}
 		metadata := s.candidateMetadataByTag[candidate.Tag()]
+		probeID := metadata.identity
+		if probeID == "" {
+			probeID = candidate.Tag()
+		}
 		profileID := metadata.profileID
 		if profileID == "" {
 			profileID = candidate.Tag()
 		}
-		if _, exists := seenProfiles[profileID]; exists {
+		if _, exists := seenProbeIDs[probeID]; exists {
 			continue
 		}
-		seenProfiles[profileID] = struct{}{}
+		seenProbeIDs[probeID] = struct{}{}
 		items = append(items, udpProbeCandidate{
 			candidate: candidate,
+			probeID:   probeID,
 			profileID: profileID,
 			usage:     decayedSmartUseScore(s.useScores[profileID], now),
-			lastProbe: s.udpProbeLastAt[profileID],
+			lastProbe: s.udpProbeLastAt[probeID],
 			rotation:  index,
 		})
 	}
@@ -1751,17 +1781,17 @@ func (s *Smart) selectUDPProbeCandidates(candidates []adapter.Outbound, budget i
 	usedBudget := min(len(used), max(1, budget/2))
 	for _, item := range used[:usedBudget] {
 		selected = append(selected, item.candidate)
-		seen[item.profileID] = struct{}{}
+		seen[item.probeID] = struct{}{}
 	}
 	for _, item := range items {
 		if len(selected) >= budget {
 			break
 		}
-		if _, exists := seen[item.profileID]; exists {
+		if _, exists := seen[item.probeID]; exists {
 			continue
 		}
 		selected = append(selected, item.candidate)
-		seen[item.profileID] = struct{}{}
+		seen[item.probeID] = struct{}{}
 	}
 	s.udpProbeCursor.Add(uint64(len(selected)))
 	return selected
@@ -2258,6 +2288,7 @@ func (s *Smart) collectDialAttempts(ranks []smartRank, networkKey, siteKey, tran
 		maxAttempts = defaultSmartMaxAttempts
 	}
 	attempts := make([]smartDialAttempt, 0, min(maxAttempts, len(ranks)))
+	seenDialIdentities := make(map[string]struct{}, len(ranks))
 	for rankIndex := range ranks {
 		if len(attempts) >= maxAttempts {
 			break
@@ -2266,6 +2297,22 @@ func (s *Smart) collectDialAttempts(ranks []smartRank, networkKey, siteKey, tran
 		if !rank.eligible || rank.status.State == "open" {
 			continue
 		}
+		// A provider aggregate may expose one physical path under multiple
+		// aliases. Retry/hedge diversity is about authenticated dial identities,
+		// not display tags; never spend two attempts on the same credentialed
+		// endpoint. Different credentials remain eligible because their dial
+		// identities are distinct from the shared probe identity.
+		dialIdentity := rank.dialIdentity
+		if dialIdentity == "" {
+			dialIdentity = rank.identity
+		}
+		if dialIdentity == "" && rank.outbound != nil {
+			dialIdentity = rank.outbound.Tag()
+		}
+		if _, exists := seenDialIdentities[dialIdentity]; exists {
+			continue
+		}
+		seenDialIdentities[dialIdentity] = struct{}{}
 		reserved := s.reserveHalfOpen(rank, networkKey, siteKey, transport)
 		if rank.status.State == "half_open" && !reserved {
 			continue
@@ -3189,14 +3236,14 @@ func (s *Smart) probeUDPWithBudget(ctx context.Context, candidates []adapter.Out
 		return
 	}
 	udpCandidates := make([]adapter.Outbound, 0, len(candidates))
-	seenUDPProfiles := make(map[string]struct{}, len(candidates))
+	seenUDPProbeIDs := make(map[string]struct{}, len(candidates))
 	for _, candidate := range candidates {
 		if common.Contains(candidate.Network(), N.NetworkUDP) {
-			profileID := s.candidateProfileID(candidate.Tag())
-			if _, exists := seenUDPProfiles[profileID]; exists {
+			probeID := s.candidateProbeIdentity(candidate.Tag())
+			if _, exists := seenUDPProbeIDs[probeID]; exists {
 				continue
 			}
-			seenUDPProfiles[profileID] = struct{}{}
+			seenUDPProbeIDs[probeID] = struct{}{}
 			udpCandidates = append(udpCandidates, candidate)
 		}
 	}
@@ -3496,11 +3543,10 @@ func (s *Smart) observeMetricForTransport(network, site, candidate, aggregateTra
 	}
 }
 
-// candidateProfileID maps provider display tags to the canonical endpoint
-// identity. Subscription copies such as "JP 1" and "JP 2" therefore share
-// one health portrait in the Go store as well as in the Zig policy backend.
-// A tag is retained as the fallback for embedded/test candidates without a
-// probe identity.
+// candidateProfileID maps provider display tags to the credential-aware dial
+// profile. Subscription aliases with the same credential share one portrait;
+// accounts on the same path stay isolated for authentication/data-plane
+// failures. A tag is retained as the fallback for embedded/test candidates.
 func (s *Smart) candidateProfileID(candidate string) string {
 	if s == nil || candidate == "" {
 		return candidate
@@ -3512,6 +3558,24 @@ func (s *Smart) candidateProfileID(candidate string) string {
 		return candidate
 	}
 	return metadata.profileID
+}
+
+// candidateProbeIdentity is the credential-free path key used by the bounded
+// TCP/UDP probe schedulers. Probes answer a network-path question, so aliases
+// with different credentials must consume one probe slot and one probe
+// timestamp. Data-plane observations and breaker state use candidateProfileID
+// instead, which is credential-aware.
+func (s *Smart) candidateProbeIdentity(candidate string) string {
+	if s == nil || candidate == "" {
+		return candidate
+	}
+	s.access.RLock()
+	metadata := s.candidateMetadataByTag[candidate]
+	s.access.RUnlock()
+	if metadata.identity != "" {
+		return metadata.identity
+	}
+	return candidate
 }
 
 func (s *Smart) rankPooled(ctx context.Context, transport string, destination M.Socksaddr) (*smartRanking, string, string, string) {
@@ -3596,6 +3660,7 @@ func (s *Smart) rankPooled(ctx context.Context, transport string, destination M.
 		ranking.ranks = append(ranking.ranks, smartRank{
 			outbound:            candidate,
 			identity:            metadata.identity,
+			dialIdentity:        metadata.dialIdentity,
 			probeKey:            metadata.probeKey,
 			policyID:            metadata.policyID,
 			selectionGeneration: ranking.snapshotGeneration,
@@ -3789,7 +3854,7 @@ func (s *Smart) rankPooled(ctx context.Context, transport string, destination M.
 					currentIndex := smartRankIndex(ranks, lastSelected)
 					if currentIndex >= 0 && currentIndex == selectedIndex {
 						for index := range ranks {
-							if index != currentIndex && smartEquivalentLine(ranks[currentIndex].outbound.Tag(), ranks[index].outbound.Tag()) {
+							if index != currentIndex && smartSameEndpoint(metadataByTag, ranks[currentIndex].outbound.Tag(), ranks[index].outbound.Tag()) {
 								equivalentRetained = true
 								break
 							}
@@ -3887,7 +3952,7 @@ func (s *Smart) rankPooled(ctx context.Context, transport string, destination M.
 			switch {
 			case current == bestCandidate:
 				s.clearSwitchChallenge(selectionKey)
-			case smartEquivalentLine(current, bestCandidate):
+			case smartSameEndpoint(metadataByTag, current, bestCandidate):
 				s.clearSwitchChallenge(selectionKey)
 				switchReason = "equivalent subscription line retained"
 				switchStatusReason = "healthy equivalent line retained"
@@ -4133,9 +4198,7 @@ func smartSameEndpoint(metadataByTag map[string]smartCandidateMetadata, left, ri
 	leftMetadata, leftFound := metadataByTag[left]
 	rightMetadata, rightFound := metadataByTag[right]
 	if leftFound && rightFound {
-		if smartMetadataSameEndpoint(leftMetadata, rightMetadata) {
-			return true
-		}
+		return smartMetadataSameEndpoint(leftMetadata, rightMetadata)
 	}
 	return smartEquivalentLine(left, right)
 }
@@ -4161,11 +4224,18 @@ func smartRemapCandidateAlias(tag string, oldMetadataByTag, newMetadataByTag map
 }
 
 func smartMetadataSameEndpoint(left, right smartCandidateMetadata) bool {
-	if left.policyID != 0 && left.policyID == right.policyID {
-		return true
+	// Policy/profile IDs are dial identities. If either side has one, compare
+	// only that namespace; falling back to the credential-free path identity
+	// here would incorrectly merge two accounts that share a server but have
+	// different authentication or service entitlements.
+	if left.policyID != 0 || right.policyID != 0 {
+		return left.policyID != 0 && left.policyID == right.policyID
 	}
 	if left.profileID != "" && left.profileID == right.profileID {
 		return true
+	}
+	if left.dialIdentity != "" || right.dialIdentity != "" {
+		return left.dialIdentity != "" && left.dialIdentity == right.dialIdentity
 	}
 	return left.identity != "" && left.identity == right.identity
 }
@@ -4778,12 +4848,41 @@ func (s *Smart) onProviderUpdated(tag string) error {
 	if !loaded {
 		return E.New("outbound provider not found: ", tag)
 	}
-	err := s.rebuildCandidates(tag)
-	if err == nil && !s.closing.Load() {
-		// Providers commonly publish after PostStart.  The cold-start probe may
-		// therefore have observed an empty catalog; do not leave a traffic-idle
-		// group unprofiled until the next periodic interval.
-		s.requestProbe()
+	// Coalesce re-entrant/concurrent provider callbacks. The first caller owns
+	// the rebuild loop; later callbacks only mark a trailing pass and return.
+	s.providerRebuildAccess.Lock()
+	if s.providerRebuildRunning {
+		s.providerRebuildPending = true
+		if tag != "" {
+			s.providerRebuildTag = tag
+		}
+		s.providerRebuildAccess.Unlock()
+		return nil
+	}
+	s.providerRebuildRunning = true
+	s.providerRebuildAccess.Unlock()
+
+	err := error(nil)
+	for {
+		err = s.rebuildCandidates(tag)
+		if err == nil && !s.closing.Load() {
+			// Providers commonly publish after PostStart. The cold-start probe may
+			// therefore have observed an empty catalog; do not leave a traffic-idle
+			// group unprofiled until the next periodic interval.
+			s.requestProbe()
+		}
+		s.providerRebuildAccess.Lock()
+		if !s.providerRebuildPending || s.closing.Load() {
+			s.providerRebuildRunning = false
+			s.providerRebuildPending = false
+			s.providerRebuildTag = ""
+			s.providerRebuildAccess.Unlock()
+			break
+		}
+		tag = s.providerRebuildTag
+		s.providerRebuildTag = ""
+		s.providerRebuildPending = false
+		s.providerRebuildAccess.Unlock()
 	}
 	if errors.Is(err, errSmartNoCandidates) && !s.closing.Load() {
 		s.setWarmingStatus("provider " + tag + " has no matching candidates")
@@ -4795,9 +4894,6 @@ func (s *Smart) onProviderUpdated(tag string) error {
 }
 
 func (s *Smart) rebuildCandidates(updatedProvider string) error {
-	if s.closing.Load() {
-		return nil
-	}
 	if s.closing.Load() {
 		return nil
 	}
@@ -4893,20 +4989,36 @@ func (s *Smart) rebuildCandidates(updatedProvider string) error {
 	if len(candidates) == 0 {
 		return errSmartNoCandidates
 	}
-	candidateByTag := make(map[string]adapter.Outbound, len(candidates))
-	candidateMetadataByTag := make(map[string]smartCandidateMetadata, len(candidates))
-	keepProfiles := make(map[string]struct{}, len(candidates))
-	keepPolicyIDs := make([]uint64, 0, len(candidates))
-	seenPolicyIDs := make(map[uint64]struct{}, len(candidates))
+	allMetadataByTag := make(map[string]smartCandidateMetadata, len(candidates))
 	// probeIdentityLocked reads the provider map. Keep the lock only around the
 	// identity snapshot; all provider-owned Outbounds calls above are lock-free.
 	s.providerAccess.Lock()
 	for _, candidate := range candidates {
 		tag := candidate.Tag()
 		identity := s.probeIdentityLocked(candidate)
+		dialIdentity := s.dialIdentityLocked(candidate)
+		metadata := s.buildCandidateMetadataWithDialIdentity(tag, identity, dialIdentity)
+		allMetadataByTag[tag] = metadata
+	}
+	s.providerAccess.Unlock()
+
+	// A provider aggregate can expose one authenticated endpoint through
+	// several aliases.  Keep aliases available to selector/url-test, but Smart
+	// must model routing diversity: one DialIdentity is one candidate.  Pick the
+	// lexicographically smallest display tag so provider refresh order cannot
+	// move the health profile or the active choice between aliases.
+	candidates, candidateMetadataByTag := dedupeSmartCandidates(candidates, allMetadataByTag)
+	if len(candidates) == 0 {
+		return errSmartNoCandidates
+	}
+	candidateByTag := make(map[string]adapter.Outbound, len(candidates))
+	keepProfiles := make(map[string]struct{}, len(candidates))
+	keepPolicyIDs := make([]uint64, 0, len(candidates))
+	seenPolicyIDs := make(map[uint64]struct{}, len(candidates))
+	for _, candidate := range candidates {
+		tag := candidate.Tag()
+		metadata := candidateMetadataByTag[tag]
 		candidateByTag[tag] = candidate
-		metadata := s.buildCandidateMetadata(tag, identity)
-		candidateMetadataByTag[tag] = metadata
 		if metadata.profileID != "" {
 			keepProfiles[metadata.profileID] = struct{}{}
 		}
@@ -4917,7 +5029,6 @@ func (s *Smart) rebuildCandidates(updatedProvider string) error {
 			}
 		}
 	}
-	s.providerAccess.Unlock()
 	// Close can begin after the provider snapshot above. Check before and after
 	// taking the catalog lock so a late callback cannot repopulate a retired
 	// Smart group after Close has cleared its candidates.
@@ -5019,6 +5130,43 @@ func (s *Smart) flattenCandidate(candidate adapter.Outbound, stack, seen map[str
 	}
 	seen[tag] = true
 	*destination = append(*destination, candidate)
+}
+
+func dedupeSmartCandidates(candidates []adapter.Outbound, metadataByTag map[string]smartCandidateMetadata) ([]adapter.Outbound, map[string]smartCandidateMetadata) {
+	if len(candidates) <= 1 {
+		return candidates, metadataByTag
+	}
+	keyFor := func(candidate adapter.Outbound) string {
+		if candidate == nil {
+			return ""
+		}
+		metadata := metadataByTag[candidate.Tag()]
+		if metadata.dialIdentity != "" {
+			return "dial:" + metadata.dialIdentity
+		}
+		if metadata.identity != "" {
+			return "path:" + metadata.identity
+		}
+		return "tag:" + candidate.Tag()
+	}
+	winner := make(map[string]string, len(candidates))
+	for _, candidate := range candidates {
+		key := keyFor(candidate)
+		if previous, exists := winner[key]; !exists || candidate.Tag() < previous {
+			winner[key] = candidate.Tag()
+		}
+	}
+	selected := make([]adapter.Outbound, 0, len(winner))
+	selectedMetadata := make(map[string]smartCandidateMetadata, len(winner))
+	for _, candidate := range candidates {
+		key := keyFor(candidate)
+		if winner[key] != candidate.Tag() {
+			continue
+		}
+		selected = append(selected, candidate)
+		selectedMetadata[candidate.Tag()] = metadataByTag[candidate.Tag()]
+	}
+	return selected, selectedMetadata
 }
 
 func (s *Smart) networkFingerprint() string {

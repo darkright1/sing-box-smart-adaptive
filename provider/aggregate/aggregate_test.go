@@ -34,6 +34,8 @@ type testProvider struct {
 	tag       string
 	members   []adapter.Outbound
 	updatedAt time.Time
+	health    map[string]uint16
+	healthErr error
 	callbacks list.List[adapter.ProviderUpdateCallback]
 }
 
@@ -52,7 +54,10 @@ func (p *testProvider) Outbound(tag string) (adapter.Outbound, bool) {
 }
 func (p *testProvider) UpdatedAt() time.Time { return p.updatedAt }
 func (p *testProvider) HealthCheck(context.Context) (map[string]uint16, error) {
-	return nil, nil
+	if p.healthErr != nil {
+		return nil, p.healthErr
+	}
+	return p.health, nil
 }
 func (p *testProvider) RegisterCallback(callback adapter.ProviderUpdateCallback) *list.Element[adapter.ProviderUpdateCallback] {
 	return p.callbacks.PushBack(callback)
@@ -159,4 +164,79 @@ func TestAggregateProviderRejectsNestedAggregates(t *testing.T) {
 	if _, ok := children[leaf.tag]; !ok {
 		t.Fatal("use_all_providers dropped a leaf provider")
 	}
+}
+
+func TestAggregateProviderHealthCheckPreservesDuplicateTags(t *testing.T) {
+	first := &testProvider{
+		tag:     "airport-a",
+		members: []adapter.Outbound{newTestOutbound("HK")},
+		health:  map[string]uint16{"HK": 30},
+	}
+	second := &testProvider{
+		tag:     "airport-b",
+		members: []adapter.Outbound{newTestOutbound("HK"), newTestOutbound("US")},
+		health:  map[string]uint16{"HK": 180, "US": 90},
+	}
+	manager := &testManager{providers: []adapter.Provider{first, second}}
+	aggregate := &Provider{
+		manager:        manager,
+		tag:            "all-airports",
+		configuredTags: []string{"airport-a", "airport-b"},
+		children:       make(map[string]adapter.Provider),
+		childHandles:   make(map[string]*list.Element[adapter.ProviderUpdateCallback]),
+		memberByTag:    make(map[string]adapter.Outbound),
+	}
+	if err := aggregate.StartContext(context.Background(), nil); err != nil {
+		t.Fatal(err)
+	}
+	checks, err := aggregate.HealthCheck(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]uint16{"HK": 30, "HK #2": 180, "US": 90}
+	if len(checks) != len(want) {
+		t.Fatalf("health entries=%d, want %d: %#v", len(checks), len(want), checks)
+	}
+	for tag, delay := range want {
+		if checks[tag] != delay {
+			t.Fatalf("health[%q]=%d, want %d: %#v", tag, checks[tag], delay, checks)
+		}
+	}
+	_ = aggregate.Close()
+}
+
+func TestAggregateProviderHealthCheckReturnsPartialResults(t *testing.T) {
+	first := &testProvider{
+		tag:     "airport-a",
+		members: []adapter.Outbound{newTestOutbound("HK")},
+		health:  map[string]uint16{"HK": 30},
+	}
+	second := &testProvider{
+		tag:       "airport-b",
+		members:   []adapter.Outbound{newTestOutbound("US")},
+		healthErr: errors.New("probe failed"),
+	}
+	manager := &testManager{providers: []adapter.Provider{first, second}}
+	aggregate := &Provider{
+		manager:        manager,
+		tag:            "all-airports",
+		configuredTags: []string{"airport-a", "airport-b"},
+		children:       make(map[string]adapter.Provider),
+		childHandles:   make(map[string]*list.Element[adapter.ProviderUpdateCallback]),
+		memberByTag:    make(map[string]adapter.Outbound),
+	}
+	if err := aggregate.StartContext(context.Background(), nil); err != nil {
+		t.Fatal(err)
+	}
+	checks, err := aggregate.HealthCheck(context.Background())
+	if err == nil {
+		t.Fatal("expected partial health-check error")
+	}
+	if checks["HK"] != 30 {
+		t.Fatalf("partial health result lost healthy child: %#v", checks)
+	}
+	if checks["US"] != 0 {
+		t.Fatalf("failed child must not publish a synthetic result: %#v", checks)
+	}
+	_ = aggregate.Close()
 }

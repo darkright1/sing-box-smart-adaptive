@@ -60,6 +60,8 @@ static int v3_load_programs(
 	entries[n++] = (struct sb_ebpf_object_map_entry){"v3_policy4_bank1", runtime->policy4_bank1_fd};
 	entries[n++] = (struct sb_ebpf_object_map_entry){"v3_policy6_bank0", runtime->policy6_bank0_fd};
 	entries[n++] = (struct sb_ebpf_object_map_entry){"v3_policy6_bank1", runtime->policy6_bank1_fd};
+	entries[n++] = (struct sb_ebpf_object_map_entry){"v3_dynamic_direct4", runtime->dynamic_direct4_fd};
+	entries[n++] = (struct sb_ebpf_object_map_entry){"v3_dynamic_direct6", runtime->dynamic_direct6_fd};
 	entries[n++] = (struct sb_ebpf_object_map_entry){"v3_host4", runtime->host4_map_fd};
 	entries[n++] = (struct sb_ebpf_object_map_entry){"v3_host6", runtime->host6_map_fd};
 	entries[n++] = (struct sb_ebpf_object_map_entry){"v3_flow_verdict", runtime->flow_map_fd};
@@ -129,6 +131,15 @@ int sb_ebpf_v3_prepare(
 		v3_create_lpm6(policy_lpm_entries, sizeof(struct sb_v3_policy_value));
 	runtime->policy6_bank1_fd =
 		v3_create_lpm6(policy_lpm_entries, sizeof(struct sb_v3_policy_value));
+	stage = "create dynamic direct maps";
+	runtime->dynamic_direct4_fd =
+		sb_ebpf_create_map(BPF_MAP_TYPE_LPM_TRIE, sizeof(struct sb_v3_lpm4_key),
+				   sizeof(struct sb_v3_dynamic_direct_value), SB_V3_DEFAULT_DYNAMIC_DIRECT_ENTRIES,
+				   BPF_F_NO_PREALLOC);
+	runtime->dynamic_direct6_fd =
+		sb_ebpf_create_map(BPF_MAP_TYPE_LPM_TRIE, sizeof(struct sb_v3_lpm6_key),
+				   sizeof(struct sb_v3_dynamic_direct_value), SB_V3_DEFAULT_DYNAMIC_DIRECT_ENTRIES,
+				   BPF_F_NO_PREALLOC);
 	stage = "create host maps";
 	runtime->host4_map_fd = v3_create_lpm4(1024U, sizeof(uint8_t));
 	runtime->host6_map_fd = v3_create_lpm6(1024U, sizeof(uint8_t));
@@ -184,7 +195,8 @@ int sb_ebpf_v3_prepare(
 
 	if (runtime->control_map_fd < 0 || runtime->policy4_bank0_fd < 0 ||
 	    runtime->policy4_bank1_fd < 0 || runtime->policy6_bank0_fd < 0 ||
-	    runtime->policy6_bank1_fd < 0 || runtime->host4_map_fd < 0 ||
+	    runtime->policy6_bank1_fd < 0 || runtime->dynamic_direct4_fd < 0 ||
+	    runtime->dynamic_direct6_fd < 0 || runtime->host4_map_fd < 0 ||
 	    runtime->host6_map_fd < 0 || runtime->flow_map_fd < 0 ||
 	    runtime->dns_hint_map_fd < 0 || runtime->dns_observe_map_fd < 0 || runtime->source_mac_map_fd < 0 ||
 	    runtime->redirect_map_fd < 0 || runtime->listener_map_fd < 0 ||
@@ -228,6 +240,8 @@ int sb_ebpf_v3_close(struct sb_ebpf_v3_runtime *runtime) {
 	CLOSE_V3(runtime->host4_map_fd);
 	CLOSE_V3(runtime->policy6_bank1_fd);
 	CLOSE_V3(runtime->policy6_bank0_fd);
+	CLOSE_V3(runtime->dynamic_direct6_fd);
+	CLOSE_V3(runtime->dynamic_direct4_fd);
 	CLOSE_V3(runtime->policy4_bank1_fd);
 	CLOSE_V3(runtime->policy4_bank0_fd);
 	CLOSE_V3(runtime->control_map_fd);

@@ -35,21 +35,20 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq clang llvm make linux-libc-dev
-      - name: Verify committed v2 provenance before generation
+      - name: Verify generated eBPF provenance
         working-directory: common/ebpf
         run: |
           set -euo pipefail
-          # Check the object that a plain `go build`/`go install` would embed
-          # before generation can replace it.  This is the actual stale-object
-          # gate; running it after `make generate` only proves compiler
-          # determinism and would miss a committed artifact drift.
-          make check-v2-source
-      - name: Generate and validate v2/v3 objects
-        working-directory: common/ebpf
-        run: |
-          set -euo pipefail
+          # Objects are generated on Linux because macOS cannot build the BPF
+          # target.  The source-hash checks below run after generation and the
+          # resulting objects are uploaded for the source tree when needed.
           make generate
           make check-v2-source
+          make check-v3-source
+      - name: Validate generated v2/v3 objects
+        working-directory: common/ebpf
+        run: |
+          set -euo pipefail
           test -s native/shared_network_v2.bpf.o
           test -s v3/kern/tc.bpf.o
           readelf -S v3/kern/tc.bpf.o | grep -E '(\.maps|\.BTF|\.BTF\.ext|classifier/ingress|\.sb\.source)'
@@ -59,8 +58,10 @@ jobs:
       - name: Publish regenerated object
         uses: actions/upload-artifact@v4
         with:
-          name: v1.14.0-v2-ebpf-object
-          path: common/ebpf/native/shared_network_v2.bpf.o
+          name: v1.14.0-ebpf-objects
+          path: |
+            common/ebpf/native/shared_network_v2.bpf.o
+            common/ebpf/v3/kern/tc.bpf.o
           if-no-files-found: error
 
   go-regression:

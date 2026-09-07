@@ -105,6 +105,7 @@ const (
 	DefaultFlowEntries    = 8192
 	DefaultDNSHints       = 8192
 	DefaultPolicyLPM      = 16384
+	DefaultDynamicDirect  = 8192
 	MaxFlowEntries        = 65536
 	MaxDNSHints           = 32768
 	MaxDNSObservations    = 4096

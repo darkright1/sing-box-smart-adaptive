@@ -70,6 +70,13 @@ func (l *Lifecycle) SyncPolicyGeneration(generation uint32) {
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	l.syncPolicyGenerationLocked(generation)
+}
+
+func (l *Lifecycle) syncPolicyGenerationLocked(generation uint32) {
+	if l == nil || generation == 0 {
+		return
+	}
 	if l.backend != nil {
 		if current := l.backend.Control.PolicyGeneration; current != 0 && generation < current {
 			return
@@ -205,7 +212,7 @@ func (l *Lifecycle) PublishStaticRules(inputs []ebpfv3.CompileInput) (accepted i
 		// The kernel bank already committed a new generation; realign the
 		// memory model to it so the next publish cannot diverge permanently.
 		if l.sink != nil {
-			l.SyncPolicyGeneration(l.sink.PolicyGeneration())
+			l.syncPolicyGenerationLocked(l.sink.PolicyGeneration())
 		}
 		return 0, 0, err
 	}
@@ -279,38 +286,43 @@ func (l *Lifecycle) PublishStaticDirect(prefixes []netip.Prefix) error {
 		// Kernel generation moved ahead of the model; resync or the gap is
 		// permanent (each side increments from its own counter).
 		if l.sink != nil {
-			l.SyncPolicyGeneration(l.sink.PolicyGeneration())
+			l.syncPolicyGenerationLocked(l.sink.PolicyGeneration())
 		}
 		return err
 	}
 	return nil
 }
 
-// MergeStaticDirect publishes one learned DIRECT prefix to the active bank
-// while keeping the kernel sink and in-process model in lockstep. It is a
-// no-op when static policy offload is disabled because the TC program would
-// not consult the policy bank in that mode.
-func (l *Lifecycle) MergeStaticDirect(prefix netip.Prefix) error {
+// MergeDynamicDirect publishes one learned DIRECT prefix to the expiring
+// dynamic map while keeping the kernel sink and in-process model in lockstep.
+func (l *Lifecycle) MergeDynamicDirect(prefix netip.Prefix, ttl time.Duration) error {
 	if l == nil || l.backend == nil {
 		return fmt.Errorf("nil lifecycle")
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	if !l.options.PolicyOffload.Enabled || !l.options.PolicyOffload.StaticRules {
+	if !l.options.PolicyOffload.Enabled {
 		return nil
 	}
 	if l.sink != nil {
-		if err := l.sink.MergeStaticDirect(prefix); err != nil {
+		if err := l.sink.MergeDynamicDirect(prefix, ttl); err != nil {
 			return err
 		}
 	}
-	if err := l.backend.MergeStaticDirect(prefix); err != nil {
+	if err := l.backend.MergeDynamicDirect(prefix, ttl); err != nil {
 		if l.sink != nil {
-			l.SyncPolicyGeneration(l.sink.PolicyGeneration())
+			l.syncPolicyGenerationLocked(l.sink.PolicyGeneration())
 		}
 		return err
 	}
 	return nil
+}
+
+// MergeStaticDirect is retained for source compatibility with older control
+// callers. It uses the same dynamic implementation with the historical
+// default TTL; new callers should use MergeDynamicDirect.
+func (l *Lifecycle) MergeStaticDirect(prefix netip.Prefix) error {
+	return l.MergeDynamicDirect(prefix, 5*time.Minute)
 }
 
 // RevokeMergedStaticDirect removes one learned/promoted DIRECT prefix from

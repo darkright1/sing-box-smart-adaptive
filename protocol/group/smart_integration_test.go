@@ -913,6 +913,25 @@ func TestSmartUnstartedHalfOpenAttemptReleasesReservation(t *testing.T) {
 	}
 }
 
+func TestSmartDialAttemptsDeduplicatePathAliasesButKeepCredentialVariants(t *testing.T) {
+	first := newSmartFakeOutbound("airport/HK", nil)
+	alias := newSmartFakeOutbound("airport/HK #2", nil)
+	credentialVariant := newSmartFakeOutbound("airport/HK #3", nil)
+	smart := newTestSmart(first, alias, credentialVariant)
+	ranks := []smartRank{
+		{outbound: first, identity: "path:hk", dialIdentity: "dial:credential-a", eligible: true, status: adapter.SmartCandidateStatus{State: "healthy"}},
+		{outbound: alias, identity: "path:hk", dialIdentity: "dial:credential-a", eligible: true, status: adapter.SmartCandidateStatus{State: "healthy"}},
+		{outbound: credentialVariant, identity: "path:hk", dialIdentity: "dial:credential-b", eligible: true, status: adapter.SmartCandidateStatus{State: "healthy"}},
+	}
+	attempts := smart.collectDialAttempts(ranks, "network", "site", N.NetworkTCP)
+	if len(attempts) != 2 {
+		t.Fatalf("attempts=%d, want 2 distinct dial identities", len(attempts))
+	}
+	if attempts[0].candidate.Tag() != first.Tag() || attempts[1].candidate.Tag() != credentialVariant.Tag() {
+		t.Fatalf("attempt order=%q,%q, want first alias then credential variant", attempts[0].candidate.Tag(), attempts[1].candidate.Tag())
+	}
+}
+
 func TestSmartSiteAffinityPreventsMinorOscillation(t *testing.T) {
 	first := newSmartFakeOutbound("first", nil)
 	second := newSmartFakeOutbound("second", nil)

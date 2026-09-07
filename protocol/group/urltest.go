@@ -914,25 +914,32 @@ func (b *urlTestBatch) test(outbounds []adapter.Outbound, link string, interval 
 func (g *URLTestGroup) replaceOutbounds(outbounds []adapter.Outbound) {
 	g.access.Lock()
 	g.outbounds = append([]adapter.Outbound(nil), outbounds...)
-	valid := make(map[string]struct{}, len(outbounds))
-	for _, detour := range outbounds {
-		if detour != nil {
-			valid[detour.Tag()] = struct{}{}
-		}
-	}
 	g.selectionAccess.Lock()
-	if g.selectedOutboundTCP != nil {
-		if _, ok := valid[g.selectedOutboundTCP.Tag()]; !ok {
-			g.selectedOutboundTCP = nil
-		}
-	}
-	if g.selectedOutboundUDP != nil {
-		if _, ok := valid[g.selectedOutboundUDP.Tag()]; !ok {
-			g.selectedOutboundUDP = nil
-		}
-	}
+	g.selectedOutboundTCP = remapGroupSelection(g.selectedOutboundTCP, outbounds)
+	g.selectedOutboundUDP = remapGroupSelection(g.selectedOutboundUDP, outbounds)
 	g.selectionAccess.Unlock()
 	g.access.Unlock()
+}
+
+func remapGroupSelection(selected adapter.Outbound, outbounds []adapter.Outbound) adapter.Outbound {
+	if selected == nil {
+		return nil
+	}
+	// Prefer the same display tag only when it still identifies the same
+	// endpoint. A provider can reuse a suffix for a different node after a
+	// refresh, so tag equality alone is not safe.
+	for _, candidate := range outbounds {
+		if candidate != nil && candidate.Tag() == selected.Tag() && sameOutboundIdentity(selected, candidate) {
+			return candidate
+		}
+	}
+	// If the suffix changed, keep the selection attached to the same endpoint.
+	for _, candidate := range outbounds {
+		if sameOutboundIdentity(selected, candidate) {
+			return candidate
+		}
+	}
+	return nil
 }
 
 func (g *URLTestGroup) performUpdateCheck() {

@@ -200,6 +200,16 @@ type OutboundWithEndpointIdentity interface {
 	EndpointIdentity() string
 }
 
+// OutboundWithDialIdentity carries the identity that must remain distinct for
+// actual authentication/data-plane outcomes.  It may differ from
+// EndpointIdentity when two credentials share the same network path.  Probe
+// and RTT state can share the endpoint identity, while dial success, breaker,
+// quarantine and retry diversity use this stronger identity.
+type OutboundWithDialIdentity interface {
+	Outbound
+	DialIdentity() string
+}
+
 // DirectOffloadHub fans out NoteRoutedDirect to all eBPF inbounds that registered.
 type DirectOffloadHub struct {
 	access   sync.Mutex

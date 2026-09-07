@@ -124,6 +124,25 @@ func newTestProviderSource(t *testing.T, options option.GroupCommonOption) (*gro
 	return source, manager
 }
 
+type providerDialTestNode struct {
+	providerTestNode
+	dialIdentity string
+}
+
+func (n *providerDialTestNode) DialIdentity() string { return n.dialIdentity }
+
+func TestSameOutboundIdentityPrefersDialIdentity(t *testing.T) {
+	old := &providerDialTestNode{providerTestNode: providerTestNode{tag: "HK #2", identity: "path"}, dialIdentity: "dial-a"}
+	newAlias := &providerDialTestNode{providerTestNode: providerTestNode{tag: "HK", identity: "path"}, dialIdentity: "dial-a"}
+	otherCredential := &providerDialTestNode{providerTestNode: providerTestNode{tag: "HK", identity: "path"}, dialIdentity: "dial-b"}
+	if !sameOutboundIdentity(old, newAlias) {
+		t.Fatal("same dial identity must survive a display-tag rename")
+	}
+	if sameOutboundIdentity(old, otherCredential) {
+		t.Fatal("different dial identities must not share a selected endpoint")
+	}
+}
+
 func mustRegex(t *testing.T, expr string) *badoption.Regexp {
 	t.Helper()
 	return (*badoption.Regexp)(regexp.MustCompile(expr))

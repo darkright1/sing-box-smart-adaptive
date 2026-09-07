@@ -2,24 +2,43 @@ package parser
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"reflect"
+	"strings"
 	"sync"
 
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/option"
 	"github.com/sagernet/sing/common"
 	E "github.com/sagernet/sing/common/exceptions"
+	"github.com/sagernet/sing/service"
 )
 
-var subscriptionParsers = []func(ctx context.Context, content string) ([]option.Outbound, []option.Endpoint, error){
-	ParseBoxSubscription,
-	ParseClashSubscription,
-	ParseSIP008Subscription,
-	ParseRawSubscription,
+type subscriptionParser struct {
+	name  string
+	parse func(context.Context, string) ([]option.Outbound, []option.Endpoint, error)
+}
+
+type providerTagContextKey struct{}
+
+func providerTagFromContext(ctx context.Context) string {
+	if ctx == nil {
+		return ""
+	}
+	providerTag, _ := ctx.Value(providerTagContextKey{}).(string)
+	return providerTag
+}
+
+var subscriptionParsers = []subscriptionParser{
+	{name: "sing-box", parse: ParseBoxSubscription},
+	{name: "clash", parse: ParseClashSubscription},
+	{name: "sip008", parse: ParseSIP008Subscription},
+	{name: "raw", parse: ParseRawSubscription},
 }
 
 var ignoredProviderFieldOnce sync.Map
+var ignoredProviderMemberOnce sync.Map
 
 func warnIgnoredProviderField(field, reason string) {
 	key := field + "|" + reason
@@ -29,17 +48,146 @@ func warnIgnoredProviderField(field, reason string) {
 	log.Printf("provider: ignoring unsupported field %q (%s)", field, reason)
 }
 
+// warnIgnoredProviderMember deliberately logs only protocol metadata. Provider
+// options can contain credentials and signed URLs, so never include the raw
+// object or source line in this diagnostic.
+func warnIgnoredProviderMember(providerTag, kind string, index int, tag, protocol string, reason error) {
+	providerTag = safeProviderText(providerTag)
+	tag = safeProviderText(tag)
+	protocol = safeProviderText(protocol)
+	message := "invalid member"
+	if reason != nil {
+		message = safeProviderText(reason.Error())
+	}
+	key := providerTag + "|" + kind + "|" + fmt.Sprint(index) + "|" + tag + "|" + protocol + "|" + message
+	if _, loaded := ignoredProviderMemberOnce.LoadOrStore(key, struct{}{}); loaded {
+		return
+	}
+	if providerTag == "" {
+		log.Printf("provider: ignoring %s[%d] tag=%q type=%q: %s", kind, index, tag, protocol, message)
+		return
+	}
+	log.Printf("provider[%s]: ignoring %s[%d] tag=%q type=%q: %s", providerTag, kind, index, tag, protocol, message)
+}
+
+func warnProviderParserError(providerTag, parserName string, err error) {
+	if err == nil {
+		return
+	}
+	message := safeProviderText(err.Error())
+	key := "parser|" + safeProviderText(providerTag) + "|" + parserName + "|" + message
+	if _, loaded := ignoredProviderMemberOnce.LoadOrStore(key, struct{}{}); loaded {
+		return
+	}
+	if providerTag == "" {
+		log.Printf("provider: %s parser skipped unsupported or malformed members: %s", parserName, message)
+		return
+	}
+	log.Printf("provider[%s]: %s parser skipped unsupported or malformed members: %s", safeProviderText(providerTag), parserName, message)
+}
+
+func safeProviderText(value string) string {
+	value = strings.Map(func(r rune) rune {
+		if r < 0x20 || r == 0x7f {
+			return -1
+		}
+		return r
+	}, value)
+	if len(value) > 256 {
+		return value[:256] + "..."
+	}
+	return value
+}
+
+// filterSupportedMembers is the final provider boundary. Parsers may support
+// more protocols than a particular build was compiled with; only the runtime
+// registry is authoritative. This keeps minimal builds useful and prevents a
+// single unsupported member from invalidating an otherwise valid subscription.
+func filterSupportedMembers(ctx context.Context, outbounds []option.Outbound, endpoints []option.Endpoint, providerTag string) ([]option.Outbound, []option.Endpoint) {
+	var outboundRegistry option.OutboundOptionsRegistry
+	var endpointRegistry option.EndpointOptionsRegistry
+	if ctx != nil {
+		outboundRegistry = service.FromContext[option.OutboundOptionsRegistry](ctx)
+		endpointRegistry = service.FromContext[option.EndpointOptionsRegistry](ctx)
+	}
+	filteredOutbounds := make([]option.Outbound, 0, len(outbounds))
+	for index, item := range outbounds {
+		if item.Type == "" {
+			warnIgnoredProviderMember(providerTag, "outbound", index, item.Tag, item.Type, E.New("missing protocol type"))
+			continue
+		}
+		if outboundRegistry != nil {
+			expected, loaded := outboundRegistry.CreateOptions(item.Type)
+			if !loaded {
+				warnIgnoredProviderMember(providerTag, "outbound", index, item.Tag, item.Type, E.New("unsupported protocol in this build"))
+				continue
+			}
+			if reflect.TypeOf(expected) != reflect.TypeOf(item.Options) {
+				warnIgnoredProviderMember(providerTag, "outbound", index, item.Tag, item.Type, E.New("unparseable options for registered protocol"))
+				continue
+			}
+		}
+		// A parser must never hand a nil options payload to overrideOutbounds:
+		// that path intentionally uses concrete option types for zero-copy
+		// overrides and would otherwise panic in a minimal/no-registry context.
+		if item.Options == nil {
+			warnIgnoredProviderMember(providerTag, "outbound", index, item.Tag, item.Type, E.New("unparseable options"))
+			continue
+		}
+		filteredOutbounds = append(filteredOutbounds, item)
+	}
+	filteredEndpoints := make([]option.Endpoint, 0, len(endpoints))
+	for index, item := range endpoints {
+		if item.Type == "" {
+			warnIgnoredProviderMember(providerTag, "endpoint", index, item.Tag, item.Type, E.New("missing protocol type"))
+			continue
+		}
+		if endpointRegistry != nil {
+			expected, loaded := endpointRegistry.CreateOptions(item.Type)
+			if !loaded {
+				warnIgnoredProviderMember(providerTag, "endpoint", index, item.Tag, item.Type, E.New("unsupported protocol in this build"))
+				continue
+			}
+			if reflect.TypeOf(expected) != reflect.TypeOf(item.Options) {
+				warnIgnoredProviderMember(providerTag, "endpoint", index, item.Tag, item.Type, E.New("unparseable options for registered protocol"))
+				continue
+			}
+		}
+		// Keep the same nil invariant for endpoint options.
+		if item.Options == nil {
+			warnIgnoredProviderMember(providerTag, "endpoint", index, item.Tag, item.Type, E.New("unparseable options"))
+			continue
+		}
+		filteredEndpoints = append(filteredEndpoints, item)
+	}
+	return filteredOutbounds, filteredEndpoints
+}
+
 func ParseSubscription(ctx context.Context, content string, overrideDialerOptions *option.OverrideDialerOptions, overrideTLSOptions *option.OverrideTLSOptions, overrideAnyTLSOptions *option.OverrideAnyTLSOptions, providerTag string) ([]option.Outbound, []option.Endpoint, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	ctx = context.WithValue(ctx, providerTagContextKey{}, providerTag)
 	var pErr error
 	for _, parser := range subscriptionParsers {
-		outbounds, endpoints, err := parser(ctx, content)
+		outbounds, endpoints, err := parser.parse(ctx, content)
 		if len(outbounds) > 0 || len(endpoints) > 0 {
+			if err != nil {
+				warnProviderParserError(providerTag, parser.name, err)
+			}
+			outbounds, endpoints = filterSupportedMembers(ctx, outbounds, endpoints, providerTag)
+			if len(outbounds) == 0 && len(endpoints) == 0 {
+				pErr = E.Errors(pErr, E.New(parser.name, " parser produced no supported members"))
+				continue
+			}
 			tags := providerTags(outbounds, endpoints)
 			return overrideOutbounds(outbounds, overrideDialerOptions, overrideTLSOptions, overrideAnyTLSOptions, tags, providerTag),
 				overrideEndpoints(endpoints, overrideDialerOptions, tags, providerTag),
 				nil
 		}
-		pErr = E.Errors(pErr, err)
+		if err != nil {
+			pErr = E.Errors(pErr, err)
+		}
 	}
 	return nil, nil, E.Cause(pErr, "no servers found")
 }

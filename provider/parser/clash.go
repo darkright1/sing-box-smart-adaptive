@@ -118,31 +118,74 @@ func (c *ClashProxy) BuildEndpoint() option.Endpoint {
 	return endpoint
 }
 
-func ParseClashSubscription(_ context.Context, content string) ([]option.Outbound, []option.Endpoint, error) {
-	config := &ClashConfig{}
-	err := yaml.Unmarshal([]byte(content), &config)
-	if err != nil {
+func ParseClashSubscription(ctx context.Context, content string) ([]option.Outbound, []option.Endpoint, error) {
+	var document yaml.Node
+	if err := yaml.Unmarshal([]byte(content), &document); err != nil {
 		return nil, nil, E.Cause(err, "parse clash config")
 	}
-	outbounds := common.FilterIsInstance(config.Proxies, func(proxy ClashProxy) (option.Outbound, bool) {
-		if proxy.SingType == "" || proxy.SingType == C.TypeWireGuard || proxy.SingType == C.TypeTailscale {
-			return option.Outbound{}, false
+	root := &document
+	if root.Kind == yaml.DocumentNode {
+		if len(root.Content) == 0 {
+			return nil, nil, E.New("empty clash config")
 		}
-		return proxy.Build(), true
-	})
-	endpoints := common.FilterIsInstance(config.Proxies, func(proxy ClashProxy) (option.Endpoint, bool) {
+		root = root.Content[0]
+	}
+	proxies, ok := clashProxiesNode(root)
+	if !ok {
+		return nil, nil, E.New("clash config has no proxies array")
+	}
+
+	var outbounds []option.Outbound
+	var endpoints []option.Endpoint
+	for index, node := range proxies.Content {
+		var proxy ClashProxy
+		if err := node.Decode(&proxy); err != nil {
+			warnClashMember(providerTagFromContext(ctx), index, "", "", E.Cause(err, "parse member"))
+			continue
+		}
+		if proxy.SingType == "" || proxy.Options == nil {
+			warnClashMember(providerTagFromContext(ctx), index, proxy.Name, proxy.Type, E.New("unsupported protocol"))
+			continue
+		}
 		switch proxy.SingType {
 		case C.TypeWireGuard:
-			if wgOpt, ok := proxy.Options.(*ClashWireGuardOption); ok && wgOpt.AmneziaWGOption != nil {
-				return option.Endpoint{}, false
+			if wgOpt, ok := proxy.Options.(*ClashWireGuardOption); ok {
+				if wgOpt.AmneziaWGOption == nil {
+					endpoints = append(endpoints, proxy.BuildEndpoint())
+				} else {
+					warnClashMember(providerTagFromContext(ctx), index, proxy.Name, proxy.Type, E.New("amnezia wireguard is not supported in this build"))
+				}
+			} else {
+				warnClashMember(providerTagFromContext(ctx), index, proxy.Name, proxy.Type, E.New("invalid wireguard options"))
 			}
 		case C.TypeTailscale:
+			endpoints = append(endpoints, proxy.BuildEndpoint())
 		default:
-			return option.Endpoint{}, false
+			outbounds = append(outbounds, proxy.Build())
 		}
-		return proxy.BuildEndpoint(), true
-	})
+	}
+	if len(outbounds) == 0 && len(endpoints) == 0 {
+		return nil, nil, E.New("no supported servers found")
+	}
 	return outbounds, endpoints, nil
+}
+
+func clashProxiesNode(root *yaml.Node) (*yaml.Node, bool) {
+	if root == nil || root.Kind != yaml.MappingNode {
+		return nil, false
+	}
+	for index := 0; index+1 < len(root.Content); index += 2 {
+		if root.Content[index].Value != "proxies" {
+			continue
+		}
+		value := root.Content[index+1]
+		return value, value.Kind == yaml.SequenceNode
+	}
+	return nil, false
+}
+
+func warnClashMember(providerTag string, index int, tag, protocol string, reason error) {
+	warnIgnoredProviderMember(providerTag, "clash proxy", index, tag, protocol, reason)
 }
 
 type ShadowSocksOption struct {

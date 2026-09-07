@@ -5,9 +5,11 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"reflect"
 	"regexp"
 	"slices"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -38,9 +40,11 @@ type Adapter struct {
 	outbounds       []adapter.Outbound
 	outboundsByTag  map[string]adapter.Outbound
 	outboundIDs     map[string]string
+	outboundDialIDs map[string]string
 	endpoints       []adapter.Outbound
 	endpointsByTag  map[string]adapter.Outbound
 	endpointIDs     map[string]string
+	endpointDialIDs map[string]string
 	ticker          *time.Ticker
 	checking        atomic.Bool
 	paused          atomic.Bool
@@ -180,10 +184,10 @@ func (a *Adapter) Outbounds() []adapter.Outbound {
 	defer a.outboundsAccess.RUnlock()
 	outbounds := make([]adapter.Outbound, 0, len(a.outbounds)+len(a.endpoints))
 	for _, outbound := range a.outbounds {
-		outbounds = append(outbounds, withEndpointIdentity(outbound, a.outboundIDs[outbound.Tag()]))
+		outbounds = append(outbounds, withEndpointIdentities(outbound, a.outboundIDs[outbound.Tag()], a.outboundDialIDs[outbound.Tag()]))
 	}
 	for _, endpoint := range a.endpoints {
-		outbounds = append(outbounds, withEndpointIdentity(endpoint, a.endpointIDs[endpoint.Tag()]))
+		outbounds = append(outbounds, withEndpointIdentities(endpoint, a.endpointIDs[endpoint.Tag()], a.endpointDialIDs[endpoint.Tag()]))
 	}
 	return outbounds
 }
@@ -192,30 +196,69 @@ func (a *Adapter) Outbound(tag string) (adapter.Outbound, bool) {
 	a.outboundsAccess.RLock()
 	defer a.outboundsAccess.RUnlock()
 	if detour, ok := a.outboundsByTag[tag]; ok {
-		return withEndpointIdentity(detour, a.outboundIDs[tag]), true
+		return withEndpointIdentities(detour, a.outboundIDs[tag], a.outboundDialIDs[tag]), true
 	}
 	detour, ok := a.endpointsByTag[tag]
-	return withEndpointIdentity(detour, a.endpointIDs[tag]), ok
+	return withEndpointIdentities(detour, a.endpointIDs[tag], a.endpointDialIDs[tag]), ok
 }
 
 func (a *Adapter) resolveOutboundTags(newOpts []option.Outbound) []string {
-	tags := make([]string, len(newOpts))
-	seen := make(map[string]bool)
+	baseTags := make([]string, len(newOpts))
+	identities := make([]string, len(newOpts))
 	for i, opt := range newOpts {
-		var baseTag string
 		if opt.Tag != "" {
-			baseTag = F.ToString(a.providerTag, "/", opt.Tag)
+			baseTags[i] = F.ToString(a.providerTag, "/", opt.Tag)
 		} else {
-			baseTag = F.ToString(a.providerTag, "/", i)
+			baseTags[i] = F.ToString(a.providerTag, "/", i)
 		}
-		tag := uniqueProviderTag(baseTag, providerOutboundIdentity(opt), seen)
-		if tag != baseTag {
-			a.logger.Warn("duplicate outbound tag ", baseTag, " in provider, renamed to ", tag)
+		identities[i] = providerOutboundIdentity(opt)
+	}
+	return a.resolveProviderTags(baseTags, identities, "outbound")
+}
+
+// resolveProviderTags assigns the unsuffixed tag to the lexicographically
+// stable first identity. Provider refreshes often reorder subscription lines;
+// sorting duplicate buckets prevents a harmless reorder from swapping health
+// profiles or manual selections between display tags.
+func (a *Adapter) resolveProviderTags(baseTags, identities []string, kind string) []string {
+	tags := make([]string, len(baseTags))
+	buckets := make(map[string][]int)
+	for index, baseTag := range baseTags {
+		buckets[baseTag] = append(buckets[baseTag], index)
+	}
+	seen := make(map[string]bool, len(baseTags))
+	for baseTag, indexes := range buckets {
+		sort.SliceStable(indexes, func(i, j int) bool {
+			left, right := identities[indexes[i]], identities[indexes[j]]
+			if left == right {
+				return indexes[i] < indexes[j]
+			}
+			return left < right
+		})
+		for _, index := range indexes {
+			tag := uniqueProviderTag(baseTag, identities[index], seen)
+			if tag != baseTag {
+				a.logger.Warn("duplicate ", kind, " tag ", baseTag, " in provider, renamed to ", tag)
+			}
+			tags[index] = tag
+			seen[tag] = true
 		}
-		seen[tag] = true
-		tags[i] = tag
 	}
 	return tags
+}
+
+func (a *Adapter) resolveEndpointTags(newOpts []option.Endpoint) []string {
+	baseTags := make([]string, len(newOpts))
+	identities := make([]string, len(newOpts))
+	for i, opt := range newOpts {
+		if opt.Tag != "" {
+			baseTags[i] = F.ToString(a.providerTag, "/", opt.Tag)
+		} else {
+			baseTags[i] = F.ToString(a.providerTag, "/endpoint-", i)
+		}
+		identities[i] = providerOptionFingerprint(opt.Type, opt.Tag, opt.Options)
+	}
+	return a.resolveProviderTags(baseTags, identities, "endpoint")
 }
 
 // providerOutboundIdentity fingerprints an outbound for stable duplicate rename
@@ -224,11 +267,21 @@ func (a *Adapter) resolveOutboundTags(newOpts []option.Outbound) []string {
 func providerOutboundIdentity(opt option.Outbound) string {
 	normalized, err := nodeidentity.CanonicalEndpointOptions(opt.Options)
 	if err != nil {
-		normalized = opt.Options
+		// Do not silently fall back to raw options: that changes the identity
+		// contract on an exceptional marshal path and can retain credential
+		// semantics. An opaque type marker is deliberately conservative.
+		normalized = map[string]any{"opaque_options_type": fmt.Sprintf("%T", opt.Options)}
 	}
 	// Display/provider aliases are not endpoint identity. Credentials are
 	// removed by CanonicalEndpointOptions so copies share one health portrait.
 	return providerOptionFingerprint(opt.Type, "", normalized)
+}
+
+// providerOutboundDialIdentity fingerprints the complete option payload. The
+// result is an opaque hash; credentials never leave the process, but distinct
+// credentials are kept distinct for auth/data-plane health and retry diversity.
+func providerOutboundDialIdentity(opt option.Outbound) string {
+	return providerOptionFingerprint(opt.Type, "", opt.Options)
 }
 
 // providerOptionFingerprint uses encoding/json instead of fmt's structural
@@ -325,9 +378,11 @@ func (a *Adapter) UpdateOutbounds(oldOpts []option.Outbound, newOpts []option.Ou
 	a.outbounds = outbounds
 	a.outboundsByTag = outboundsByTag
 	a.outboundIDs = make(map[string]string, len(newTags))
+	a.outboundDialIDs = make(map[string]string, len(newTags))
 	for i, tag := range newTags {
 		if i < len(newOpts) {
 			a.outboundIDs[tag] = providerOutboundIdentity(newOpts[i])
+			a.outboundDialIDs[tag] = providerOutboundDialIdentity(newOpts[i])
 		}
 	}
 	a.outboundsAccess.Unlock()
@@ -471,9 +526,11 @@ func (a *Adapter) Close() error {
 	a.outbounds = nil
 	a.outboundsByTag = nil
 	a.outboundIDs = nil
+	a.outboundDialIDs = nil
 	a.endpoints = nil
 	a.endpointsByTag = nil
 	a.endpointIDs = nil
+	a.endpointDialIDs = nil
 	a.outboundsAccess.Unlock()
 	var err error
 	for _, ob := range outbounds {
@@ -497,19 +554,33 @@ func (a *Adapter) Close() error {
 // without exposing provider options or credentials to group consumers.
 type identifiedOutbound struct {
 	adapter.Outbound
-	identity string
+	identity     string
+	dialIdentity string
 }
 
 func (o *identifiedOutbound) EndpointIdentity() string { return o.identity }
+func (o *identifiedOutbound) DialIdentity() string     { return o.dialIdentity }
 
 func withEndpointIdentity(outbound adapter.Outbound, identity string) adapter.Outbound {
-	if outbound == nil || identity == "" {
+	return withEndpointIdentities(outbound, identity, identity)
+}
+
+func withEndpointIdentities(outbound adapter.Outbound, identity, dialIdentity string) adapter.Outbound {
+	if outbound == nil || (identity == "" && dialIdentity == "") {
 		return outbound
 	}
 	if identified, ok := outbound.(adapter.OutboundWithEndpointIdentity); ok && identified.EndpointIdentity() == identity {
-		return outbound
+		if withDial, hasDial := outbound.(adapter.OutboundWithDialIdentity); (hasDial && withDial.DialIdentity() == dialIdentity) || (!hasDial && dialIdentity == identity) {
+			return outbound
+		}
 	}
-	return &identifiedOutbound{Outbound: outbound, identity: identity}
+	if dialIdentity == "" {
+		dialIdentity = identity
+	}
+	if identity == "" {
+		identity = dialIdentity
+	}
+	return &identifiedOutbound{Outbound: outbound, identity: identity, dialIdentity: dialIdentity}
 }
 
 func (a *Adapter) loopCheck() {
@@ -638,27 +709,6 @@ func (a *Adapter) RewriteDetourForProviderEndpoints(opts []option.Endpoint, outb
 	}
 }
 
-func (a *Adapter) resolveEndpointTags(newOpts []option.Endpoint) []string {
-	tags := make([]string, len(newOpts))
-	seen := make(map[string]bool)
-	for i, opt := range newOpts {
-		var baseTag string
-		if opt.Tag != "" {
-			baseTag = F.ToString(a.providerTag, "/", opt.Tag)
-		} else {
-			baseTag = F.ToString(a.providerTag, "/endpoint-", i)
-		}
-		identity := providerOptionFingerprint(opt.Type, opt.Tag, opt.Options)
-		tag := uniqueProviderTag(baseTag, identity, seen)
-		if tag != baseTag {
-			a.logger.Warn("duplicate endpoint tag ", baseTag, " in provider, renamed to ", tag)
-		}
-		seen[tag] = true
-		tags[i] = tag
-	}
-	return tags
-}
-
 func (a *Adapter) UpdateEndpoints(oldOpts []option.Endpoint, newOpts []option.Endpoint) {
 	newTags := a.resolveEndpointTags(newOpts)
 	oldTags := a.resolveEndpointTags(oldOpts)
@@ -715,13 +765,15 @@ func (a *Adapter) UpdateEndpoints(oldOpts []option.Endpoint, newOpts []option.En
 	a.endpoints = endpoints
 	a.endpointsByTag = endpointsByTag
 	a.endpointIDs = make(map[string]string, len(newTags))
+	a.endpointDialIDs = make(map[string]string, len(newTags))
 	for i, tag := range newTags {
 		if i < len(newOpts) {
 			normalized, normalizeErr := nodeidentity.CanonicalEndpointOptions(newOpts[i].Options)
 			if normalizeErr != nil {
-				normalized = newOpts[i].Options
+				normalized = map[string]any{"opaque_options_type": fmt.Sprintf("%T", newOpts[i].Options)}
 			}
 			a.endpointIDs[tag] = providerOptionFingerprint(newOpts[i].Type, "", normalized)
+			a.endpointDialIDs[tag] = providerOptionFingerprint(newOpts[i].Type, "", newOpts[i].Options)
 		}
 	}
 	a.outboundsAccess.Unlock()

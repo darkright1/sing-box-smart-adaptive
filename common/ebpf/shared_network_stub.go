@@ -82,6 +82,9 @@ func (b *SharedNetworkBackend) PublishStaticDirect([]netip.Prefix, uint32, uint3
 func (b *SharedNetworkBackend) MergeStaticDirect(netip.Prefix) error {
 	return unsupportedSharedNetworkError()
 }
+func (b *SharedNetworkBackend) MergeDynamicDirect(netip.Prefix, time.Duration) error {
+	return unsupportedSharedNetworkError()
+}
 func (b *SharedNetworkBackend) PublishDNSHint(netip.Addr, bool, uint8, uint32, time.Duration) error {
 	return unsupportedSharedNetworkError()
 }

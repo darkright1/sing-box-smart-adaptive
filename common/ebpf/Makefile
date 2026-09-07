@@ -24,7 +24,7 @@ XDP_PROVENANCE_INPUTS := Makefile $(XDP_SOURCE) v3/kern/abi.h v3/kern/parser.h v
 XDP_SOURCE_HASH := $(shell cat $(XDP_PROVENANCE_INPUTS) | sha256sum | cut -d' ' -f1)
 BPF_INCLUDE_FLAGS += -Iv3/kern
 
-.PHONY: generate check check-v2-source xdp-generate xdp-check check-xdp-source clean
+.PHONY: generate check check-v2-source check-v3-source xdp-generate xdp-check check-xdp-source clean
 
 generate:
 	@set -eu; \
@@ -71,6 +71,16 @@ check-v2-source:
 	if [ "$$actual" != "$(V2_SOURCE_HASH)" ]; then \
 		echo "native/shared_network_v2.bpf.o source provenance stale" >&2; \
 		echo "embedded=$$actual expected=$(V2_SOURCE_HASH)" >&2; \
+		exit 1; \
+	fi
+
+check-v3-source:
+	@set -eu; \
+	actual="$$($(BPF_READELF) -p .sb.source v3/kern/tc.bpf.o 2>/dev/null \
+		| sed -n 's/.*]  \([0-9a-f]\{64\}\).*/\1/p')"; \
+	if [ "$$actual" != "$(V3_SOURCE_HASH)" ]; then \
+		echo "v3/kern/tc.bpf.o source provenance stale" >&2; \
+		echo "embedded=$$actual expected=$(V3_SOURCE_HASH)" >&2; \
 		exit 1; \
 	fi
 

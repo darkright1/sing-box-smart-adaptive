@@ -11,6 +11,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/common/nodeidentity"
@@ -18,6 +19,50 @@ import (
 )
 
 func (s *Smart) probeIdentityLocked(candidate adapter.Outbound) string {
+	return probeIdentityFromProviders(candidate, s.providers)
+}
+
+// dialIdentityLocked is intentionally stronger than probeIdentityLocked. The
+// latter is a path identity (credentials stripped) and is shared for RTT/DNS
+// probing. Dial outcomes, breakers and retry diversity must keep different
+// credentials separate because a server may map them to different backends or
+// quotas. The returned value is always an opaque hash and never exposes the
+// option payload.
+func (s *Smart) dialIdentityLocked(candidate adapter.Outbound) string {
+	if candidate == nil {
+		return ""
+	}
+	if identified, ok := candidate.(adapter.OutboundWithDialIdentity); ok {
+		if identity := identified.DialIdentity(); identity != "" {
+			return identity
+		}
+	}
+	for _, provider := range s.providers {
+		if provider == nil {
+			continue
+		}
+		var outboundOptions option.Outbound
+		var loaded bool
+		if lookup, ok := provider.(adapter.ProviderOutboundOptionLookup); ok {
+			outboundOptions, loaded = lookup.OutboundOption(candidate.Tag())
+		} else if source, ok := provider.(adapter.ProviderOutboundOptions); ok {
+			outboundOptions, loaded = source.OutboundOptions()[candidate.Tag()]
+		}
+		if !loaded || outboundOptions.Type == "" || outboundOptions.Options == nil {
+			continue
+		}
+		payload, err := json.Marshal(struct {
+			Type    string `json:"type"`
+			Options any    `json:"options"`
+		}{Type: outboundOptions.Type, Options: outboundOptions.Options})
+		if err != nil {
+			payload = []byte(fmt.Sprintf("%s\x00%T\x00%s", outboundOptions.Type, outboundOptions.Options, candidate.Tag()))
+		}
+		h := sha256.New()
+		_, _ = h.Write([]byte("sing-box/smart-dial/v1\x00"))
+		_, _ = h.Write(payload)
+		return "dial:" + hex.EncodeToString(h.Sum(nil))
+	}
 	return probeIdentityFromProviders(candidate, s.providers)
 }
 

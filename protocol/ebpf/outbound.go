@@ -485,8 +485,8 @@ func normalizeOutboundOffloadOptions(options option.EBPFOutboundOffloadOptions) 
 	}
 	if options.Verdict.AllowWithSniff {
 		// Q3 P4: field kept (B-4) but no longer opens domain/protocol learn paths.
-		// MatchInputs gate is authoritative; this flag only affects MatchInputs==0
-		// legacy sniff heuristic (see evaluateVerdictLearn).
+		// MatchInputs gate is authoritative. Keep accepting the field so existing
+		// configurations remain readable, but make its no-op semantics explicit.
 		warnings = append(warnings,
 			"outbound_offload.verdict.allow_with_sniff is deprecated: it no longer relaxes domain/protocol/process learn gates (Q3); prefer IP-only rules + MatchInputs")
 	}

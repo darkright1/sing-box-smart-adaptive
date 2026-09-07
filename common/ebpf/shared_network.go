@@ -652,6 +652,15 @@ func (b *SharedNetworkBackend) DeleteMergedStaticDirect(prefix netip.Prefix) err
 	return E.New("DeleteMergedStaticDirect requires engine=v3")
 }
 
+// MergeDynamicDirect is v3-only; returning an explicit error prevents a
+// legacy engine from silently dropping a learned DIRECT promotion.
+func (b *SharedNetworkBackend) MergeDynamicDirect(prefix netip.Prefix, ttl time.Duration) error {
+	if !prefix.IsValid() || ttl <= 0 {
+		return E.New("invalid dynamic direct promotion")
+	}
+	return E.New("MergeDynamicDirect requires engine=v3")
+}
+
 // PublishMACPolicies is v2-specific: the source-MAC identity policy is a v3
 // feature and the token data plane never consumes it, so this surface only
 // rejects explicitly instead of silently ignoring a misconfigured engine.

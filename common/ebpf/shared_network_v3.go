@@ -75,8 +75,11 @@ type V3Backend struct {
 	// banks alternate: A→B→C would otherwise try to delete B from bank A and
 	// leave A's stale prefixes live when bank A becomes active again.
 	lastStatic [2][]netip.Prefix
-	// mergedDirects[bank] tracks learn-promoted /32|/128 merges (revocable).
-	mergedDirects   [2]map[netip.Prefix]struct{}
+	// dynamicDirects tracks learn-promoted /32|/128 rows and their monotonic
+	// deadlines in the separate expiring maps. Keeping this outside lastStatic
+	// makes static policy publication independent from runtime learning and
+	// allows expired rows to be reclaimed before the fixed-size LPM fills.
+	dynamicDirects  map[netip.Prefix]uint64
 	originalDstLost atomic.Uint64
 	flowEnabled     bool
 }
@@ -110,6 +113,20 @@ type v3PolicyValue struct {
 	MatchDPortMax uint16
 	PolicyID      uint32
 	Generation    uint32
+}
+
+type v3DynamicDirectValue struct {
+	Verdict       uint8
+	Source        uint8
+	Confidence    uint8
+	Reserved0     uint8
+	ReasonCode    uint16
+	MatchProtocol uint16
+	MatchDPortMin uint16
+	MatchDPortMax uint16
+	PolicyID      uint32
+	Generation    uint32
+	ExpiresNs     uint64
 }
 
 type v3FlowKey struct {
@@ -281,7 +298,7 @@ func PrepareSharedNetworkV3(
 		C.size_t(len(sharedNetworkV3Object)),
 		C.uint32_t(16384),
 		C.uint32_t(flowMaxEntries),
-		C.uint32_t(8192),
+		C.uint32_t(ebpfv3.DefaultDynamicDirect),
 		runtimeState,
 		&savedErrno,
 	)
@@ -299,6 +316,7 @@ func PrepareSharedNetworkV3(
 		flowEnabled:       policyOffloadFlow,
 		statsPossibleCPUs: statsCPUs,
 		statsScratch:      make([]v3StatsValue, statsCPUs),
+		dynamicDirects:    make(map[netip.Prefix]uint64),
 	}
 	// Must match SB_V3_ABI_VERSION in v3/kern/abi.h. The version covers the
 	// PERCPU stats vector and the DNS observation map contract.
@@ -913,9 +931,6 @@ func (b *V3Backend) PublishStaticDirect(prefixes []netip.Prefix, generation uint
 		written = append(written, prefix)
 	}
 	b.control.ActiveBank = inactive
-	// The freshly activated bank was rebuilt from the snapshot; promotions
-	// merged into it no longer exist.
-	b.mergedDirects[inactive] = make(map[netip.Prefix]struct{})
 	b.control.PolicyGeneration = generation
 	if err := b.writeControl(b.control.Enabled != 0); err != nil {
 		b.control = previousControl
@@ -930,6 +945,13 @@ func (b *V3Backend) PublishStaticDirect(prefixes []netip.Prefix, generation uint
 		return E.Cause(err, "commit v3 static policy")
 	}
 	b.lastStatic[inactive] = next
+	// A generation commit invalidates all learned rows.  Remove the now-stale
+	// dynamic entries as well so an idle process cannot retain them until the
+	// map reaches capacity.  This is deliberately after the atomic policy flip:
+	// a failed static transaction never destroys valid runtime learning.
+	if err := b.clearDynamicDirectLocked(); err != nil {
+		return E.Cause(err, "clear stale v3 dynamic direct entries")
+	}
 	return nil
 }
 
@@ -969,10 +991,9 @@ func wrapOptionalEBPFError(err error, context string) error {
 	return E.Cause(err, context)
 }
 
-// MergeStaticDirect installs one DIRECT prefix into the *active* bank using the
-// current generation. Used by dns_prefill / route promote so first-packet DIRECT
-// works without invalidating exact-flow entries.
-func (b *V3Backend) MergeStaticDirect(prefix netip.Prefix) error {
+// MergeDynamicDirect writes one learned DIRECT prefix to the separate expiring
+// map. Static policy banks remain immutable snapshots between publishes.
+func (b *V3Backend) MergeDynamicDirect(prefix netip.Prefix, ttl time.Duration) error {
 	if b == nil {
 		return osErrClosed
 	}
@@ -986,38 +1007,51 @@ func (b *V3Backend) MergeStaticDirect(prefix netip.Prefix) error {
 	if b.runtime == nil {
 		return osErrClosed
 	}
-	active := b.control.ActiveBank & 1
-	fd4 := int(b.runtime.policy4_bank0_fd)
-	fd6 := int(b.runtime.policy6_bank0_fd)
-	if active == 1 {
-		fd4 = int(b.runtime.policy4_bank1_fd)
-		fd6 = int(b.runtime.policy6_bank1_fd)
+	if ttl <= 0 {
+		ttl = 5 * time.Minute
 	}
-	last := b.lastStatic[active]
-	for _, p := range last {
-		if p == prefix {
-			return nil
+	now, err := monotonicExpireNs(0)
+	if err != nil {
+		return err
+	}
+	expires, err := monotonicExpireNs(ttl)
+	if err != nil {
+		return err
+	}
+	if err := b.purgeExpiredDynamicDirectLocked(now); err != nil {
+		return E.Cause(err, "reclaim expired v3 dynamic direct entries")
+	}
+	if existing, ok := b.dynamicDirects[prefix]; ok && existing > now {
+		if err := writeV3DynamicDirect(int(b.runtime.dynamic_direct4_fd), int(b.runtime.dynamic_direct6_fd), prefix,
+			b.control.PolicyGeneration, expires); err != nil {
+			return err
 		}
+		b.dynamicDirects[prefix] = expires
+		return nil
 	}
-	if err := validateV3PolicyPrefixes(append(append([]netip.Prefix(nil), last...), prefix)); err != nil {
+	if len(b.dynamicDirects) >= ebpfv3.DefaultDynamicDirect {
+		return E.New("v3 dynamic direct map capacity reached")
+	}
+	if err := writeV3DynamicDirect(int(b.runtime.dynamic_direct4_fd), int(b.runtime.dynamic_direct6_fd), prefix,
+		b.control.PolicyGeneration, expires); err != nil {
 		return err
 	}
-	if err := writeV3PolicyPrefix(fd4, fd6, prefix, b.control.PolicyGeneration); err != nil {
-		return err
+	if b.dynamicDirects == nil {
+		b.dynamicDirects = make(map[netip.Prefix]uint64)
 	}
-	// Keep the active bank snapshot coherent for the next full publish delete pass.
-	b.lastStatic[active] = append(last, prefix)
-	if b.mergedDirects[active] == nil {
-		b.mergedDirects[active] = make(map[netip.Prefix]struct{})
-	}
-	b.mergedDirects[active][prefix] = struct{}{}
+	b.dynamicDirects[prefix] = expires
 	return nil
 }
 
-// DeleteMergedStaticDirect removes one learn-promoted /32|/128 from the
-// active bank. Only MergeStaticDirect-sourced prefixes are revocable, so a
-// conflicting DNS observation can never delete a snapshot-published bypass
-// rule that happens to share the address.
+// MergeStaticDirect is retained as a source-compatible wrapper for callers
+// outside the v3 lifecycle. New code must provide the authoritative TTL via
+// MergeDynamicDirect so the kernel expiry matches the DNS answer lifetime.
+func (b *V3Backend) MergeStaticDirect(prefix netip.Prefix) error {
+	return b.MergeDynamicDirect(prefix, 5*time.Minute)
+}
+
+// DeleteMergedStaticDirect is the compatibility façade for deleting one
+// learn-promoted dynamic DIRECT row. Static snapshot entries are never touched.
 func (b *V3Backend) DeleteMergedStaticDirect(prefix netip.Prefix) error {
 	if b == nil {
 		return osErrClosed
@@ -1032,27 +1066,13 @@ func (b *V3Backend) DeleteMergedStaticDirect(prefix netip.Prefix) error {
 	if b.runtime == nil {
 		return osErrClosed
 	}
-	active := b.control.ActiveBank & 1
-	if _, revocable := b.mergedDirects[active][prefix]; !revocable {
+	if _, revocable := b.dynamicDirects[prefix]; !revocable {
 		return nil
 	}
-	fd4 := int(b.runtime.policy4_bank0_fd)
-	fd6 := int(b.runtime.policy6_bank0_fd)
-	if active == 1 {
-		fd4 = int(b.runtime.policy4_bank1_fd)
-		fd6 = int(b.runtime.policy6_bank1_fd)
-	}
-	if err := deleteV3PolicyPrefix(fd4, fd6, prefix); err != nil {
+	if err := deleteV3DynamicDirect(int(b.runtime.dynamic_direct4_fd), int(b.runtime.dynamic_direct6_fd), prefix); err != nil {
 		return err
 	}
-	delete(b.mergedDirects[active], prefix)
-	last := b.lastStatic[active]
-	for i, p := range last {
-		if p == prefix {
-			b.lastStatic[active] = append(last[:i], last[i+1:]...)
-			break
-		}
-	}
+	delete(b.dynamicDirects, prefix)
 	return nil
 }
 
@@ -1128,6 +1148,95 @@ func deleteV3PolicyPrefix(fd4, fd6 int, prefix netip.Prefix) error {
 		return err
 	}
 	return nil
+}
+
+func writeV3DynamicDirect(fd4, fd6 int, prefix netip.Prefix, generation uint32, expires uint64) error {
+	prefix, err := ebpfv3.CanonicalPrefix(prefix)
+	if err != nil {
+		return err
+	}
+	value := v3DynamicDirectValue{
+		Verdict:    v3VerdictDirect,
+		Source:     v3SourceStatic,
+		Confidence: 2,
+		ReasonCode: 1,
+		Generation: generation,
+		ExpiresNs:  expires,
+	}
+	addr := prefix.Addr()
+	if addr.Is4() {
+		a := addr.As4()
+		key := v3LPM4{PrefixLen: uint32(prefix.Bits()), Addr: a}
+		return updateMap(fd4, unsafe.Pointer(&key), unsafe.Pointer(&value))
+	}
+	if addr.Is6() {
+		key := v3LPM6{PrefixLen: uint32(prefix.Bits()), Addr: addr.As16()}
+		return updateMap(fd6, unsafe.Pointer(&key), unsafe.Pointer(&value))
+	}
+	return E.New("invalid dynamic direct prefix family")
+}
+
+func deleteV3DynamicDirect(fd4, fd6 int, prefix netip.Prefix) error {
+	prefix, err := ebpfv3.CanonicalPrefix(prefix)
+	if err != nil {
+		return err
+	}
+	addr := prefix.Addr()
+	if addr.Is4() {
+		a := addr.As4()
+		key := v3LPM4{PrefixLen: uint32(prefix.Bits()), Addr: a}
+		err := deleteMap(fd4, unsafe.Pointer(&key))
+		if errors.Is(err, unix.ENOENT) {
+			return nil
+		}
+		return err
+	}
+	if addr.Is6() {
+		key := v3LPM6{PrefixLen: uint32(prefix.Bits()), Addr: addr.As16()}
+		err := deleteMap(fd6, unsafe.Pointer(&key))
+		if errors.Is(err, unix.ENOENT) {
+			return nil
+		}
+		return err
+	}
+	return E.New("invalid dynamic direct prefix family")
+}
+
+// clearDynamicDirectLocked removes all learned rows known to this process.
+// The map is generation-checked in the kernel, but explicit deletion avoids
+// retaining expired rows and makes capacity independent from reload count.
+func (b *V3Backend) clearDynamicDirectLocked() error {
+	if b == nil || b.runtime == nil || len(b.dynamicDirects) == 0 {
+		return nil
+	}
+	var joined error
+	for prefix := range b.dynamicDirects {
+		if err := deleteV3DynamicDirect(int(b.runtime.dynamic_direct4_fd), int(b.runtime.dynamic_direct6_fd), prefix); err != nil {
+			joined = errors.Join(joined, err)
+		}
+	}
+	if joined == nil {
+		clear(b.dynamicDirects)
+	}
+	return joined
+}
+
+func (b *V3Backend) purgeExpiredDynamicDirectLocked(now uint64) error {
+	if b == nil || b.runtime == nil {
+		return nil
+	}
+	var joined error
+	for prefix, expires := range b.dynamicDirects {
+		if expires == 0 || expires > now {
+			continue
+		}
+		if err := deleteV3DynamicDirect(int(b.runtime.dynamic_direct4_fd), int(b.runtime.dynamic_direct6_fd), prefix); err != nil {
+			joined = errors.Join(joined, err)
+			continue
+		}
+		delete(b.dynamicDirects, prefix)
+	}
+	return joined
 }
 
 // PublishMACPolicies replaces the complete source-MAC identity snapshot in
@@ -1404,7 +1513,9 @@ func (b *V3Backend) IsClosed() bool {
 func (b *SharedNetworkBackend) PublishStaticDirect(prefixes []netip.Prefix, generation uint32, bank uint32) error {
 	return nil
 }
-func (b *SharedNetworkBackend) MergeStaticDirect(prefix netip.Prefix) error { return nil }
+func (b *SharedNetworkBackend) MergeDynamicDirect(prefix netip.Prefix, ttl time.Duration) error {
+	return nil
+}
 func (b *SharedNetworkBackend) PublishDNSHint(addr netip.Addr, direct bool, evidence uint8, generation uint32, ttl time.Duration) error {
 	return nil
 }

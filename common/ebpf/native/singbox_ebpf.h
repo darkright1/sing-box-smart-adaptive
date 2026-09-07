@@ -213,6 +213,8 @@ struct sb_ebpf_v3_runtime {
 	int policy4_bank1_fd;
 	int policy6_bank0_fd;
 	int policy6_bank1_fd;
+	int dynamic_direct4_fd;
+	int dynamic_direct6_fd;
 	int host4_map_fd;
 	int host6_map_fd;
 	int flow_map_fd;

@@ -25,6 +25,29 @@ type groupOutboundSnapshot struct {
 	outbounds map[string]adapter.Outbound
 }
 
+// sameOutboundIdentity keeps a selected runtime member attached to the same
+// authenticated endpoint across provider refreshes. Display tags are allowed
+// to gain or lose a numeric suffix, so a tag-only comparison can silently keep
+// dialing a retired object after a reorder. DialIdentity is the strongest
+// key; EndpointIdentity is the credential-free fallback used by legacy
+// providers.
+func sameOutboundIdentity(left, right adapter.Outbound) bool {
+	if left == nil || right == nil {
+		return false
+	}
+	leftDial, leftHasDial := left.(adapter.OutboundWithDialIdentity)
+	rightDial, rightHasDial := right.(adapter.OutboundWithDialIdentity)
+	if leftHasDial || rightHasDial {
+		return leftHasDial && rightHasDial && leftDial.DialIdentity() != "" && leftDial.DialIdentity() == rightDial.DialIdentity()
+	}
+	leftEndpoint, leftHasEndpoint := left.(adapter.OutboundWithEndpointIdentity)
+	rightEndpoint, rightHasEndpoint := right.(adapter.OutboundWithEndpointIdentity)
+	if leftHasEndpoint || rightHasEndpoint {
+		return leftHasEndpoint && rightHasEndpoint && leftEndpoint.EndpointIdentity() != "" && leftEndpoint.EndpointIdentity() == rightEndpoint.EndpointIdentity()
+	}
+	return left.Tag() == right.Tag()
+}
+
 func newGroupOutboundSnapshot(tags []string, outbounds map[string]adapter.Outbound) *groupOutboundSnapshot {
 	copyTags := append([]string(nil), tags...)
 	copyOutbounds := make(map[string]adapter.Outbound, len(outbounds))
@@ -456,12 +479,14 @@ func (s *groupProviderSource) memberOutbounds(updatedTag string) (tags []string,
 // key on the renamed tag while dialing still goes through the real member.
 type renamedOutbound struct {
 	adapter.Outbound
-	tag      string
-	identity string
+	tag          string
+	identity     string
+	dialIdentity string
 }
 
 func (o *renamedOutbound) Tag() string              { return o.tag }
 func (o *renamedOutbound) EndpointIdentity() string { return o.identity }
+func (o *renamedOutbound) DialIdentity() string     { return o.dialIdentity }
 
 // renameProviderMembers assigns every provider member a unique, panel-visible
 // tag. When a member collides with an occupied tag (an explicit member, or a
@@ -510,7 +535,7 @@ func renameProviderMembers(members []adapter.Outbound, occupied map[string]struc
 		}
 		tag := assigned[index]
 		if tag != member.Tag() {
-			member = &renamedOutbound{Outbound: member, tag: tag, identity: providerMemberIdentity(member)}
+			member = &renamedOutbound{Outbound: member, tag: tag, identity: providerMemberIdentity(member), dialIdentity: providerMemberDialIdentity(member)}
 		}
 		tags = append(tags, tag)
 		renamed = append(renamed, member)
@@ -530,6 +555,18 @@ func providerMemberIdentity(member adapter.Outbound) string {
 	// Legacy providers do not expose structured options. Their tag is the only
 	// safe identity available; it still avoids order-dependent suffix churn.
 	return member.Tag()
+}
+
+func providerMemberDialIdentity(member adapter.Outbound) string {
+	if member == nil {
+		return ""
+	}
+	if identified, ok := member.(adapter.OutboundWithDialIdentity); ok {
+		if identity := identified.DialIdentity(); identity != "" {
+			return identity
+		}
+	}
+	return providerMemberIdentity(member)
 }
 
 // appendProviderMembers merges provider members into the group's explicit

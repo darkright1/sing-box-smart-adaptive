@@ -107,9 +107,19 @@ func (s *Selector) setFallbackLocked(snapshot *groupOutboundSnapshot) {
 		return
 	}
 	if current := s.selected.Load(); current != nil {
-		if next, loaded := snapshot.outbounds[current.Tag()]; loaded {
+		if next, loaded := snapshot.outbounds[current.Tag()]; loaded && sameOutboundIdentity(current, next) {
 			s.selected.Store(next)
 			return
+		}
+		// A provider refresh may legitimately renumber a duplicate display tag
+		// (for example HK #2 becomes HK after HK #1 disappears). Preserve the
+		// selected endpoint by identity, never by a coincidental UI tag.
+		for _, tag := range snapshot.tags {
+			next := snapshot.outbounds[tag]
+			if sameOutboundIdentity(current, next) {
+				s.selected.Store(next)
+				return
+			}
 		}
 	}
 	if s.defaultTag != "" {

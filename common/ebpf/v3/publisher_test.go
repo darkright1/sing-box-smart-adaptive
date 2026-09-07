@@ -3,6 +3,7 @@ package v3
 import (
 	"net/netip"
 	"testing"
+	"time"
 )
 
 func TestCanonicalPrefixNormalizesMappedIPv4(t *testing.T) {
@@ -209,20 +210,23 @@ func TestLookupStaticIPv6HonorsProtocolAndPort(t *testing.T) {
 	}
 }
 
-func TestMergeStaticDirectMirrorsActiveBank(t *testing.T) {
+func TestMergeDynamicDirectIsSeparateAndBounded(t *testing.T) {
 	b := NewMemoryBackend()
 	prefix := netip.MustParsePrefix("203.0.113.9/32")
-	if err := b.MergeStaticDirect(prefix); err != nil {
+	if err := b.MergeDynamicDirect(prefix, time.Minute); err != nil {
 		t.Fatal(err)
 	}
-	if got := b.LookupStatic(prefix.Addr(), ProtocolTCP, 443); got == nil || got.Generation != b.Control.PolicyGeneration {
-		t.Fatalf("merged policy=%+v control=%+v", got, b.Control)
+	if got := b.LookupStatic(prefix.Addr(), ProtocolTCP, 443); got != nil {
+		t.Fatalf("dynamic policy leaked into static bank: %+v", got)
 	}
-	if err := b.MergeStaticDirect(prefix); err != nil {
+	if got := b.LookupDynamicDirect(prefix.Addr(), ProtocolTCP, 443); got == nil || got.Generation != b.Control.PolicyGeneration {
+		t.Fatalf("dynamic policy=%+v control=%+v", got, b.Control)
+	}
+	if err := b.MergeDynamicDirect(prefix, time.Minute); err != nil {
 		t.Fatal(err)
 	}
-	if got := len(b.Policy4[b.Control.ActiveBank]); got != 1 {
-		t.Fatalf("duplicate merge grew active bank: %d", got)
+	if got := len(b.dynamicDirects); got != 1 {
+		t.Fatalf("duplicate merge grew dynamic map: %d", got)
 	}
 }
 

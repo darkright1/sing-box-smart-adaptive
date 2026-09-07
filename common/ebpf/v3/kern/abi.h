@@ -16,6 +16,7 @@
 #define SB_V3_AF_INET6 10U
 
 #define SB_V3_MAX_POLICY_LPM_ENTRIES 65536U
+#define SB_V3_MAX_DYNAMIC_DIRECT_ENTRIES 32768U
 #define SB_V3_MAX_PORT_RULES 4096U
 #define SB_V3_MAX_SOURCE_POLICY 8192U
 #define SB_V3_MAX_FLOW_ENTRIES 65536U
@@ -30,6 +31,7 @@
 #define SB_V3_DEFAULT_FLOW_ENTRIES 8192U
 #define SB_V3_DEFAULT_DNS_HINTS 8192U
 #define SB_V3_DEFAULT_POLICY_LPM 16384U
+#define SB_V3_DEFAULT_DYNAMIC_DIRECT_ENTRIES 8192U
 
 enum sb_v3_verdict {
 	SB_V3_UNSEEN = 0,
@@ -179,6 +181,25 @@ struct sb_v3_policy_value {
 };
 
 _Static_assert(sizeof(struct sb_v3_policy_value) == 20U, "sb_v3_policy_value size");
+
+/* Learned DIRECT entries are deliberately a separate map from the static
+ * policy snapshot.  They have an expiry and must never consume the static
+ * rule bank's capacity or participate in its generation transaction. */
+struct sb_v3_dynamic_direct_value {
+	__u8 verdict; /* always SB_V3_DIRECT */
+	__u8 source;
+	__u8 confidence;
+	__u8 reserved0;
+	__u16 reason_code;
+	__u16 match_protocol; /* 0 = any; else IPPROTO_* */
+	__u16 match_dport_min;
+	__u16 match_dport_max;
+	__u32 policy_id;
+	__u32 generation;
+	__u64 expires_ns;
+};
+
+_Static_assert(sizeof(struct sb_v3_dynamic_direct_value) == 32U, "sb_v3_dynamic_direct_value size");
 
 struct sb_v3_lpm4_key {
 	__u32 prefixlen;

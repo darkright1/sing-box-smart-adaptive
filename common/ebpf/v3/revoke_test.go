@@ -3,7 +3,6 @@ package v3
 import (
 	"net/netip"
 	"testing"
-	"time"
 )
 
 // The shared-IP generalisation guard: a learn-promoted /32 DIRECT must be
@@ -32,20 +31,15 @@ func TestMemoryBackendRevokeMergedStaticDirect(t *testing.T) {
 	if err := b.MergeStaticDirect(promoted); err != nil {
 		t.Fatal(err)
 	}
-	active := b.Control.ActiveBank & 1
-	key, err := PrefixToLPM4(promoted)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, ok := b.Policy4[active][key]; !ok {
-		t.Fatal("promoted /32 missing from active bank")
+	if got := b.LookupDynamicDirect(promoted.Addr(), ProtocolTCP, 443); got == nil {
+		t.Fatal("promoted /32 missing from dynamic map")
 	}
 
 	// Shared-IP conflict: revoke the promoted prefix only.
 	if err := b.DeleteMergedStaticDirect(promoted); err != nil {
 		t.Fatal(err)
 	}
-	if _, ok := b.Policy4[active][key]; ok {
+	if got := b.LookupDynamicDirect(promoted.Addr(), ProtocolTCP, 443); got != nil {
 		t.Fatal("revoked /32 still in active bank")
 	}
 
@@ -53,8 +47,7 @@ func TestMemoryBackendRevokeMergedStaticDirect(t *testing.T) {
 	if err := b.DeleteMergedStaticDirect(snapshot[0].Prefix); err != nil {
 		t.Fatal(err)
 	}
-	snapshotKey, _ := PrefixToLPM4(snapshot[0].Prefix)
-	if _, ok := b.Policy4[active][snapshotKey]; !ok {
+	if got := b.LookupStatic(snapshot[0].Prefix.Addr(), ProtocolTCP, 443); got == nil {
 		t.Fatal("snapshot-published bypass rule was removed by revoke")
 	}
 
@@ -65,8 +58,7 @@ func TestMemoryBackendRevokeMergedStaticDirect(t *testing.T) {
 	if err := b.PublishStatic(nil); err != nil {
 		t.Fatal(err)
 	}
-	if len(b.mergedDirects[b.Control.ActiveBank&1]) != 0 {
+	if len(b.dynamicDirects) != 0 {
 		t.Fatal("merged set not cleared after snapshot publish")
 	}
-	_ = time.Now
 }

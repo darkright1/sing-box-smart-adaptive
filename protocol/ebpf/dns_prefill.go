@@ -490,10 +490,10 @@ func dnsPrefillIsStableDirect(
 		}
 		break
 	}
-	if scope == adapter.RouteVerdictScopeUnknown && metadata.MatchInputs != 0 {
-		return false
-	}
-	if scope != adapter.RouteVerdictScopeUnknown && scope != adapter.RouteVerdictScopeDestinationIP {
+	// DNS answers are global IP evidence. Only an explicit destination-IP
+	// verdict may promote one to a global kernel DIRECT entry; unknown/legacy
+	// metadata is deliberately rejected instead of inferred from zero bits.
+	if scope != adapter.RouteVerdictScopeDestinationIP {
 		return false
 	}
 

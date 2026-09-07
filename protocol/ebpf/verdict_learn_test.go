@@ -359,19 +359,19 @@ func TestVerdictLearnIPOnlyAllowsDespiteSniffMetadata(t *testing.T) {
 	}
 }
 
-func TestVerdictLearnMatchInputsZeroStillUsesLegacySniffGate(t *testing.T) {
+func TestVerdictLearnUnknownScopeFailsClosedEvenWithLegacyMetadata(t *testing.T) {
 	opts := verdictLearnOptions{mode: "learn", ttl: time.Minute, allowWithSniff: false}
 	meta := adapter.InboundContext{Protocol: "tls"} // MatchInputs==0
 	ok, reason := evaluateVerdictLearn(opts, stubDirectDialer{empty: true}, meta,
 		netip.MustParseAddrPort("1.2.3.4:443"))
 	if ok || reason != verdictSkipSniff {
-		t.Fatalf("MatchInputs==0 + sniff metadata must refuse without allow_with_sniff, ok=%v reason=%d", ok, reason)
+		t.Fatalf("unknown scope must refuse even with sniff metadata, ok=%v reason=%d", ok, reason)
 	}
 	opts.allowWithSniff = true
 	ok, reason = evaluateVerdictLearn(opts, stubDirectDialer{empty: true}, meta,
 		netip.MustParseAddrPort("1.2.3.4:443"))
-	if !ok || reason != verdictSkipNone {
-		t.Fatalf("allow_with_sniff still softens MatchInputs==0 path, ok=%v reason=%d", ok, reason)
+	if ok || reason != verdictSkipSniff {
+		t.Fatalf("allow_with_sniff must not manufacture route scope, ok=%v reason=%d", ok, reason)
 	}
 }
 

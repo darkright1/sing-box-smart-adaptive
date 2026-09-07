@@ -34,9 +34,13 @@ type FlowHit struct {
 
 // Input gathers maps/control state for one packet decision.
 type Input struct {
-	Control        Control
-	Packet         Packet
-	Static         *StaticPolicy
+	Control Control
+	Packet  Packet
+	Static  *StaticPolicy
+	// Dynamic is a learned DIRECT prefix kept in the separate expiring map.
+	// It is consulted after the authoritative static snapshot and before exact
+	// flow state, matching tc.bpf.c.
+	Dynamic        *StaticPolicy
 	Flow           *FlowHit
 	MACSource      *MACSourceHit
 	DNS            *DNSIPValue
@@ -131,7 +135,22 @@ func Decide(in Input) Decision {
 		}
 	}
 
-	// tc step 9: exact-flow.
+	// tc step 9: learned dynamic DIRECT promotions. They never override a
+	// static proxy/block rule, but are valid before exact-flow evidence.
+	if in.Dynamic != nil {
+		switch in.Dynamic.Verdict {
+		case VerdictDirect:
+			return Decision{Action: ActionContinue, Reason: ReasonDNSHintDirect, Mark: 0}
+		case VerdictBlock:
+			return Decision{Action: ActionBlock, Reason: ReasonStaticBlock, Mark: 0}
+		case VerdictProxy:
+			return proxyDecision(c, ReasonStaticProxy)
+		case VerdictMustControl:
+			return proxyDecision(c, ReasonMustControl)
+		}
+	}
+
+	// tc step 10: exact-flow.
 	if in.Flow != nil {
 		switch in.Flow.Verdict {
 		case VerdictDirect:
@@ -145,7 +164,7 @@ func Decide(in Input) Decision {
 		}
 	}
 
-	// tc step 10: DNS/FakeIP allows direct. A conflict does NOT proxy in the
+	// tc step 11: DNS/FakeIP allows direct. A conflict does NOT proxy in the
 	// kernel — it only counts DNS_HINT_CONFLICT and falls through, so the
 	// model falls through too.
 	if in.DNS != nil {
@@ -154,12 +173,12 @@ func Decide(in Input) Decision {
 		}
 	}
 
-	// tc step 11: established-TCP socket assignment bypass.
+	// tc step 12: established-TCP socket assignment bypass.
 	if in.EstablishedTCP {
 		return Decision{Action: ActionContinue, Reason: ReasonEstablishedBypass, Mark: 0}
 	}
 
-	// tc step 12: default NEED_USERSPACE.
+	// tc step 13: default NEED_USERSPACE.
 	return proxyDecision(c, ReasonMapMissProxy)
 }
 

@@ -12,7 +12,7 @@ import (
 // Implementations: common/ebpf.V3Backend via sharedNetwork.backend.
 type DataplaneSink interface {
 	PublishStaticDirect(prefixes []netip.Prefix, generation uint32, bank uint32) error
-	MergeStaticDirect(prefix netip.Prefix) error
+	MergeDynamicDirect(prefix netip.Prefix, ttl time.Duration) error
 	PutDirectFlow(protocol uint8, source, destination netip.AddrPort, ttl time.Duration) error
 	DeleteDirectFlow(protocol uint8, source, destination netip.AddrPort) error
 	PublishDNSHint(addr netip.Addr, direct bool, evidence uint8, generation uint32, ttl time.Duration) error

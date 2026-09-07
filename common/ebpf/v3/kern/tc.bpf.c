@@ -268,6 +268,39 @@ static __attribute__((always_inline)) const struct sb_v3_policy_value *lookup_st
 	return 0;
 }
 
+/* Learned DIRECT promotions are intentionally consulted after the
+ * authoritative static snapshot.  A static proxy/block rule therefore still
+ * wins over a stale learned address, while a valid dynamic DIRECT entry keeps
+ * its old first-packet fast-path behaviour without masquerading as static. */
+static __attribute__((always_inline)) const struct sb_v3_dynamic_direct_value *lookup_dynamic_direct(
+		const struct sb_v3_control *control, const struct sb_v3_packet *packet) {
+	if (packet->family == SB_V3_AF_INET) {
+		struct sb_v3_lpm4_key key = {.prefixlen = 32U};
+		__builtin_memcpy(key.addr, packet->daddr, 4);
+		const struct sb_v3_dynamic_direct_value *value = map_lookup(&v3_dynamic_direct4, &key);
+		if (!value || value->verdict != SB_V3_DIRECT || value->generation != control->policy_generation ||
+		    value->expires_ns <= monotonic_ns() ||
+		    (value->match_protocol != 0 && value->match_protocol != packet->protocol) ||
+		    ((value->match_dport_min != 0 || value->match_dport_max != 0) &&
+		     (packet->dport < value->match_dport_min || packet->dport > value->match_dport_max)))
+			return 0;
+		return value;
+	}
+	if (packet->family == SB_V3_AF_INET6) {
+		struct sb_v3_lpm6_key key = {.prefixlen = 128U};
+		__builtin_memcpy(key.addr, packet->daddr, 16);
+		const struct sb_v3_dynamic_direct_value *value = map_lookup(&v3_dynamic_direct6, &key);
+		if (!value || value->verdict != SB_V3_DIRECT || value->generation != control->policy_generation ||
+		    value->expires_ns <= monotonic_ns() ||
+		    (value->match_protocol != 0 && value->match_protocol != packet->protocol) ||
+		    ((value->match_dport_min != 0 || value->match_dport_max != 0) &&
+		     (packet->dport < value->match_dport_min || packet->dport > value->match_dport_max)))
+			return 0;
+		return value;
+	}
+	return 0;
+}
+
 static __attribute__((always_inline)) bool host_address(const struct sb_v3_packet *packet) {
 	if (packet->family == SB_V3_AF_INET) {
 		struct sb_v3_lpm4_key key = {.prefixlen = 32U};
@@ -605,6 +638,10 @@ int sb_v3_ingress(struct __sk_buff *skb) {
 		if (static_policy->verdict == SB_V3_MUST_CONTROL)
 			return handoff_proxy(skb, control, &packet, SB_V3_STAT_MUST_CONTROL, ifindex, pkt_len);
 	}
+
+	const struct sb_v3_dynamic_direct_value *dynamic_direct = lookup_dynamic_direct(control, &packet);
+	if (dynamic_direct && dynamic_direct->verdict == SB_V3_DIRECT)
+		return action_direct(skb, dynamic_direct->reason_code != 0 ? dynamic_direct->reason_code : SB_V3_STAT_DNS_HINT_DIRECT);
 
 	const struct sb_v3_flow_value *flow = lookup_flow(control, &packet);
 	if (flow) {

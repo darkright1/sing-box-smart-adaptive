@@ -31,6 +31,14 @@ SB_V3_MAP(v3_policy6_bank0, BPF_MAP_TYPE_LPM_TRIE, struct sb_v3_lpm6_key, struct
 SB_V3_MAP(v3_policy6_bank1, BPF_MAP_TYPE_LPM_TRIE, struct sb_v3_lpm6_key, struct sb_v3_policy_value,
 	  SB_V3_DEFAULT_POLICY_LPM, BPF_F_NO_PREALLOC);
 
+/* Learned DNS/direct promotions are independent from static policy banks.
+ * Their value carries expiry and generation, so a stale learned row can be
+ * ignored without mutating the authoritative static snapshot. */
+SB_V3_MAP(v3_dynamic_direct4, BPF_MAP_TYPE_LPM_TRIE, struct sb_v3_lpm4_key,
+	  struct sb_v3_dynamic_direct_value, SB_V3_DEFAULT_DYNAMIC_DIRECT_ENTRIES, BPF_F_NO_PREALLOC);
+SB_V3_MAP(v3_dynamic_direct6, BPF_MAP_TYPE_LPM_TRIE, struct sb_v3_lpm6_key,
+	  struct sb_v3_dynamic_direct_value, SB_V3_DEFAULT_DYNAMIC_DIRECT_ENTRIES, BPF_F_NO_PREALLOC);
+
 SB_V3_MAP(v3_host4, BPF_MAP_TYPE_LPM_TRIE, struct sb_v3_lpm4_key, __u8,
 	  1024U, BPF_F_NO_PREALLOC);
 SB_V3_MAP(v3_host6, BPF_MAP_TYPE_LPM_TRIE, struct sb_v3_lpm6_key, __u8,

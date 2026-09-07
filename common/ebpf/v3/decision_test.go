@@ -47,6 +47,30 @@ func TestDecisionOrderFlowAfterStaticMiss(t *testing.T) {
 	}
 }
 
+func TestDecisionOrderDynamicDirectBeforeFlow(t *testing.T) {
+	d := Decide(Input{
+		Control: baseControl(),
+		Packet:  tcpPacket(443),
+		Dynamic: &StaticPolicy{Verdict: VerdictDirect},
+		Flow:    &FlowHit{Verdict: VerdictProxy},
+	})
+	if d.Action != ActionContinue || d.Reason != ReasonDNSHintDirect || d.Mark != 0 {
+		t.Fatalf("dynamic direct must precede flow: %+v", d)
+	}
+}
+
+func TestDecisionOrderStaticProxyStillBeatsDynamicDirect(t *testing.T) {
+	d := Decide(Input{
+		Control: baseControl(),
+		Packet:  tcpPacket(443),
+		Static:  &StaticPolicy{Verdict: VerdictProxy},
+		Dynamic: &StaticPolicy{Verdict: VerdictDirect},
+	})
+	if d.Action != ActionProxy || d.Reason != ReasonStaticProxy {
+		t.Fatalf("static proxy must beat dynamic direct: %+v", d)
+	}
+}
+
 func TestDecisionMapMissNeverDirect(t *testing.T) {
 	d := Decide(Input{
 		Control: baseControl(),

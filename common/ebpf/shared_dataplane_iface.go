@@ -56,9 +56,9 @@ type SharedDataplane interface {
 	// V3 policy surface (no-op on v2).
 	// PublishStaticDirect replaces the inactive bank and commits (full snapshot).
 	PublishStaticDirect(prefixes []netip.Prefix, generation uint32, bank uint32) error
-	// MergeStaticDirect writes one DIRECT prefix into the *active* bank without
-	// bumping generation (incremental promote / dns_prefill).
-	MergeStaticDirect(prefix netip.Prefix) error
+	// MergeDynamicDirect writes one expiring learned DIRECT prefix to the
+	// independent dynamic map without mutating the static policy snapshot.
+	MergeDynamicDirect(prefix netip.Prefix, ttl time.Duration) error
 	PublishDNSHint(addr netip.Addr, direct bool, evidence uint8, generation uint32, ttl time.Duration) error
 	// DrainDNSObservations removes a bounded batch of plaintext DNS answers
 	// captured by the v3 TC sniffer. Each row carries the first A/AAAA answer

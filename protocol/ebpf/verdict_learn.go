@@ -77,22 +77,15 @@ func evaluateVerdictLearn(
 	if destination.Port() == 53 {
 		return false, verdictSkipPort53
 	}
-	// Q3: route MatchInputs gate (fail-closed on Unknown / non-IP-only).
+	// Q3: explicit route verdict gate (fail-closed on Unknown / non-IP-only).
 	// Domain/process/user classes never learn DIRECT (F-4). allow_with_sniff does
-	// NOT relax those classes (P4); it only softens the legacy metadata sniff gate
-	// when MatchInputs was never filled (MatchInputs==0 fallback path).
+	// NOT relax those classes and cannot manufacture missing scope evidence.
 	if !verdictRouteInputsOK(metadata) {
 		return false, verdictSkipSniff
 	}
-	// Legacy sniff heuristic: only when routing did not classify any item
-	// (MatchInputs==0). Once MatchInputs is IP-only non-zero, sniff-filled
-	// Protocol/Client must not block learn — otherwise every sniff-on config
-	// would skip forever even for pure ip_cidr rules (Q3 P3 goal).
-	if metadata.MatchInputs == 0 {
-		if !opts.allowWithSniff && verdictUsedSniff(metadata) {
-			return false, verdictSkipSniff
-		}
-	}
+	// For an explicit DestinationIP scope, sniff metadata is orthogonal to the
+	// route key and must not block learning. Legacy callers without scope have
+	// already failed closed above.
 	// (d) process/user based selection if detectable
 	if verdictUsedProcessOrUser(metadata) {
 		return false, verdictSkipProcessUser
@@ -104,18 +97,15 @@ func evaluateVerdictLearn(
 	return true, verdictSkipNone
 }
 
-// verdictRouteInputsOK: only a destination-IP scoped verdict may become a
-// global /32. MatchInputs is retained as a compatibility fallback for callers
-// that predate VerdictScope, but port/network/source dimensions are no longer
-// treated as destination-only because they are absent from the kernel key.
+// verdictRouteInputsOK: only an explicitly destination-IP scoped verdict may
+// become a global /32. Unknown scope is fail-closed, including legacy callers
+// that leave MatchInputs at zero: absence of evidence is not proof that the
+// decision was destination-only.
 func verdictRouteInputsOK(metadata adapter.InboundContext) bool {
-	if metadata.VerdictScope != adapter.RouteVerdictScopeUnknown {
-		return metadata.VerdictScope == adapter.RouteVerdictScopeDestinationIP
-	}
-	if metadata.MatchInputs == 0 {
+	if metadata.VerdictScope == adapter.RouteVerdictScopeDestinationIP {
 		return true
 	}
-	return metadata.MatchInputs == adapter.RouteMatchIP
+	return false
 }
 
 func verdictUsedSniff(metadata adapter.InboundContext) bool {

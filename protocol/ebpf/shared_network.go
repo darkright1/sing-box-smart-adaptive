@@ -550,11 +550,11 @@ func (s v3KernelSink) WriteControlV3(enabled bool, flags uint32, activeBank, gen
 	}
 	return s.dp.WriteControlV3(enabled, flags, activeBank, generation, routingMark)
 }
-func (s v3KernelSink) MergeStaticDirect(prefix netip.Prefix) error {
+func (s v3KernelSink) MergeDynamicDirect(prefix netip.Prefix, ttl time.Duration) error {
 	if s.dp == nil {
 		return nil
 	}
-	return s.dp.MergeStaticDirect(prefix)
+	return s.dp.MergeDynamicDirect(prefix, ttl)
 }
 func (s v3KernelSink) PutDirectFlow(protocol uint8, source, destination netip.AddrPort, ttl time.Duration) error {
 	if s.dp == nil {
@@ -693,7 +693,7 @@ func (s *sharedNetwork) promoteV3Direct(addr netip.Addr, ttl time.Duration) {
 	// Evidence strong: dns_prefill / route already proved stable DIRECT.
 	s.observeV3DNS(addr, true, 2 /* DNSEvidenceStrong */, ttl)
 	var err error
-	err = s.v3.MergeStaticDirect(prefix)
+	err = s.v3.MergeDynamicDirect(prefix, ttl)
 	if err != nil {
 		if s.parent != nil && s.parent.logger != nil {
 			s.parent.logger.Debug("eBPF v3 merge static direct: ", err)

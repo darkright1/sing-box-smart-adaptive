@@ -2,6 +2,7 @@ package aggregate
 
 import (
 	"context"
+	"errors"
 	"regexp"
 	"sort"
 	"sync"
@@ -347,7 +348,7 @@ func (p *Provider) rebuild() {
 			tag = F.ToString(item.base, " #", count)
 		}
 		if tag != item.outbound.Tag() {
-			item.outbound = &renamedOutbound{Outbound: item.outbound, tag: tag, identity: item.identity}
+			item.outbound = &renamedOutbound{Outbound: item.outbound, tag: tag, identity: item.identity, dialIdentity: dialIdentity(item.outbound)}
 		}
 		members = append(members, item.outbound)
 		byTag[tag] = item.outbound
@@ -371,14 +372,23 @@ func identity(outbound adapter.Outbound) string {
 	return outbound.Type() + "\x00" + outbound.Tag()
 }
 
+func dialIdentity(outbound adapter.Outbound) string {
+	if identified, ok := outbound.(adapter.OutboundWithDialIdentity); ok && identified.DialIdentity() != "" {
+		return identified.DialIdentity()
+	}
+	return identity(outbound)
+}
+
 type renamedOutbound struct {
 	adapter.Outbound
-	tag      string
-	identity string
+	tag          string
+	identity     string
+	dialIdentity string
 }
 
 func (o *renamedOutbound) Tag() string              { return o.tag }
 func (o *renamedOutbound) EndpointIdentity() string { return o.identity }
+func (o *renamedOutbound) DialIdentity() string     { return o.dialIdentity }
 
 func (p *Provider) isClosed() bool {
 	p.access.RLock()
@@ -400,27 +410,82 @@ func (p *Provider) notify() {
 
 func (p *Provider) HealthCheck(ctx context.Context) (map[string]uint16, error) {
 	p.access.RLock()
-	children := make([]adapter.Provider, 0, len(p.children))
+	children := make([]struct {
+		tag      string
+		provider adapter.Provider
+	}, 0, len(p.children))
+	include, exclude := p.include, p.exclude
 	for _, child := range p.children {
-		children = append(children, child)
+		children = append(children, struct {
+			tag      string
+			provider adapter.Provider
+		}{child.Tag(), child})
 	}
 	p.access.RUnlock()
+	sort.Slice(children, func(i, j int) bool { return children[i].tag < children[j].tag })
+
+	// Build the same deterministic display namespace as rebuild().  A health
+	// map from a child is keyed by its local tag, so merging those maps directly
+	// would overwrite duplicate aliases (HK/HK #2).  The source tag makes the
+	// join key unambiguous and the identity ordering keeps suffixes stable
+	// across provider refreshes.
+	type member struct {
+		sourceTag string
+		base      string
+		identity  string
+		display   string
+	}
+	all := make([]member, 0)
+	for _, child := range children {
+		for _, outbound := range child.provider.Outbounds() {
+			if outbound == nil || outbound.Tag() == "" || !providerAdapter.MemberAllowed(outbound.Tag(), include, exclude) {
+				continue
+			}
+			all = append(all, member{sourceTag: child.tag, base: outbound.Tag(), identity: identity(outbound)})
+		}
+	}
+	sort.SliceStable(all, func(i, j int) bool {
+		if all[i].base != all[j].base {
+			return all[i].base < all[j].base
+		}
+		return all[i].identity < all[j].identity
+	})
+	seen := make(map[string]int)
+	displayBySourceTag := make(map[string]string, len(all))
+	for _, item := range all {
+		count := seen[item.base] + 1
+		seen[item.base] = count
+		display := item.base
+		if count > 1 {
+			display = F.ToString(item.base, " #", count)
+		}
+		key := item.sourceTag + "\x00" + item.base
+		if _, exists := displayBySourceTag[key]; !exists {
+			displayBySourceTag[key] = display
+		}
+	}
+
 	result := make(map[string]uint16)
+	var errs []error
 	for _, child := range children {
 		if ctx != nil {
 			if err := ctx.Err(); err != nil {
-				return result, err
+				errs = append(errs, err)
+				break
 			}
 		}
-		checks, err := child.HealthCheck(ctx)
+		checks, err := child.provider.HealthCheck(ctx)
 		if err != nil {
-			return result, err
+			errs = append(errs, E.Cause(err, "health check provider ", child.tag))
+			continue
 		}
 		for tag, delay := range checks {
-			result[tag] = delay
+			if display, exists := displayBySourceTag[child.tag+"\x00"+tag]; exists {
+				result[display] = delay
+			}
 		}
 	}
-	return result, nil
+	return result, errors.Join(errs...)
 }
 
 func (p *Provider) Close() error {
