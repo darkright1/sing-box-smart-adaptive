@@ -41,7 +41,7 @@ func TestEvaluateVerdictLearn_Port53(t *testing.T) {
 	}
 }
 
-func TestEvaluateVerdictLearn_Sniff(t *testing.T) {
+func TestEvaluateVerdictLearn_SniffMetadataIPOnly(t *testing.T) {
 	opts := verdictLearnOptions{mode: "learn", ttl: time.Minute, allowWithSniff: false}
 	meta := adapter.InboundContext{
 		Protocol:     "tls",
@@ -50,8 +50,8 @@ func TestEvaluateVerdictLearn_Sniff(t *testing.T) {
 	}
 	ok, reason := evaluateVerdictLearn(opts, stubDirectDialer{empty: true}, meta,
 		netip.MustParseAddrPort("1.2.3.4:443"))
-	if ok || reason != verdictSkipSniff {
-		t.Fatalf("want skip sniff, ok=%v reason=%d", ok, reason)
+	if !ok || reason != verdictSkipNone {
+		t.Fatalf("IP-only scope must ignore sniff metadata, ok=%v reason=%d", ok, reason)
 	}
 	opts.allowWithSniff = true
 	ok, reason = evaluateVerdictLearn(opts, stubDirectDialer{empty: true}, meta,
