@@ -76,11 +76,11 @@ func parseBoxOutbound(ctx context.Context, item any, index int) (option.Outbound
 		warnIgnoredProviderMember(providerTagFromContext(ctx), "outbound", index, tag, protocol, E.New("group members are not supported in a provider"))
 		return result, false
 	}
+	if support := service.FromContext[option.OutboundSupportRegistry](ctx); support != nil && !support.IsSupported(protocol) {
+		warnIgnoredProviderMember(providerTagFromContext(ctx), "outbound", index, tag, protocol, E.New("unsupported protocol in this build"))
+		return result, false
+	}
 	if registry := service.FromContext[option.OutboundOptionsRegistry](ctx); registry != nil {
-		if support, ok := registry.(option.OutboundSupportRegistry); ok && !support.IsSupported(protocol) {
-			warnIgnoredProviderMember(providerTagFromContext(ctx), "outbound", index, tag, protocol, E.New("unsupported protocol in this build"))
-			return result, false
-		}
 		if _, loaded := registry.CreateOptions(protocol); !loaded {
 			warnIgnoredProviderMember(providerTagFromContext(ctx), "outbound", index, tag, protocol, E.New("unsupported protocol in this build"))
 			return result, false
@@ -110,11 +110,11 @@ func parseBoxEndpoint(ctx context.Context, item any, index int) (option.Endpoint
 		warnIgnoredProviderMember(providerTagFromContext(ctx), "endpoint", index, tag, protocol, E.New("missing or invalid type"))
 		return result, false
 	}
+	if support := service.FromContext[option.EndpointSupportRegistry](ctx); support != nil && !support.IsSupported(protocol) {
+		warnIgnoredProviderMember(providerTagFromContext(ctx), "endpoint", index, tag, protocol, E.New("unsupported protocol in this build"))
+		return result, false
+	}
 	if registry := service.FromContext[option.EndpointOptionsRegistry](ctx); registry != nil {
-		if support, ok := registry.(option.EndpointSupportRegistry); ok && !support.IsSupported(protocol) {
-			warnIgnoredProviderMember(providerTagFromContext(ctx), "endpoint", index, tag, protocol, E.New("unsupported protocol in this build"))
-			return result, false
-		}
 		if _, loaded := registry.CreateOptions(protocol); !loaded {
 			warnIgnoredProviderMember(providerTagFromContext(ctx), "endpoint", index, tag, protocol, E.New("unsupported protocol in this build"))
 			return result, false

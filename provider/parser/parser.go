@@ -108,6 +108,7 @@ func providerErrorReason(err error) string {
 	message := strings.ToLower(safeProviderText(err.Error()))
 	switch {
 	case strings.Contains(message, "unsupported"),
+		strings.Contains(message, "not supported"),
 		strings.Contains(message, "unknown outbound type"),
 		strings.Contains(message, "unknown endpoint type"),
 		strings.Contains(message, "unsupported scheme"):
@@ -163,11 +164,11 @@ func filterSupportedMembers(ctx context.Context, outbounds []option.Outbound, en
 			warnIgnoredProviderMember(providerTag, "outbound", index, item.Tag, item.Type, E.New("missing protocol type"))
 			continue
 		}
+		if outboundSupport != nil && !outboundSupport.IsSupported(item.Type) {
+			warnIgnoredProviderMember(providerTag, "outbound", index, item.Tag, item.Type, E.New("unsupported protocol in this build"))
+			continue
+		}
 		if outboundRegistry != nil {
-			if outboundSupport != nil && !outboundSupport.IsSupported(item.Type) {
-				warnIgnoredProviderMember(providerTag, "outbound", index, item.Tag, item.Type, E.New("unsupported protocol in this build"))
-				continue
-			}
 			expected, loaded := outboundRegistry.CreateOptions(item.Type)
 			if !loaded {
 				warnIgnoredProviderMember(providerTag, "outbound", index, item.Tag, item.Type, E.New("unsupported protocol in this build"))
@@ -193,11 +194,11 @@ func filterSupportedMembers(ctx context.Context, outbounds []option.Outbound, en
 			warnIgnoredProviderMember(providerTag, "endpoint", index, item.Tag, item.Type, E.New("missing protocol type"))
 			continue
 		}
+		if endpointSupport != nil && !endpointSupport.IsSupported(item.Type) {
+			warnIgnoredProviderMember(providerTag, "endpoint", index, item.Tag, item.Type, E.New("unsupported protocol in this build"))
+			continue
+		}
 		if endpointRegistry != nil {
-			if endpointSupport != nil && !endpointSupport.IsSupported(item.Type) {
-				warnIgnoredProviderMember(providerTag, "endpoint", index, item.Tag, item.Type, E.New("unsupported protocol in this build"))
-				continue
-			}
 			expected, loaded := endpointRegistry.CreateOptions(item.Type)
 			if !loaded {
 				warnIgnoredProviderMember(providerTag, "endpoint", index, item.Tag, item.Type, E.New("unsupported protocol in this build"))

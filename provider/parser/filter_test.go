@@ -161,6 +161,16 @@ func TestFilterSupportedMembersDropsSchemaOnlyStubs(t *testing.T) {
 	}
 }
 
+func TestFilterSupportedMembersUsesCapabilityRegistryWithoutSchemaRegistry(t *testing.T) {
+	ctx := service.ContextWith[option.OutboundSupportRegistry](context.Background(), parserStubOutboundRegistry{})
+	outbounds, endpoints := filterSupportedMembers(ctx, []option.Outbound{
+		{Type: C.TypeNaive, Tag: "stub", Options: new(option.NaiveOutboundOptions)},
+	}, nil, "test")
+	if len(outbounds) != 0 || len(endpoints) != 0 {
+		t.Fatalf("capability-only registry must still reject schema-only stubs: outbounds=%d endpoints=%d", len(outbounds), len(endpoints))
+	}
+}
+
 func TestParseClashSubscriptionDropsSchemaOnlyStub(t *testing.T) {
 	ctx := service.ContextWith[option.OutboundOptionsRegistry](context.Background(), parserStubOutboundRegistry{})
 	ctx = service.ContextWith[option.OutboundSupportRegistry](ctx, parserStubOutboundRegistry{})
