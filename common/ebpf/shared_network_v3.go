@@ -1513,9 +1513,6 @@ func (b *V3Backend) IsClosed() bool {
 func (b *SharedNetworkBackend) PublishStaticDirect(prefixes []netip.Prefix, generation uint32, bank uint32) error {
 	return nil
 }
-func (b *SharedNetworkBackend) MergeDynamicDirect(prefix netip.Prefix, ttl time.Duration) error {
-	return nil
-}
 func (b *SharedNetworkBackend) PublishDNSHint(addr netip.Addr, direct bool, evidence uint8, generation uint32, ttl time.Duration) error {
 	return nil
 }
