@@ -40,6 +40,9 @@ func TestGroupProfileRegistryIsSharedForProcessLifetime(t *testing.T) {
 	if first != second {
 		t.Fatal("groups in one process received different profile registries")
 	}
+	if existing := existingGroupProfileRegistry(); existing != first {
+		t.Fatal("API lookup did not find the active process profile registry")
+	}
 	releaseFirst()
 	releaseSecond()
 	third, releaseThird := acquireGroupProfileRegistry(ctx)

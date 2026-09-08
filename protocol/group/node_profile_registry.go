@@ -119,6 +119,23 @@ func acquireGroupProfileRegistry(ctx context.Context) (*nodeProfileRegistry, fun
 	}
 }
 
+// existingGroupProfileRegistry lets dashboard/API helpers that only receive a
+// request context join the already-running process registry. Request contexts
+// are commonly derived from the process context and therefore have a distinct
+// Done channel; creating another registry there would silently defeat
+// cross-group single-flight. The normal group constructors remain the owners
+// and process cancellation still performs final cleanup.
+func existingGroupProfileRegistry() *nodeProfileRegistry {
+	nodeProfileRegistries.Lock()
+	defer nodeProfileRegistries.Unlock()
+	for _, reference := range nodeProfileRegistries.byProcess {
+		if reference != nil && reference.registry != nil {
+			return reference.registry
+		}
+	}
+	return nil
+}
+
 func acquireSmartProfileRegistry(ctx context.Context) (*nodeProfileRegistry, func()) {
 	registry, releaseReference := acquireGroupProfileRegistry(ctx)
 	var once sync.Once
