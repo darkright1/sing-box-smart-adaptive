@@ -560,6 +560,30 @@ func TestLifecyclePublishStaticDirectMirrorsMemorySnapshot(t *testing.T) {
 	}
 }
 
+func TestLifecycleStaticPreparationBlocksKernelOnModelConflict(t *testing.T) {
+	drop := false
+	lc, err := NewLifecycle(option.EBPFSharedNetworkOptions{
+		Enabled: true, Engine: EngineV3, DataPlane: "socket_assign", DropUDP443: &drop,
+		PolicyOffload: option.EBPFPolicyOffloadOptions{Enabled: true, StaticRules: true},
+	}, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lc.Close()
+	sink := &memSink{gen: 1}
+	lc.BindSink(sink)
+	if _, ok := lc.Backend().Publisher.BeginCompile(); !ok {
+		t.Fatal("failed to reserve model compile")
+	}
+	defer lc.Backend().Publisher.AbortCompile()
+	if err := lc.PublishStaticDirect([]netip.Prefix{netip.MustParsePrefix("203.0.113.8/32")}); err == nil {
+		t.Fatal("expected model preparation conflict")
+	}
+	if sink.static != 0 {
+		t.Fatalf("kernel was mutated before model preparation completed: %d prefixes", sink.static)
+	}
+}
+
 func TestLifecycleGenerationSyncKeepsPublisherMonotonic(t *testing.T) {
 	drop := false
 	lc, err := NewLifecycle(option.EBPFSharedNetworkOptions{

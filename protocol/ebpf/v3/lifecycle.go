@@ -224,19 +224,20 @@ func (l *Lifecycle) PublishStaticRules(inputs []ebpfv3.CompileInput) (accepted i
 	for _, c := range direct {
 		directPrefixes = append(directPrefixes, c.Prefix)
 	}
+	// Stage and validate the model before touching the kernel. The reservation
+	// prevents another model compile from racing this transaction; after the
+	// sink succeeds, CommitPreparedStatic has no fallible path left.
+	prepared, err := l.backend.PrepareStatic(direct)
+	if err != nil {
+		return 0, 0, err
+	}
 	if l.sink != nil {
 		if err := l.sink.PublishStaticDirect(directPrefixes, 0, 0); err != nil {
+			l.backend.AbortPreparedStatic(prepared)
 			return len(direct), len(rej), err
 		}
 	}
-	if err := l.backend.PublishStatic(direct); err != nil {
-		// The kernel bank already committed a new generation; realign the
-		// memory model to it so the next publish cannot diverge permanently.
-		if l.sink != nil {
-			l.syncPolicyGenerationLocked(l.sink.PolicyGeneration())
-		}
-		return 0, 0, err
-	}
+	l.backend.CommitPreparedStatic(prepared)
 	return len(direct), len(rej), nil
 }
 
@@ -389,19 +390,17 @@ func (l *Lifecycle) PublishStaticDirect(prefixes []netip.Prefix) error {
 			},
 		})
 	}
+	prepared, err := l.backend.PrepareStatic(policies)
+	if err != nil {
+		return err
+	}
 	if l.sink != nil {
 		if err := l.sink.PublishStaticDirect(normalized, 0, 0); err != nil {
+			l.backend.AbortPreparedStatic(prepared)
 			return err
 		}
 	}
-	if err := l.backend.PublishStatic(policies); err != nil {
-		// Kernel generation moved ahead of the model; resync or the gap is
-		// permanent (each side increments from its own counter).
-		if l.sink != nil {
-			l.syncPolicyGenerationLocked(l.sink.PolicyGeneration())
-		}
-		return err
-	}
+	l.backend.CommitPreparedStatic(prepared)
 	return nil
 }
 

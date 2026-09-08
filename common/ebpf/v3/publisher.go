@@ -151,6 +151,18 @@ type MemoryBackend struct {
 	nextFlowPruneNs uint64
 }
 
+// PreparedStatic reserves the inactive policy bank and contains a fully
+// validated snapshot ready for an infallible model commit.  Lifecycle uses
+// this reservation to validate and stage the model before touching the live
+// kernel, so a successful kernel publish cannot be followed by a model-side
+// compile/capacity failure.
+type PreparedStatic struct {
+	backend  *MemoryBackend
+	inactive uint32
+	policy4  map[LPM4Key]PolicyValue
+	policy6  map[LPM6Key]PolicyValue
+}
+
 func NewMemoryBackend() *MemoryBackend {
 	b := &MemoryBackend{
 		Publisher:   NewBankPublisher(),
@@ -176,11 +188,15 @@ func NewMemoryBackend() *MemoryBackend {
 	return b
 }
 
-// PublishStatic performs inactive-bank fill + atomic commit.
-func (b *MemoryBackend) PublishStatic(policies []CompiledPolicy) error {
+// PrepareStatic validates and stages an inactive-bank snapshot. The compile
+// reservation remains held until CommitPreparedStatic or AbortPreparedStatic.
+func (b *MemoryBackend) PrepareStatic(policies []CompiledPolicy) (*PreparedStatic, error) {
+	if b == nil || b.Publisher == nil {
+		return nil, fmt.Errorf("nil memory backend")
+	}
 	inactive, ok := b.Publisher.BeginCompile()
 	if !ok {
-		return fmt.Errorf("compile already in progress")
+		return nil, fmt.Errorf("compile already in progress")
 	}
 	// Build off to the side, then install the complete bank in one assignment;
 	// a malformed prefix must not leave a partially refreshed inactive snapshot.
@@ -195,7 +211,7 @@ func (b *MemoryBackend) PublishStatic(policies []CompiledPolicy) error {
 		canonical, canonicalErr := CanonicalPrefix(p.Prefix)
 		if canonicalErr != nil {
 			b.Publisher.AbortCompile()
-			return canonicalErr
+			return nil, canonicalErr
 		}
 		p.Prefix = canonical
 		p.Value.Generation = nextGen
@@ -204,7 +220,7 @@ func (b *MemoryBackend) PublishStatic(policies []CompiledPolicy) error {
 			key, err := PrefixToLPM4(p.Prefix)
 			if err != nil {
 				b.Publisher.AbortCompile()
-				return err
+				return nil, err
 			}
 			policy4[key] = p.Value
 			continue
@@ -212,16 +228,36 @@ func (b *MemoryBackend) PublishStatic(policies []CompiledPolicy) error {
 		key, err := PrefixToLPM6(p.Prefix)
 		if err != nil {
 			b.Publisher.AbortCompile()
-			return err
+			return nil, err
 		}
 		policy6[key] = p.Value
 	}
 	if len(policy4) > DefaultPolicyLPM || len(policy6) > DefaultPolicyLPM {
 		b.Publisher.AbortCompile()
-		return fmt.Errorf("static policy exceeds eBPF LPM map capacity")
+		return nil, fmt.Errorf("static policy exceeds eBPF LPM map capacity")
 	}
-	b.Policy4[inactive] = policy4
-	b.Policy6[inactive] = policy6
+	return &PreparedStatic{backend: b, inactive: inactive, policy4: policy4, policy6: policy6}, nil
+}
+
+// AbortPreparedStatic releases a staged snapshot without changing the model.
+// It is required when the corresponding kernel publication fails.
+func (b *MemoryBackend) AbortPreparedStatic(prepared *PreparedStatic) {
+	if b == nil || prepared == nil || prepared.backend != b {
+		return
+	}
+	b.Publisher.AbortCompile()
+	prepared.backend = nil
+}
+
+// CommitPreparedStatic installs a previously validated snapshot. All
+// fallible work happened in PrepareStatic; this method only performs map
+// assignments and the publisher's atomic bank flip.
+func (b *MemoryBackend) CommitPreparedStatic(prepared *PreparedStatic) {
+	if b == nil || prepared == nil || prepared.backend != b {
+		return
+	}
+	b.Policy4[prepared.inactive] = prepared.policy4
+	b.Policy6[prepared.inactive] = prepared.policy6
 	gen, bank := b.Publisher.Commit()
 	b.Control.ActiveBank = bank
 	b.Control.PolicyGeneration = gen
@@ -231,6 +267,16 @@ func (b *MemoryBackend) PublishStatic(policies []CompiledPolicy) error {
 	clear(b.dynamicDirects6)
 	b.invalidateGenerationMaps(gen)
 	b.Stats[25] = uint64(gen) // RELOAD_GENERATION index if aligned — best-effort
+	prepared.backend = nil
+}
+
+// PublishStatic performs inactive-bank fill + atomic commit.
+func (b *MemoryBackend) PublishStatic(policies []CompiledPolicy) error {
+	prepared, err := b.PrepareStatic(policies)
+	if err != nil {
+		return err
+	}
+	b.CommitPreparedStatic(prepared)
 	return nil
 }
 
