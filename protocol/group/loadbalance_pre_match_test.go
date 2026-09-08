@@ -1,6 +1,7 @@
 package group
 
 import (
+	"context"
 	"testing"
 	"time"
 
@@ -112,11 +113,19 @@ func TestLoadBalanceUDPFailureDoesNotPoisonTCPHealth(t *testing.T) {
 	outbound := &preMatchTestOutbound{tag: "udp-node"}
 	history := U.NewHistoryStorage()
 	history.StoreURLTestHistoryKey(U.KeyForOutbound(outbound, "", N.NetworkTCP), &adapter.URLTestHistory{Time: time.Now(), Delay: 20})
-	group := &LoadBalanceGroup{
-		history:     history,
-		udpFailures: newGroupUDPFailureTracker(),
+	profiles := newNodeProfileRegistry(context.Background())
+	defer profiles.close()
+	endpointKey, profileKey := groupTCPProfileKey(outbound, "")
+	if _, err, _ := profiles.runProbeMode(context.Background(), endpointKey, profileKey, time.Second, time.Minute, false, func(context.Context) (uint16, error) {
+		return 20, nil
+	}); err != nil {
+		t.Fatal(err)
 	}
-	group.udpFailures.mark(outbound)
+	group := &LoadBalanceGroup{
+		history:         history,
+		profileRegistry: profiles,
+	}
+	profiles.recordPassive(groupUDPProfileKey(outbound), false, 0, groupPassiveFailureTTL)
 	if !group.memberAvailable(outbound, &adapter.InboundContext{Network: N.NetworkTCP}) {
 		t.Fatal("UDP failure suppressed TCP member")
 	}

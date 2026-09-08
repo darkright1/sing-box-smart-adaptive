@@ -21,10 +21,10 @@ func TestSmartProbeUsesOnlyConnectivity204(t *testing.T) {
 	leaf := &smartCloseStubOutbound{Adapter: outbound.NewAdapter(C.TypeDirect, "leaf", []string{N.NetworkTCP}, nil)}
 	var access sync.Mutex
 	var links []string
-	registry := &smartProbeRegistry{
+	registry := &nodeProfileRegistry{
 		ctx:     context.Background(),
 		cancel:  func() {},
-		entries: make(map[string]*smartProbeEntry),
+		entries: make(map[string]*nodeProfileEntry),
 		slots:   make(chan struct{}, 1),
 		probe: func(_ context.Context, link string, _ adapter.Outbound) (uint16, error) {
 			access.Lock()
@@ -161,10 +161,10 @@ func TestSmartManualProbeUnboundedByDefault(t *testing.T) {
 }
 
 func TestSmartProbeBudgetRotatesWithoutOverlap(t *testing.T) {
-	registry := &smartProbeRegistry{
+	registry := &nodeProfileRegistry{
 		ctx:     context.Background(),
 		cancel:  func() {},
-		entries: make(map[string]*smartProbeEntry),
+		entries: make(map[string]*nodeProfileEntry),
 		slots:   make(chan struct{}, 5),
 		probe: func(_ context.Context, _ string, _ adapter.Outbound) (uint16, error) {
 			return 10, nil
@@ -218,11 +218,11 @@ func TestSmartProbeBudgetRotatesWithoutOverlap(t *testing.T) {
 }
 
 func TestSmartProbeRegistryFullDefersWithoutBypassingBounds(t *testing.T) {
-	registry := newSmartProbeRegistry(context.Background())
+	registry := newNodeProfileRegistry(context.Background())
 	defer registry.close()
-	busy := &smartProbeEntry{inflight: true, done: make(chan struct{})}
+	busy := &nodeProfileEntry{inflight: true, done: make(chan struct{})}
 	registry.access.Lock()
-	for index := 0; index < smartProbeRegistryLimit; index++ {
+	for index := 0; index < nodeProfileRegistryLimit; index++ {
 		registry.entries["busy-"+itoaSmall(index)] = busy
 	}
 	registry.access.Unlock()
@@ -232,7 +232,7 @@ func TestSmartProbeRegistryFullDefersWithoutBypassingBounds(t *testing.T) {
 		called = true
 		return 1, nil
 	})
-	if !errors.Is(err, errSharedSmartProbeDeferred) {
+	if !errors.Is(err, errSharedNodeProbeDeferred) {
 		t.Fatalf("full registry error = %v, want deferred", err)
 	}
 	if called {
@@ -241,7 +241,7 @@ func TestSmartProbeRegistryFullDefersWithoutBypassingBounds(t *testing.T) {
 }
 
 func TestSmartProbeRegistryDistinguishesFreshAndCachedResults(t *testing.T) {
-	registry := newSmartProbeRegistry(context.Background())
+	registry := newNodeProfileRegistry(context.Background())
 	defer registry.close()
 	var calls atomic.Int32
 	registry.probe = func(context.Context, string, adapter.Outbound) (uint16, error) {
@@ -259,7 +259,7 @@ func TestSmartProbeRegistryDistinguishesFreshAndCachedResults(t *testing.T) {
 		t.Fatalf("probe executed %d times, want once", got)
 	}
 
-	failureRegistry := newSmartProbeRegistry(context.Background())
+	failureRegistry := newNodeProfileRegistry(context.Background())
 	defer failureRegistry.close()
 	var failureCalls atomic.Int32
 	failureRegistry.probe = func(context.Context, string, adapter.Outbound) (uint16, error) {
@@ -278,7 +278,7 @@ func TestSmartProbeRegistryDistinguishesFreshAndCachedResults(t *testing.T) {
 }
 
 func TestSmartProbeRegistryCancellationDoesNotCacheFailure(t *testing.T) {
-	registry := newSmartProbeRegistry(context.Background())
+	registry := newNodeProfileRegistry(context.Background())
 	defer registry.close()
 	started := make(chan struct{})
 	var calls atomic.Int32
@@ -303,7 +303,7 @@ func TestSmartProbeRegistryCancellationDoesNotCacheFailure(t *testing.T) {
 	}()
 	<-started
 	cancel()
-	if err := <-firstDone; !errors.Is(err, errSharedSmartProbeDeferred) {
+	if err := <-firstDone; !errors.Is(err, errSharedNodeProbeDeferred) {
 		t.Fatalf("cancelled probe error = %v, want deferred", err)
 	}
 
@@ -316,7 +316,7 @@ func TestSmartProbeRegistryCancellationDoesNotCacheFailure(t *testing.T) {
 }
 
 func TestSmartProbeRegistrySerializesTracksPerEndpoint(t *testing.T) {
-	registry := newSmartProbeRegistry(context.Background())
+	registry := newNodeProfileRegistry(context.Background())
 	defer registry.close()
 	started := make(chan struct{})
 	release := make(chan struct{})
@@ -360,7 +360,7 @@ func TestSmartProbeRegistrySerializesTracksPerEndpoint(t *testing.T) {
 }
 
 func TestSmartProbeRegistryRecoveryKeepsEndpointLock(t *testing.T) {
-	registry := newSmartProbeRegistry(context.Background())
+	registry := newNodeProfileRegistry(context.Background())
 	defer registry.close()
 	firstStarted := make(chan struct{})
 	firstRelease := make(chan struct{})
@@ -978,10 +978,10 @@ func TestSmartCloseDoesNotBlockIndefinitely(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	block := make(chan struct{})
-	registry := &smartProbeRegistry{
+	registry := &nodeProfileRegistry{
 		ctx:     ctx,
 		cancel:  func() {},
-		entries: make(map[string]*smartProbeEntry),
+		entries: make(map[string]*nodeProfileEntry),
 		slots:   make(chan struct{}, 1),
 		probe: func(probeCtx context.Context, _ string, _ adapter.Outbound) (uint16, error) {
 			select {

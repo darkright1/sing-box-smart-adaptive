@@ -263,7 +263,7 @@ func (s *URLTest) DashboardURLTest(ctx context.Context) (map[string]uint16, erro
 	if group == nil {
 		return map[string]uint16{}, nil
 	}
-	return DashboardURLTestOutbounds(ctx, s.outbound, group.history, s.logger, group.OutboundsSnapshot(), group.link), nil
+	return dashboardURLTestOutbounds(ctx, s.outbound, group.history, s.logger, group.OutboundsSnapshot(), group.link, group.profileRegistry), nil
 }
 
 func (s *URLTest) CheckOutbounds() {
@@ -350,9 +350,11 @@ func (s *URLTest) DialContext(ctx context.Context, network string, destination M
 	adapter.NoteRealOutbound(ctx, outbound)
 	conn, err := outbound.DialContext(ctx, network, destination)
 	if err == nil {
+		group.profileRegistry.recordPassive(groupTCPPassiveProfileKey(outbound), true, 0, 0)
 		return group.interruptGroup.NewConn(conn, interrupt.IsExternalConnectionFromContext(ctx)), nil
 	}
 	s.logger.ErrorContext(ctx, err)
+	group.profileRegistry.recordPassive(groupTCPPassiveProfileKey(outbound), false, 0, groupPassiveFailureTTL)
 	key := historyKeyForOutbound(s.outbound, outbound, group.link, N.NetworkTCP)
 	group.history.DeleteURLTestHistoryKey(key)
 	return nil, err
@@ -374,14 +376,14 @@ func (s *URLTest) ListenPacket(ctx context.Context, destination M.Socksaddr) (ne
 	adapter.NoteRealOutbound(ctx, outbound)
 	conn, err := outbound.ListenPacket(ctx, destination)
 	if err == nil {
-		group.udpFailures.clear(outbound)
+		group.profileRegistry.recordPassive(groupUDPProfileKey(outbound), true, 0, 0)
 		return group.interruptGroup.NewPacketConn(conn, interrupt.IsExternalConnectionFromContext(ctx)), nil
 	}
 	s.logger.ErrorContext(ctx, err)
 	// UDP failure is transport-scoped passive evidence. Do not erase the
 	// authenticated TCP URL-test observation; suppress this member briefly and
 	// let the next bounded test refresh the control-plane state.
-	group.udpFailures.mark(outbound)
+	group.profileRegistry.recordPassive(groupUDPProfileKey(outbound), false, 0, groupPassiveFailureTTL)
 	return nil, err
 }
 
@@ -411,7 +413,8 @@ type URLTestGroup struct {
 	lastCheck                    atomic.Int64
 	selectedOutboundTCP          adapter.Outbound
 	selectedOutboundUDP          adapter.Outbound
-	udpFailures                  *groupUDPFailureTracker
+	profileRegistry              *nodeProfileRegistry
+	releaseProfileRegistry       func()
 	selectionAccess              sync.RWMutex
 	interruptGroup               *interrupt.Group
 	interruptExternalConnections bool
@@ -441,6 +444,7 @@ func NewURLTestGroup(ctx context.Context, outboundManager adapter.OutboundManage
 	if history == nil {
 		return nil, E.New("missing URL test history storage")
 	}
+	profileRegistry, releaseProfileRegistry := acquireGroupProfileRegistry(ctx)
 	return &URLTestGroup{
 		ctx:                          ctx,
 		outbound:                     outboundManager,
@@ -455,7 +459,8 @@ func NewURLTestGroup(ctx context.Context, outboundManager adapter.OutboundManage
 		pause:                        service.FromContext[pause.Manager](ctx),
 		interruptGroup:               interrupt.NewGroup(),
 		interruptExternalConnections: interruptExternalConnections,
-		udpFailures:                  newGroupUDPFailureTracker(),
+		profileRegistry:              profileRegistry,
+		releaseProfileRegistry:       releaseProfileRegistry,
 	}, nil
 }
 
@@ -515,20 +520,21 @@ func (g *URLTestGroup) Close() error {
 		return nil
 	}
 	g.closed = true
-	if g.ticker == nil {
-		close(g.close)
-		g.access.Unlock()
-		return nil
-	}
 	ticker := g.ticker
 	g.ticker = nil
 	callback := g.pauseCallback
 	g.pauseCallback = nil
 	close(g.close)
 	g.access.Unlock()
-	ticker.Stop()
+	if ticker != nil {
+		ticker.Stop()
+	}
 	if callback != nil {
 		g.pause.UnregisterCallback(callback)
+	}
+	if g.releaseProfileRegistry != nil {
+		g.releaseProfileRegistry()
+		g.releaseProfileRegistry = nil
 	}
 	return nil
 }
@@ -547,9 +553,15 @@ func (g *URLTestGroup) Select(network string) (adapter.Outbound, bool) {
 	var minDelay uint16
 	var minOutbound adapter.Outbound
 	if selected != nil {
-		key := historyKeyForOutbound(g.outbound, selected, g.link, N.NetworkTCP)
-		if history := g.history.LoadURLTestHistoryKey(key); history != nil && (!isUDP || !g.udpFailures.active(selected)) {
+		profile, loaded := groupTCPProfileSnapshot(g.profileRegistry, selected, g.link)
+		if loaded && profile.success && groupTCPAvailable(g.profileRegistry, selected) && (!isUDP || groupUDPAvailable(g.profileRegistry, selected)) {
 			if g.containsOutbound(selected, network) {
+				minOutbound = selected
+				minDelay = profile.delay
+			}
+		} else if g.profileRegistry == nil {
+			key := historyKeyForOutbound(g.outbound, selected, g.link, N.NetworkTCP)
+			if history := g.history.LoadURLTestHistoryKey(key); history != nil && g.containsOutbound(selected, network) {
 				minOutbound = selected
 				minDelay = history.Delay
 			}
@@ -560,16 +572,25 @@ func (g *URLTestGroup) Select(network string) (adapter.Outbound, bool) {
 		if !common.Contains(detour.Network(), network) {
 			continue
 		}
-		if isUDP && g.udpFailures.active(detour) {
+		if isUDP && !groupUDPAvailable(g.profileRegistry, detour) {
 			continue
 		}
-		key := historyKeyForOutbound(g.outbound, detour, g.link, N.NetworkTCP)
-		history := g.history.LoadURLTestHistoryKey(key)
-		if history == nil {
+		profile, loaded := groupTCPProfileSnapshot(g.profileRegistry, detour, g.link)
+		var delay uint16
+		if loaded && profile.success && groupTCPAvailable(g.profileRegistry, detour) {
+			delay = profile.delay
+		} else if g.profileRegistry == nil {
+			key := historyKeyForOutbound(g.outbound, detour, g.link, N.NetworkTCP)
+			history := g.history.LoadURLTestHistoryKey(key)
+			if history != nil {
+				delay = history.Delay
+			}
+		}
+		if delay == 0 {
 			continue
 		}
-		if minDelay == 0 || uint32(minDelay) > uint32(history.Delay)+uint32(g.tolerance) {
-			minDelay = history.Delay
+		if minDelay == 0 || uint32(minDelay) > uint32(delay)+uint32(g.tolerance) {
+			minDelay = delay
 			minOutbound = detour
 		}
 	}
@@ -578,7 +599,7 @@ func (g *URLTestGroup) Select(network string) (adapter.Outbound, bool) {
 			if !common.Contains(detour.Network(), network) {
 				continue
 			}
-			if isUDP && g.udpFailures.active(detour) {
+			if isUDP && !groupUDPAvailable(g.profileRegistry, detour) {
 				continue
 			}
 			return detour, false
@@ -665,7 +686,7 @@ func (g *URLTestGroup) urlTest(ctx context.Context, force bool) (map[string]uint
 		return make(map[string]uint16), nil
 	}
 	defer g.checking.Store(false)
-	result := URLTestOutbounds(ctx, g.outbound, g.history, g.logger, g.OutboundsSnapshot(), g.link, g.interval, force)
+	result := urlTestOutbounds(ctx, g.outbound, g.history, g.logger, g.OutboundsSnapshot(), g.link, g.interval, force, false, 10, g.profileRegistry)
 	g.lastCheck.Store(time.Now().UnixNano())
 	g.performUpdateCheck()
 	return result, nil
@@ -687,10 +708,11 @@ type urlTestBatch struct {
 	access    sync.Mutex
 	result    map[string]uint16
 	dashboard bool
+	profiles  *nodeProfileRegistry
 }
 
 func URLTestOutbounds(ctx context.Context, outboundManager adapter.OutboundManager, history *urltest.HistoryStorage, logger log.Logger, outbounds []adapter.Outbound, link string, interval time.Duration, force bool) map[string]uint16 {
-	return urlTestOutbounds(ctx, outboundManager, history, logger, outbounds, link, interval, force, false, 10)
+	return urlTestOutbounds(ctx, outboundManager, history, logger, outbounds, link, interval, force, false, 10, nil)
 }
 
 // DashboardURLTestOutbounds follows Surge's control-plane rule: sample the
@@ -698,12 +720,16 @@ func URLTestOutbounds(ctx context.Context, outboundManager adapter.OutboundManag
 // groups keep ownership of their own bounded scheduler. It is intentionally
 // separate from URLTestOutbounds so periodic full checks retain their contract.
 func DashboardURLTestOutbounds(ctx context.Context, outboundManager adapter.OutboundManager, history *urltest.HistoryStorage, logger log.Logger, outbounds []adapter.Outbound, link string) map[string]uint16 {
+	return dashboardURLTestOutbounds(ctx, outboundManager, history, logger, outbounds, link, nil)
+}
+
+func dashboardURLTestOutbounds(ctx context.Context, outboundManager adapter.OutboundManager, history *urltest.HistoryStorage, logger log.Logger, outbounds []adapter.Outbound, link string, profiles *nodeProfileRegistry) map[string]uint16 {
 	leaves, dashboardGroups := collectDashboardOutbounds(outboundManager, outbounds)
 	selectedLeaves := selectDashboardOutbounds(history, leaves, dashboardURLTestLimit)
 	result := make(map[string]uint16)
 	var resultAccess sync.Mutex
 	if len(selectedLeaves) > 0 {
-		maps.Copy(result, urlTestOutbounds(ctx, outboundManager, history, logger, selectedLeaves, link, 0, true, true, dashboardURLTestConcurrency))
+		maps.Copy(result, urlTestOutbounds(ctx, outboundManager, history, logger, selectedLeaves, link, 0, true, true, dashboardURLTestConcurrency, profiles))
 	}
 	groupBatch, _ := batch.New(ctx, batch.WithConcurrencyNum[any](dashboardURLTestConcurrency))
 	for _, dashboardGroup := range dashboardGroups {
@@ -720,7 +746,7 @@ func DashboardURLTestOutbounds(ctx context.Context, outboundManager adapter.Outb
 	return result
 }
 
-func urlTestOutbounds(ctx context.Context, outboundManager adapter.OutboundManager, history *urltest.HistoryStorage, logger log.Logger, outbounds []adapter.Outbound, link string, interval time.Duration, force, dashboard bool, concurrency int) map[string]uint16 {
+func urlTestOutbounds(ctx context.Context, outboundManager adapter.OutboundManager, history *urltest.HistoryStorage, logger log.Logger, outbounds []adapter.Outbound, link string, interval time.Duration, force, dashboard bool, concurrency int, profiles *nodeProfileRegistry) map[string]uint16 {
 	if concurrency <= 0 {
 		concurrency = 1
 	}
@@ -734,6 +760,7 @@ func urlTestOutbounds(ctx context.Context, outboundManager adapter.OutboundManag
 		checked:   make(map[string]bool),
 		result:    make(map[string]uint16),
 		dashboard: dashboard,
+		profiles:  profiles,
 	}
 	testBatch.test(outbounds, link, interval, force)
 	b.Wait()
@@ -892,16 +919,49 @@ func (b *urlTestBatch) test(outbounds []adapter.Outbound, link string, interval 
 			})), link, interval, force)
 		default:
 			key := historyKeyForOutbound(b.outbound, detour, link, N.NetworkTCP)
-			history := b.history.LoadURLTestHistoryKey(key)
-			if !force && history != nil && time.Since(history.Time) < interval {
+			endpointKey, profileKey := groupTCPProfileKey(detour, link)
+			checkedKey := tag
+			if b.profiles != nil {
+				checkedKey = "profile\x00" + profileKey
+				if !force {
+					if profile, loaded := b.profiles.snapshot(profileKey); loaded && time.Now().Before(profile.nextProbeAt) {
+						if profile.success {
+							b.access.Lock()
+							b.result[tag] = profile.delay
+							b.access.Unlock()
+						} else {
+							b.history.DeleteURLTestHistoryKey(key)
+						}
+						continue
+					}
+				}
+			} else {
+				history := b.history.LoadURLTestHistoryKey(key)
+				if !force && history != nil && time.Since(history.Time) < interval {
+					continue
+				}
+			}
+			if b.checked[checkedKey] {
 				continue
 			}
-			b.checked[tag] = true
+			b.checked[checkedKey] = true
 			b.batch.Go(tag, func() (any, error) {
 				testCtx, cancel := context.WithTimeout(b.ctx, C.TCPTimeout)
 				defer cancel()
 				var testResult urlTestResult
-				if b.dashboard {
+				if b.profiles != nil {
+					probe := func(probeCtx context.Context) (uint16, error) {
+						return urltest.URLTest(probeCtx, link, detour)
+					}
+					if b.dashboard {
+						testResult.delay, testResult.err = runDashboardLeafProbe(testCtx, func(probeCtx context.Context) (uint16, error) {
+							delay, probeErr, _ := b.profiles.runProbeMode(probeCtx, endpointKey, profileKey, C.TCPTimeout, interval, force, probe)
+							return delay, probeErr
+						})
+					} else {
+						testResult.delay, testResult.err, _ = b.profiles.runProbeMode(testCtx, endpointKey, profileKey, C.TCPTimeout, interval, force, probe)
+					}
+				} else if b.dashboard {
 					testResult.delay, testResult.err = runDashboardLeafProbe(testCtx, func(probeCtx context.Context) (uint16, error) {
 						return urltest.URLTest(probeCtx, link, detour)
 					})

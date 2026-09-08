@@ -241,7 +241,7 @@ func (s *LoadBalance) DashboardURLTest(ctx context.Context) (map[string]uint16, 
 	if group == nil {
 		return map[string]uint16{}, nil
 	}
-	return DashboardURLTestOutbounds(ctx, s.outbound, group.history, s.logger, group.outboundsSnapshot(), group.link), nil
+	return dashboardURLTestOutbounds(ctx, s.outbound, group.history, s.logger, group.outboundsSnapshot(), group.link, group.profileRegistry), nil
 }
 
 func (s *LoadBalance) CheckOutbounds() {
@@ -287,9 +287,11 @@ func (s *LoadBalance) DialContext(ctx context.Context, network string, destinati
 	adapter.NoteRealOutbound(ctx, outbound)
 	conn, err := outbound.DialContext(ctx, network, destination)
 	if err == nil {
+		group.profileRegistry.recordPassive(groupTCPPassiveProfileKey(outbound), true, 0, 0)
 		return group.interruptGroup.NewConnEx(conn, interrupt.IsExternalConnectionFromContext(ctx), interrupt.IsProviderConnectionFromContext(ctx)), nil
 	}
 	s.logger.ErrorContext(ctx, err)
+	group.profileRegistry.recordPassive(groupTCPPassiveProfileKey(outbound), false, 0, groupPassiveFailureTTL)
 	key := historyKeyForOutbound(s.outbound, outbound, group.link, N.NetworkTCP)
 	group.history.DeleteURLTestHistoryKey(key)
 	go group.CheckOutbounds(true)
@@ -310,14 +312,14 @@ func (s *LoadBalance) ListenPacket(ctx context.Context, destination M.Socksaddr)
 	adapter.NoteRealOutbound(ctx, outbound)
 	conn, err := outbound.ListenPacket(ctx, destination)
 	if err == nil {
-		group.udpFailures.clear(outbound)
+		group.profileRegistry.recordPassive(groupUDPProfileKey(outbound), true, 0, 0)
 		return group.interruptGroup.NewPacketConnEx(conn, interrupt.IsExternalConnectionFromContext(ctx), interrupt.IsProviderConnectionFromContext(ctx)), nil
 	}
 	s.logger.ErrorContext(ctx, err)
 	// UDP failure is transport-scoped passive evidence. Keep the TCP URL-test
 	// history intact; only suppress this endpoint for a short UDP cooldown and
 	// let the normal bounded check refresh its control-plane view.
-	group.udpFailures.mark(outbound)
+	group.profileRegistry.recordPassive(groupUDPProfileKey(outbound), false, 0, groupPassiveFailureTTL)
 	go group.CheckOutbounds(true)
 	return nil, err
 }
@@ -425,7 +427,8 @@ type LoadBalanceGroup struct {
 	interruptExternalConnections bool
 	access                       sync.Mutex
 	outboundsAccess              sync.RWMutex
-	udpFailures                  *groupUDPFailureTracker
+	profileRegistry              *nodeProfileRegistry
+	releaseProfileRegistry       func()
 	ticker                       *time.Ticker
 	close                        chan struct{}
 	started                      bool
@@ -467,6 +470,7 @@ func NewLoadBalanceGroup(ctx context.Context, outboundManager adapter.OutboundMa
 	if link == "" {
 		link = "https://www.gstatic.com/generate_204"
 	}
+	profileRegistry, releaseProfileRegistry := acquireGroupProfileRegistry(ctx)
 	loadBalanceGroup := &LoadBalanceGroup{
 		ctx:                          ctx,
 		outbound:                     outboundManager,
@@ -483,7 +487,8 @@ func NewLoadBalanceGroup(ctx context.Context, outboundManager adapter.OutboundMa
 		pause:                        service.FromContext[pause.Manager](ctx),
 		interruptGroup:               interrupt.NewGroup(),
 		interruptExternalConnections: interruptExternalConnections,
-		udpFailures:                  newGroupUDPFailureTracker(),
+		profileRegistry:              profileRegistry,
+		releaseProfileRegistry:       releaseProfileRegistry,
 	}
 	if persistent {
 		// Surge's persistent mode is host-affinity over the currently available
@@ -575,6 +580,10 @@ func (g *LoadBalanceGroup) Close() error {
 	if callback != nil {
 		g.pause.UnregisterCallback(callback)
 	}
+	if g.releaseProfileRegistry != nil {
+		g.releaseProfileRegistry()
+		g.releaseProfileRegistry = nil
+	}
 	return nil
 }
 
@@ -644,15 +653,28 @@ func (g *LoadBalanceGroup) urlTest(ctx context.Context, force bool) (map[string]
 	for _, detour := range g.outboundsSnapshot() {
 		tag := detour.Tag()
 		realTag := RealTag(g.outbound, detour)
-		if checked[realTag] {
+		endpointKey, profileKey := groupTCPProfileKey(detour, g.link)
+		if checked[profileKey] {
 			continue
 		}
 		key := historyKeyForOutbound(g.outbound, detour, g.link, N.NetworkTCP)
-		history := g.history.LoadURLTestHistoryKey(key)
-		if !force && history != nil && time.Since(history.Time) < g.interval {
-			continue
+		if !force {
+			if g.profileRegistry != nil {
+				if profile, loaded := g.profileRegistry.snapshot(profileKey); loaded && time.Now().Before(profile.nextProbeAt) {
+					if profile.success {
+						resultAccess.Lock()
+						result[tag] = profile.delay
+						resultAccess.Unlock()
+					} else {
+						g.history.DeleteURLTestHistoryKey(key)
+					}
+					continue
+				}
+			} else if history := g.history.LoadURLTestHistoryKey(key); history != nil && time.Since(history.Time) < g.interval {
+				continue
+			}
 		}
-		checked[realTag] = true
+		checked[profileKey] = true
 		p, loaded := g.outbound.Outbound(realTag)
 		if !loaded {
 			continue
@@ -660,7 +682,15 @@ func (g *LoadBalanceGroup) urlTest(ctx context.Context, force bool) (map[string]
 		b.Go(realTag, func() (any, error) {
 			testCtx, cancel := context.WithTimeout(ctx, C.TCPTimeout)
 			defer cancel()
-			t, err := urltest.URLTest(testCtx, g.link, p)
+			var t uint16
+			var err error
+			if g.profileRegistry != nil {
+				t, err, _ = g.profileRegistry.runProbeMode(testCtx, endpointKey, profileKey, C.TCPTimeout, g.interval, force, func(probeCtx context.Context) (uint16, error) {
+					return urltest.URLTest(probeCtx, g.link, p)
+				})
+			} else {
+				t, err = urltest.URLTest(testCtx, g.link, p)
+			}
 			if err != nil {
 				g.logger.Debug("outbound ", tag, " unavailable: ", err)
 				g.history.DeleteURLTestHistoryKey(key)
@@ -725,6 +755,9 @@ func (g *LoadBalanceGroup) UnwrapPreMatch(metadata *adapter.InboundContext, matc
 // died since; Surge re-benchmarks before trusting it again. Untested members
 // are not alive here — strategies keep their own recovery fallbacks.
 func (g *LoadBalanceGroup) AliveForTestUrl(proxy adapter.Outbound) bool {
+	if g.profileRegistry != nil {
+		return groupProfileAlive(g.profileRegistry, proxy, g.link, g.alivenessWindow())
+	}
 	key := historyKeyForOutbound(g.outbound, proxy, g.link, N.NetworkTCP)
 	if history := g.history.LoadURLTestHistoryKey(key); history != nil {
 		// A zero Time never occurs in production (StoreURLTestHistoryKey stamps
@@ -738,7 +771,7 @@ func (g *LoadBalanceGroup) memberAvailable(proxy adapter.Outbound, metadata *ada
 	if !g.AliveForTestUrl(proxy) {
 		return false
 	}
-	if metadata != nil && N.NetworkName(metadata.Network) == N.NetworkUDP && g.udpFailures.active(proxy) {
+	if metadata != nil && N.NetworkName(metadata.Network) == N.NetworkUDP && !groupUDPAvailable(g.profileRegistry, proxy) {
 		return false
 	}
 	return true

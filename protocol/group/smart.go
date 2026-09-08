@@ -302,8 +302,11 @@ func (s *Smart) buildCandidateMetadataWithDialIdentity(tag, identity, dialIdenti
 		identity:     probeIdentity,
 		dialIdentity: dialIdentity,
 		profileID:    tag,
-		probeKey:     smartProbeKey(probeIdentity, s.probeURL, s.probeTimeout),
-		weight:       s.nodeWeights.Explain(tag),
+		// An active URL test traverses the authenticated proxy path. Its result
+		// therefore belongs to DialIdentity, while registry admission remains
+		// serialized by the credential-free endpoint identity.
+		probeKey: nodeProfileKey(dialIdentity, s.probeURL+"\x00"+N.NetworkTCP, 0),
+		weight:   s.nodeWeights.Explain(tag),
 	}
 	if dialIdentity != "" && dialIdentity != tag {
 		metadata.profileID = "dial:" + dialIdentity
@@ -564,7 +567,7 @@ type Smart struct {
 	postStarted                bool
 	retired                    bool
 	workerStarted              bool
-	probeRegistry              *smartProbeRegistry
+	probeRegistry              *nodeProfileRegistry
 	releaseProbeRegistry       func()
 	probeStartupDelay          time.Duration
 	probeNow                   chan struct{}
@@ -766,7 +769,7 @@ func NewSmart(ctx context.Context, router adapter.Router, logger log.ContextLogg
 			logger.Info("smart policy backend: zig, selection mode: ", selectionMode.String())
 		}
 	}
-	probeRegistry, releaseProbeRegistry := acquireSmartProbeRegistry(ctx)
+	probeRegistry, releaseProbeRegistry := acquireSmartProfileRegistry(ctx)
 	smart := &Smart{
 		Adapter:    outbound.NewAdapter(C.TypeSmart, tag, []string{N.NetworkTCP, N.NetworkUDP}, options.Outbounds),
 		ctx:        ctx,
@@ -836,7 +839,7 @@ func NewSmart(ctx context.Context, router adapter.Router, logger log.ContextLogg
 		interruptGrace:            interruptGrace,
 		probeRegistry:             probeRegistry,
 		releaseProbeRegistry:      releaseProbeRegistry,
-		probeStartupDelay:         probeRegistry.startupDelay(),
+		probeStartupDelay:         probeRegistry.registerSmartScheduler(),
 		probeNow:                  make(chan struct{}, 1),
 		families:                  trafficfamily.NewResolver(),
 	}
@@ -2434,17 +2437,17 @@ func (s *Smart) recoverOpenCandidates(ctx context.Context, candidates []adapter.
 					if identity == "" {
 						identity = candidate.Tag()
 					}
+					dialIdentity := metadata.dialIdentity
+					if dialIdentity == "" {
+						dialIdentity = identity
+					}
 					key := metadata.probeKey
 					if baseTransport == N.NetworkUDP {
-						probeIdentity := "udp://dns-health"
-						if family := smartTransportFamily(transport); family != "" {
-							probeIdentity += "/" + family
-						}
-						key = smartProbeKey(identity, probeIdentity, probeTimeout)
+						key = nodeProfileKey(dialIdentity, "udp://dns-health\x00"+transport, 0)
 					} else if probeFamily := smartTransportFamily(transport); probeFamily != "" {
-						key = smartProbeKey(identity, s.probeURL+"/"+transport, probeTimeout)
+						key = nodeProfileKey(dialIdentity, s.probeURL+"\x00"+transport, 0)
 					} else if key == "" {
-						key = smartProbeKey(identity, s.probeURL, probeTimeout)
+						key = nodeProfileKey(dialIdentity, s.probeURL+"\x00"+N.NetworkTCP, 0)
 					}
 					var delay uint16
 					delay, err = s.probeRegistry.runRecoveryForEndpoint(probeCtx, identity, key, probeTimeout, s.probeInterval, func(probeContext context.Context) (uint16, error) {
@@ -2667,6 +2670,7 @@ func (s *Smart) dialContextAdaptive(ctx context.Context, network string, destina
 				continue
 			}
 			s.observeDial(time.Now(), networkKey, siteKey, candidate.Tag(), transport, true, result.elapsed)
+			s.recordSharedDataPlaneEvidence(candidate.Tag(), transport, true)
 			if result.observedTransport != "" && result.observedTransport != transport {
 				s.observeDial(time.Now(), networkKey, siteKey, candidate.Tag(), result.observedTransport, true, result.elapsed)
 			}
@@ -2777,6 +2781,7 @@ func (s *Smart) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.
 			continue
 		}
 		s.observeDial(time.Now(), networkKey, siteKey, candidate.Tag(), transport, true, elapsed)
+		s.recordSharedDataPlaneEvidence(candidate.Tag(), transport, true)
 		adapter.NoteRealOutbound(ctx, candidate)
 		endpointID := rank.status.EndpointID
 		if endpointID == "" {
@@ -2999,7 +3004,7 @@ func (s *Smart) probeWithBudget(ctx context.Context, budget int) (result map[str
 					performed = true
 				}
 				families := s.probeTCPFamilies(ctx, candidate, metadata)
-				penalize := err != nil && !errors.Is(err, errSharedSmartProbeDeferred) && sweepCtx.Err() == nil && !s.closing.Load()
+				penalize := err != nil && !errors.Is(err, errSharedNodeProbeDeferred) && sweepCtx.Err() == nil && !s.closing.Load()
 				results <- probeResult{candidate: candidate, delay: delay, err: err, penalize: penalize, performed: performed, families: families}
 			}
 		}()
@@ -3212,6 +3217,10 @@ func (s *Smart) probeTCPFamilies(ctx context.Context, candidate adapter.Outbound
 	if identity == "" {
 		identity = candidate.Tag()
 	}
+	dialIdentity := metadata.dialIdentity
+	if dialIdentity == "" {
+		dialIdentity = identity
+	}
 	probeTimeout := s.probeTimeout
 	if probeTimeout <= 0 {
 		probeTimeout = defaultSmartProbeTimeout
@@ -3223,7 +3232,7 @@ func (s *Smart) probeTCPFamilies(ctx context.Context, candidate adapter.Outbound
 		{transport: "tcp/ipv4"},
 		{transport: "tcp/ipv6"},
 	} {
-		key := smartProbeKey(identity, s.probeURL+"/"+family.transport, probeTimeout)
+		key := nodeProfileKey(dialIdentity, s.probeURL+"\x00"+family.transport, 0)
 		startedAt := time.Now()
 		var (
 			delay     uint16
@@ -3325,6 +3334,10 @@ func (s *Smart) probeUDPWithBudget(ctx context.Context, candidates []adapter.Out
 			if identity == "" {
 				identity = candidate.Tag()
 			}
+			dialIdentity := metadata.dialIdentity
+			if dialIdentity == "" {
+				dialIdentity = identity
+			}
 			probeTimeout := s.probeTimeout
 			if probeTimeout <= 0 {
 				probeTimeout = defaultSmartUDPProbeTimeout
@@ -3333,7 +3346,7 @@ func (s *Smart) probeUDPWithBudget(ctx context.Context, candidates []adapter.Out
 				familyStarted := time.Now()
 				familyPerformed := false
 				var familyErr error
-				key := smartProbeKey(identity, "udp://dns-health/"+target.transport, probeTimeout)
+				key := nodeProfileKey(dialIdentity, "udp://dns-health\x00"+target.transport, 0)
 				if s.probeRegistry != nil {
 					_, familyErr, familyPerformed = s.probeRegistry.runProbeMode(probeCtx, identity, key, probeTimeout, s.probeInterval, false, func(probeContext context.Context) (uint16, error) {
 						familyPerformed = true
@@ -3363,7 +3376,7 @@ func (s *Smart) probeUDPWithBudget(ctx context.Context, candidates []adapter.Out
 			if aggregateSuccess {
 				err = nil
 			} else if !performed && err == nil {
-				err = errSharedSmartProbeDeferred
+				err = errSharedNodeProbeDeferred
 			}
 			cancel()
 			if aggregateElapsed == 0 {
@@ -3553,10 +3566,33 @@ func (s *Smart) observeDataPlaneFailure(now time.Time, network, site, candidate,
 
 func (s *Smart) observeDataPlaneFailureWithType(now time.Time, network, site, candidate, transport string, elapsed time.Duration, failureType string) {
 	s.observeDial(now, network, site, candidate, transport, false, elapsed)
+	s.recordSharedDataPlaneEvidence(candidate, transport, false)
 	if s.store != nil {
 		s.store.quarantineDataPlaneFailure(now, network, site, s.candidateProfileID(candidate), transport, defaultSmartDataPlaneFailureQuarantine)
 	}
 	s.noteFailureType(smartStatusSelectionKey(network, site, transport), failureType)
+}
+
+// recordSharedDataPlaneEvidence publishes only transport reachability to the
+// process-wide base profile. Smart keeps site scoring and breaker semantics in
+// its policy store, while URLTest and LoadBalance can immediately avoid a
+// credential that real Smart traffic just proved unusable. TCP and UDP use
+// independent keys so one transport can never poison the other.
+func (s *Smart) recordSharedDataPlaneEvidence(tag, transport string, success bool) {
+	if s == nil || s.probeRegistry == nil {
+		return
+	}
+	s.access.RLock()
+	candidate := s.candidateByTag[tag]
+	s.access.RUnlock()
+	if candidate == nil {
+		return
+	}
+	key := groupTCPPassiveProfileKey(candidate)
+	if smartTransportBase(transport) == N.NetworkUDP {
+		key = groupUDPProfileKey(candidate)
+	}
+	s.probeRegistry.recordPassive(key, success, 0, groupPassiveFailureTTL)
 }
 
 func (s *Smart) observeDataPlaneFailureForTransport(now time.Time, network, site, candidate, aggregateTransport, observedTransport string, elapsed time.Duration) {
@@ -3700,12 +3736,16 @@ func (s *Smart) rankPooled(ctx context.Context, transport string, destination M.
 			scoreEstimate.FirstByteP95MS += penalty
 		}
 		sharedProbeDead := false
-		if s.probeRegistry != nil && common.Contains(candidate.Network(), N.NetworkTCP) {
-			probeKey := metadata.probeKey
-			if family := smartTransportFamily(transport); family != "" {
-				probeKey = smartProbeKey(metadata.identity, s.probeURL+"/"+family, s.probeTimeout)
+		if s.probeRegistry != nil {
+			if baseTransport == N.NetworkTCP && common.Contains(candidate.Network(), N.NetworkTCP) {
+				probeKey := metadata.probeKey
+				if family := smartTransportFamily(transport); family != "" {
+					probeKey = nodeProfileKey(metadata.dialIdentity, s.probeURL+"\x00"+transport, 0)
+				}
+				sharedProbeDead = s.probeRegistry.dead(probeKey) || !groupTCPAvailable(s.probeRegistry, candidate)
+			} else if baseTransport == N.NetworkUDP {
+				sharedProbeDead = !groupUDPAvailable(s.probeRegistry, candidate)
 			}
-			sharedProbeDead = s.probeRegistry.dead(probeKey)
 		}
 		if sharedProbeDead {
 			estimate.State = "open"

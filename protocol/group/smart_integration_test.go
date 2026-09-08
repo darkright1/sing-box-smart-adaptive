@@ -515,7 +515,7 @@ func TestSmartProbeDeadlineCommitsCompletedObservations(t *testing.T) {
 	fast := newSmartFakeOutbound("probe-fast", nil)
 	slow := newSmartFakeOutbound("probe-slow", nil)
 	smart := newTestSmart(fast, slow)
-	registry := newSmartProbeRegistry(context.Background())
+	registry := newNodeProfileRegistry(context.Background())
 	defer registry.close()
 	registry.probe = func(ctx context.Context, _ string, candidate adapter.Outbound) (uint16, error) {
 		if candidate.Tag() == fast.Tag() {
@@ -564,12 +564,14 @@ func TestSmartRequestProbeCoalesces(t *testing.T) {
 func TestSmartBasicProbeRequiresConfirmedFailure(t *testing.T) {
 	candidate := newSmartFakeOutbound("bootstrap-candidate", nil)
 	smart := newTestSmart(candidate)
-	registry := newSmartProbeRegistry(context.Background())
+	registry := newNodeProfileRegistry(context.Background())
 	defer registry.close()
 	smart.probeRegistry = registry
 	setSmartCandidateIdentities(smart, map[string]string{candidate.Tag(): candidate.Tag()})
-	key := smartProbeKey(candidate.Tag(), smart.probeURL, smart.probeTimeout)
-	registry.entries[key] = &smartProbeEntry{result: smartProbeResult{
+	smart.access.RLock()
+	key := smart.candidateMetadataByTag[candidate.Tag()].probeKey
+	smart.access.RUnlock()
+	registry.entries[key] = &nodeProfileEntry{result: nodeProfileResult{
 		success: false, failures: 1, nextProbeAt: time.Now().Add(time.Minute),
 	}}
 	ranks, _, _, _ := smart.rank(context.Background(), N.NetworkTCP, M.Socksaddr{})
@@ -583,11 +585,30 @@ func TestSmartBasicProbeRequiresConfirmedFailure(t *testing.T) {
 	}
 }
 
+func TestSmartConsumesSharedPassiveTransportFailure(t *testing.T) {
+	candidate := newSmartFakeOutbound("shared-passive", nil)
+	smart := newTestSmart(candidate)
+	registry := newNodeProfileRegistry(context.Background())
+	defer registry.close()
+	smart.probeRegistry = registry
+	setSmartCandidateIdentities(smart, map[string]string{candidate.Tag(): candidate.Tag()})
+	registry.recordPassive(groupTCPPassiveProfileKey(candidate), false, 0, groupPassiveFailureTTL)
+	ranks, _, _, _ := smart.rank(context.Background(), N.NetworkTCP, M.Socksaddr{})
+	if len(ranks) != 1 || ranks[0].status.State != "open" {
+		t.Fatalf("shared passive TCP failure did not isolate Smart candidate: %+v", ranks)
+	}
+	registry.recordPassive(groupTCPPassiveProfileKey(candidate), true, 0, 0)
+	ranks, _, _, _ = smart.rank(context.Background(), N.NetworkTCP, M.Socksaddr{})
+	if len(ranks) != 1 || ranks[0].status.State == "open" {
+		t.Fatalf("shared passive TCP recovery did not restore Smart candidate: %+v", ranks)
+	}
+}
+
 func TestSmartAllOpenRecoveryUsesHalfOpenBasicProbe(t *testing.T) {
 	first := newSmartFakeOutbound("recovery-first", nil)
 	second := newSmartFakeOutbound("recovery-second", nil)
 	smart := newTestSmart(first, second)
-	registry := newSmartProbeRegistry(context.Background())
+	registry := newNodeProfileRegistry(context.Background())
 	defer registry.close()
 	registry.probe = func(_ context.Context, _ string, candidate adapter.Outbound) (uint16, error) {
 		if candidate.Tag() == first.Tag() {
@@ -618,7 +639,7 @@ func TestSmartProbePublishesFirstSuccessBeforeCycleCompletes(t *testing.T) {
 	fast := newSmartFakeOutbound("stream-fast", nil)
 	slow := newSmartFakeOutbound("stream-slow", nil)
 	smart := newTestSmart(fast, slow)
-	registry := newSmartProbeRegistry(context.Background())
+	registry := newNodeProfileRegistry(context.Background())
 	defer registry.close()
 	releaseSlow := make(chan struct{})
 	registry.probe = func(_ context.Context, _ string, candidate adapter.Outbound) (uint16, error) {
