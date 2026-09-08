@@ -23,5 +23,8 @@ type DataplaneSink interface {
 	// control map without touching policy banks (hot reconfig surface).
 	WriteControlV3(enabled bool, flags uint32, activeBank, generation, routingMark uint32) error
 	InvalidateFlowDirect() error
+	// Disable is the last-resort fail-closed fuse. It detaches the v3
+	// dataplane's control enable bit when a narrower recovery cannot be trusted.
+	Disable() error
 	PolicyGeneration() uint32
 }
