@@ -98,6 +98,7 @@ type memSink struct {
 	controlWrites int
 	flags         uint32
 	controlErr    error
+	macErr        error
 	deleteErr     error
 	invalidateErr error
 }
@@ -127,7 +128,7 @@ func (m *memSink) DeleteDirectFlow(protocol uint8, source, destination netip.Add
 }
 func (m *memSink) PublishMACPolicies(entries []ebpfv3.MACPolicyEntry) error {
 	m.mac += len(entries)
-	return nil
+	return m.macErr
 }
 func (m *memSink) DeleteMergedStaticDirect(prefix netip.Prefix) error {
 	m.revoked = append(m.revoked, prefix)
@@ -232,6 +233,57 @@ func TestLifecycleLearnFlowValidatesBeforeKernelWrite(t *testing.T) {
 	}
 	if sink.flows != 0 {
 		t.Fatalf("kernel was mutated before validation: puts=%d", sink.flows)
+	}
+}
+
+func TestLifecycleMACPublishFailureInvalidatesGeneration(t *testing.T) {
+	drop := false
+	lc, err := NewLifecycle(option.EBPFSharedNetworkOptions{
+		Enabled: true, Engine: EngineV3, DataPlane: "socket_assign", DropUDP443: &drop,
+		PolicyOffload: option.EBPFPolicyOffloadOptions{Enabled: true, MACSourcePolicy: true},
+	}, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lc.Close()
+	sink := &memSink{gen: 1, macErr: errors.New("partial MAC snapshot")}
+	lc.BindSink(sink)
+	before := lc.Backend().Control.PolicyGeneration
+	err = lc.PublishMACSourcePolicies([]ebpfv3.MACPolicyEntry{{
+		Key: ebpfv3.MACKey{Addr: [6]byte{1, 2, 3, 4, 5, 6}},
+	}})
+	if err == nil {
+		t.Fatal("expected MAC publish error")
+	}
+	if sink.invalid != 1 || sink.gen == before {
+		t.Fatalf("MAC failure did not invalidate generation: invalid=%d before=%d after=%d", sink.invalid, before, sink.gen)
+	}
+	if len(lc.Backend().MACPolicies) != 0 {
+		t.Fatal("model MAC snapshot changed after kernel publish failure")
+	}
+}
+
+func TestLifecycleMACPublishDisablesFastPathWhenRecoveryFails(t *testing.T) {
+	drop := false
+	lc, err := NewLifecycle(option.EBPFSharedNetworkOptions{
+		Enabled: true, Engine: EngineV3, DataPlane: "socket_assign", DropUDP443: &drop,
+		PolicyOffload: option.EBPFPolicyOffloadOptions{Enabled: true, MACSourcePolicy: true},
+	}, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lc.Close()
+	sink := &memSink{gen: 1, macErr: errors.New("partial MAC snapshot"), invalidateErr: errors.New("generation bump failed")}
+	lc.BindSink(sink)
+	lc.Backend().Control.Flags |= ebpfv3.FlagMACSource
+	err = lc.PublishMACSourcePolicies([]ebpfv3.MACPolicyEntry{{
+		Key: ebpfv3.MACKey{Addr: [6]byte{6, 5, 4, 3, 2, 1}},
+	}})
+	if err == nil {
+		t.Fatal("expected MAC publish recovery error")
+	}
+	if lc.Backend().Control.Flags&ebpfv3.FlagMACSource != 0 {
+		t.Fatal("MAC fast path remained enabled after recovery failure")
 	}
 }
 

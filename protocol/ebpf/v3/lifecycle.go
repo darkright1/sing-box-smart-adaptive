@@ -238,12 +238,52 @@ func (l *Lifecycle) PublishMACSourcePolicies(entries []ebpfv3.MACPolicyEntry) er
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	if len(entries) > ebpfv3.MaxSourcePolicies {
+		return fmt.Errorf("mac source policy exceeds map capacity")
+	}
 	if l.sink != nil {
 		if err := l.sink.PublishMACPolicies(entries); err != nil {
+			return l.recoverMACPublishFailureLocked(err)
+		}
+	}
+	if err := l.backend.PublishMACPolicies(entries); err != nil {
+		// This is expected to be unreachable after the preflight above, but
+		// keep the kernel/model transaction fail-closed if model validation is
+		// extended in the future.
+		return l.recoverMACPublishFailureLocked(err)
+	}
+	return nil
+}
+
+// recoverMACPublishFailureLocked retires an uncertain one-map MAC snapshot.
+// A partial kernel update must never remain live with the old model epoch. If
+// generation invalidation itself cannot be committed, disable the MAC fast
+// path so traffic returns to the userspace decision path.
+func (l *Lifecycle) recoverMACPublishFailureLocked(cause error) error {
+	if l == nil || l.sink == nil {
+		return cause
+	}
+	invalidateErr := l.invalidateGenerationLocked()
+	if invalidateErr == nil {
+		return cause
+	}
+	disableErr := l.disableMACSourceLocked()
+	return errors.Join(cause, invalidateErr, disableErr)
+}
+
+func (l *Lifecycle) disableMACSourceLocked() error {
+	if l == nil || l.backend == nil {
+		return nil
+	}
+	flags := l.backend.Control.Flags &^ ebpfv3.FlagMACSource
+	if l.sink != nil {
+		bank, generation := l.backend.Publisher.Snapshot()
+		if err := l.sink.WriteControlV3(true, flags, bank, generation, l.backend.Control.RoutingMark); err != nil {
 			return err
 		}
 	}
-	return l.backend.PublishMACPolicies(entries)
+	l.backend.Control.Flags = flags
+	return nil
 }
 
 // PublishStaticDirect replaces the complete DIRECT prefix snapshot in both
