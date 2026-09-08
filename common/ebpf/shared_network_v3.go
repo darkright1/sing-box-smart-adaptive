@@ -463,8 +463,10 @@ func (b *V3Backend) PutDirectFlow(protocol uint8, source, destination netip.Addr
 	if err != nil {
 		return err
 	}
-	b.access.RLock()
-	defer b.access.RUnlock()
+	// Pair publication may need to advance the generation if the reverse
+	// update and its forward rollback both fail, so take the exclusive lock.
+	b.access.Lock()
+	defer b.access.Unlock()
 	b.mapAccess.Lock()
 	defer b.mapAccess.Unlock()
 	if b.runtime == nil || !b.flowEnabled {
@@ -486,7 +488,8 @@ func (b *V3Backend) PutDirectFlow(protocol uint8, source, destination netip.Addr
 		// traffic take a different path until the TTL expires.
 		cleanupErr := deleteMap(int(b.runtime.flow_map_fd), unsafe.Pointer(&fwd))
 		if cleanupErr != nil && !errors.Is(cleanupErr, unix.ENOENT) {
-			return errors.Join(E.Cause(err, "update v3 flow reverse"), E.Cause(cleanupErr, "rollback v3 flow forward"))
+			invalidateErr := b.invalidateFlowGenerationLocked()
+			return errors.Join(E.Cause(err, "update v3 flow reverse"), E.Cause(cleanupErr, "rollback v3 flow forward"), invalidateErr)
 		}
 		return E.Cause(err, "update v3 flow reverse")
 	}
@@ -556,6 +559,13 @@ func (b *V3Backend) InvalidateFlowDirect() error {
 	}
 	b.access.Lock()
 	defer b.access.Unlock()
+	return b.invalidateFlowGenerationLocked()
+}
+
+func (b *V3Backend) invalidateFlowGenerationLocked() error {
+	if b == nil {
+		return osErrClosed
+	}
 	if b.runtime == nil {
 		return osErrClosed
 	}
@@ -1292,8 +1302,9 @@ func (b *V3Backend) PublishMACPolicies(entries []ebpfv3.MACPolicyEntry) error {
 	if generation == 0 {
 		generation = 1
 	}
-	// Enumerate live keys first: deleting while iterating with get_next_key
-	// can skip entries, so removals happen after the walk completes.
+	// Enumerate live keys and values first: deleting while iterating with
+	// get_next_key can skip entries, and retaining the old values lets us
+	// restore the previous snapshot if a later syscall fails.
 	var live []v3MACKey
 	var next v3MACKey
 	for {
@@ -1309,6 +1320,17 @@ func (b *V3Backend) PublishMACPolicies(entries []ebpfv3.MACPolicyEntry) error {
 			return E.Cause(err, "iterate v3 source mac")
 		}
 		live = append(live, next)
+	}
+	previous := make(map[v3MACKey]v3MACPolicyValue, len(live))
+	for _, key := range live {
+		value := v3MACPolicyValue{}
+		if err := lookupMap(mapFD, unsafe.Pointer(&key), unsafe.Pointer(&value)); err != nil {
+			if errors.Is(err, unix.ENOENT) {
+				continue
+			}
+			return E.Cause(err, "read v3 source mac snapshot")
+		}
+		previous[key] = value
 	}
 	desired := make(map[v3MACKey]v3MACPolicyValue, len(entries))
 	for _, entry := range entries {
@@ -1333,19 +1355,42 @@ func (b *V3Backend) PublishMACPolicies(entries []ebpfv3.MACPolicyEntry) error {
 			Ifindex:  entry.Key.Ifindex,
 		}] = value
 	}
-	for _, old := range live {
+	restore := func() error {
+		var restoreErr error
+		// Remove keys that did not exist in the previous snapshot and restore
+		// every previous value. ENOENT is harmless during rollback because the
+		// target state is already absent.
+		for key := range desired {
+			if _, existed := previous[key]; existed {
+				continue
+			}
+			entry := key
+			if err := deleteMap(mapFD, unsafe.Pointer(&entry)); err != nil && !errors.Is(err, unix.ENOENT) {
+				restoreErr = errors.Join(restoreErr, E.Cause(err, "rollback new v3 source mac"))
+			}
+		}
+		for key, value := range previous {
+			entry := key
+			old := value
+			if err := updateMap(mapFD, unsafe.Pointer(&entry), unsafe.Pointer(&old)); err != nil {
+				restoreErr = errors.Join(restoreErr, E.Cause(err, "restore v3 source mac"))
+			}
+		}
+		return restoreErr
+	}
+	for key, value := range desired {
+		entry := key
+		if err := updateMap(mapFD, unsafe.Pointer(&entry), unsafe.Pointer(&value)); err != nil {
+			return errors.Join(E.Cause(err, "publish v3 source mac"), restore())
+		}
+	}
+	for old := range previous {
 		if _, ok := desired[old]; ok {
 			continue
 		}
 		stale := old
 		if err := deleteMap(mapFD, unsafe.Pointer(&stale)); err != nil && !errors.Is(err, unix.ENOENT) {
-			return E.Cause(err, "delete stale v3 source mac")
-		}
-	}
-	for key, value := range desired {
-		entry := key
-		if err := updateMap(mapFD, unsafe.Pointer(&entry), unsafe.Pointer(&value)); err != nil {
-			return E.Cause(err, "publish v3 source mac")
+			return errors.Join(E.Cause(err, "delete stale v3 source mac"), restore())
 		}
 	}
 	return nil
