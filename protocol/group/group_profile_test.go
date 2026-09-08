@@ -70,6 +70,50 @@ func TestExistingGroupProfileRegistryDoesNotGuessAcrossProcesses(t *testing.T) {
 	cancelB()
 }
 
+func TestManagerScopedProfileRegistryWaitsForAllLifecycles(t *testing.T) {
+	manager := &struct{ adapter.OutboundManager }{}
+	ctxA, cancelA := context.WithCancel(context.Background())
+	ctxB, cancelB := context.WithCancel(context.Background())
+	first, releaseFirst := acquireGroupProfileRegistry(ctxA, manager)
+	second, releaseSecond := acquireGroupProfileRegistry(ctxB, manager)
+	if first != second {
+		t.Fatal("one outbound manager received multiple profile registries")
+	}
+	releaseFirst()
+	cancelA()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) && existingGroupProfileRegistry(manager) == nil {
+		time.Sleep(time.Millisecond)
+	}
+	if existingGroupProfileRegistry(manager) != first {
+		t.Fatal("first lifecycle cancellation closed a registry still used by another lifecycle")
+	}
+	releaseSecond()
+	cancelB()
+	deadline = time.Now().Add(time.Second)
+	for time.Now().Before(deadline) && existingGroupProfileRegistry(manager) != nil {
+		time.Sleep(time.Millisecond)
+	}
+	if existingGroupProfileRegistry(manager) != nil {
+		t.Fatal("last lifecycle cancellation did not release the manager registry")
+	}
+}
+
+func TestManagerScopedProfileRegistryClosesWithoutLifecycleContext(t *testing.T) {
+	manager := &struct{ adapter.OutboundManager }{}
+	registry, release := acquireGroupProfileRegistry(context.Background(), manager)
+	if existingGroupProfileRegistry(manager) != registry {
+		t.Fatal("manager registry was not registered")
+	}
+	release()
+	if existingGroupProfileRegistry(manager) != nil {
+		t.Fatal("background-context manager registry was retained after its last release")
+	}
+	if registry.ctx.Err() == nil {
+		t.Fatal("released background-context registry was not canceled")
+	}
+}
+
 func TestSmartURLTestAndLoadBalanceShareOneTCPProfile(t *testing.T) {
 	registry := newNodeProfileRegistry(context.Background())
 	defer registry.close()
@@ -203,5 +247,56 @@ func TestNodeProfilesKeepAddressFamiliesSeparate(t *testing.T) {
 	_, v6 := groupTCPProfileKey(node, "https://probe", "tcp/ipv6")
 	if generic == v4 || generic == v6 || v4 == v6 {
 		t.Fatalf("TCP profile keys collapsed address families: generic=%q v4=%q v6=%q", generic, v4, v6)
+	}
+}
+
+func TestTCPPassiveFailuresKeepAddressFamiliesSeparate(t *testing.T) {
+	node := &sharedProfileTestOutbound{tag: "node", endpoint: "path", dial: "dial"}
+	registry := newNodeProfileRegistry(context.Background())
+	defer registry.close()
+	registry.recordPassive(groupTCPPassiveProfileKey(node, "tcp6"), false, 0, groupPassiveFailureTTL)
+	if groupTCPAvailable(registry, node, "tcp6") {
+		t.Fatal("IPv6 passive failure was not applied to IPv6")
+	}
+	if !groupTCPAvailable(registry, node, "tcp4") || !groupTCPAvailable(registry, node, N.NetworkTCP) {
+		t.Fatal("IPv6 passive failure contaminated generic or IPv4 TCP")
+	}
+}
+
+func TestFamilySpecificProfileIsConsumedBeforeGenericProfile(t *testing.T) {
+	registry := newNodeProfileRegistry(context.Background())
+	defer registry.close()
+	node := &sharedProfileTestOutbound{tag: "node", endpoint: "path", dial: "dial"}
+	link := "https://probe.example/204"
+	_, familyKey := groupTCPProfileKey(node, link, "tcp/ipv6")
+	if _, err, _ := registry.runProbeMode(context.Background(), "path", familyKey, time.Second, time.Minute, true, func(context.Context) (uint16, error) {
+		return 33, nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if !groupProfileAlive(registry, node, link, time.Minute, "tcp6") {
+		t.Fatal("family-specific profile was not consumed for tcp6")
+	}
+	if groupProfileAlive(registry, node, link, time.Minute, "tcp4") {
+		t.Fatal("IPv6 profile leaked into tcp4")
+	}
+}
+
+func TestTCPPassiveFailureDoesNotSuppressUDP(t *testing.T) {
+	registry := newNodeProfileRegistry(context.Background())
+	defer registry.close()
+	node := &sharedProfileTestOutbound{tag: "node", endpoint: "path", dial: "dial"}
+	link := "https://probe.example/204"
+	seedSharedTCPProfile(t, registry, node, link, 25)
+	registry.recordPassive(groupTCPPassiveProfileKey(node), false, 0, groupPassiveFailureTTL)
+	if !groupProfileAlive(registry, node, link, time.Minute, N.NetworkUDP) {
+		t.Fatal("TCP passive failure suppressed UDP availability")
+	}
+	if groupTCPPassiveProfileKey(node, N.NetworkUDP) == groupTCPPassiveProfileKey(node) {
+		t.Fatal("non-TCP input aliased the generic TCP passive key")
+	}
+	registry.recordPassive(groupUDPProfileKey(node), false, 0, groupPassiveFailureTTL)
+	if groupProfileAlive(registry, node, link, time.Minute, N.NetworkUDP) {
+		t.Fatal("UDP passive failure was not applied to UDP availability")
 	}
 }

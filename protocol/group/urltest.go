@@ -350,12 +350,12 @@ func (s *URLTest) DialContext(ctx context.Context, network string, destination M
 	adapter.NoteRealOutbound(ctx, outbound)
 	conn, err := outbound.DialContext(ctx, network, destination)
 	if err == nil {
-		group.profileRegistry.recordPassive(groupTCPPassiveProfileKey(outbound), true, 0, 0)
+		group.profileRegistry.recordPassive(groupTCPPassiveProfileKey(outbound, network), true, 0, 0)
 		return group.interruptGroup.NewConn(conn, interrupt.IsExternalConnectionFromContext(ctx)), nil
 	}
 	s.logger.ErrorContext(ctx, err)
-	group.profileRegistry.recordPassive(groupTCPPassiveProfileKey(outbound), false, 0, groupPassiveFailureTTL)
-	key := historyKeyForOutbound(s.outbound, outbound, group.link, N.NetworkTCP)
+	group.profileRegistry.recordPassive(groupTCPPassiveProfileKey(outbound, network), false, 0, groupPassiveFailureTTL)
+	key := historyKeyForOutbound(s.outbound, outbound, group.link, network)
 	group.history.DeleteURLTestHistoryKey(key)
 	return nil, err
 }
@@ -553,8 +553,8 @@ func (g *URLTestGroup) Select(network string) (adapter.Outbound, bool) {
 	var minDelay uint16
 	var minOutbound adapter.Outbound
 	if selected != nil {
-		profile, loaded := groupTCPProfileSnapshot(g.profileRegistry, selected, g.link)
-		if loaded && profile.success && groupTCPAvailable(g.profileRegistry, selected) && (!isUDP || groupUDPAvailable(g.profileRegistry, selected)) {
+		profile, loaded := groupTCPProfileSnapshot(g.profileRegistry, selected, g.link, network)
+		if loaded && profile.success && groupTransportAvailable(g.profileRegistry, selected, network) {
 			if g.containsOutbound(selected, network) {
 				minOutbound = selected
 				minDelay = profile.delay
@@ -575,9 +575,9 @@ func (g *URLTestGroup) Select(network string) (adapter.Outbound, bool) {
 		if isUDP && !groupUDPAvailable(g.profileRegistry, detour) {
 			continue
 		}
-		profile, loaded := groupTCPProfileSnapshot(g.profileRegistry, detour, g.link)
+		profile, loaded := groupTCPProfileSnapshot(g.profileRegistry, detour, g.link, network)
 		var delay uint16
-		if loaded && profile.success && groupTCPAvailable(g.profileRegistry, detour) {
+		if loaded && profile.success && groupTransportAvailable(g.profileRegistry, detour, network) {
 			delay = profile.delay
 		} else if g.profileRegistry == nil {
 			key := historyKeyForOutbound(g.outbound, detour, g.link, N.NetworkTCP)

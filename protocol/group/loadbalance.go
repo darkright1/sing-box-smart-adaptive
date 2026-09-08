@@ -287,12 +287,12 @@ func (s *LoadBalance) DialContext(ctx context.Context, network string, destinati
 	adapter.NoteRealOutbound(ctx, outbound)
 	conn, err := outbound.DialContext(ctx, network, destination)
 	if err == nil {
-		group.profileRegistry.recordPassive(groupTCPPassiveProfileKey(outbound), true, 0, 0)
+		group.profileRegistry.recordPassive(groupTCPPassiveProfileKey(outbound, network), true, 0, 0)
 		return group.interruptGroup.NewConnEx(conn, interrupt.IsExternalConnectionFromContext(ctx), interrupt.IsProviderConnectionFromContext(ctx)), nil
 	}
 	s.logger.ErrorContext(ctx, err)
-	group.profileRegistry.recordPassive(groupTCPPassiveProfileKey(outbound), false, 0, groupPassiveFailureTTL)
-	key := historyKeyForOutbound(s.outbound, outbound, group.link, N.NetworkTCP)
+	group.profileRegistry.recordPassive(groupTCPPassiveProfileKey(outbound, network), false, 0, groupPassiveFailureTTL)
+	key := historyKeyForOutbound(s.outbound, outbound, group.link, network)
 	group.history.DeleteURLTestHistoryKey(key)
 	go group.CheckOutbounds(true)
 	return nil, err
@@ -754,9 +754,9 @@ func (g *LoadBalanceGroup) UnwrapPreMatch(metadata *adapter.InboundContext, matc
 // (within the check interval). A stale entry describes a node that may have
 // died since; Surge re-benchmarks before trusting it again. Untested members
 // are not alive here — strategies keep their own recovery fallbacks.
-func (g *LoadBalanceGroup) AliveForTestUrl(proxy adapter.Outbound) bool {
+func (g *LoadBalanceGroup) AliveForTestUrl(proxy adapter.Outbound, network ...string) bool {
 	if g.profileRegistry != nil {
-		return groupProfileAlive(g.profileRegistry, proxy, g.link, g.alivenessWindow())
+		return groupProfileBaselineAlive(g.profileRegistry, proxy, g.link, g.alivenessWindow(), network...)
 	}
 	key := historyKeyForOutbound(g.outbound, proxy, g.link, N.NetworkTCP)
 	if history := g.history.LoadURLTestHistoryKey(key); history != nil {
@@ -768,10 +768,14 @@ func (g *LoadBalanceGroup) AliveForTestUrl(proxy adapter.Outbound) bool {
 }
 
 func (g *LoadBalanceGroup) memberAvailable(proxy adapter.Outbound, metadata *adapter.InboundContext) bool {
-	if !g.AliveForTestUrl(proxy) {
+	var network string
+	if metadata != nil {
+		network = metadata.Network
+	}
+	if !g.AliveForTestUrl(proxy, network) {
 		return false
 	}
-	if metadata != nil && N.NetworkName(metadata.Network) == N.NetworkUDP && !groupUDPAvailable(g.profileRegistry, proxy) {
+	if !groupTransportAvailable(g.profileRegistry, proxy, network) {
 		return false
 	}
 	return true

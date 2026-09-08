@@ -3589,7 +3589,7 @@ func (s *Smart) recordSharedDataPlaneEvidence(tag, transport string, success boo
 	if candidate == nil {
 		return
 	}
-	key := groupTCPPassiveProfileKey(candidate)
+	key := groupTCPPassiveProfileKey(candidate, transport)
 	if smartTransportBase(transport) == N.NetworkUDP {
 		key = groupUDPProfileKey(candidate)
 	}
@@ -3743,7 +3743,7 @@ func (s *Smart) rankPooled(ctx context.Context, transport string, destination M.
 				if family := smartTransportFamily(transport); family != "" {
 					probeKey = nodeProfileKey(metadata.dialIdentity, s.probeURL+"\x00"+transport, 0)
 				}
-				sharedProbeDead = s.probeRegistry.dead(probeKey) || !groupTCPAvailable(s.probeRegistry, candidate)
+				sharedProbeDead = s.probeRegistry.dead(probeKey) || !groupTCPAvailable(s.probeRegistry, candidate, transport)
 			} else if baseTransport == N.NetworkUDP {
 				sharedProbeDead = !groupUDPAvailable(s.probeRegistry, candidate)
 			}

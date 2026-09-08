@@ -67,9 +67,11 @@ func (r *nodeProfileRegistry) releaseSmartScheduler() {
 }
 
 type nodeProfileRegistryReference struct {
-	registry *nodeProfileRegistry
-	refs     int
-	manager  uintptr
+	registry     *nodeProfileRegistry
+	refs         int
+	manager      uintptr
+	managerOwner adapter.OutboundManager // keep the runtime owner alive while evidence is retained
+	processKeys  map[<-chan struct{}]struct{}
 }
 
 var nodeProfileRegistries struct {
@@ -109,41 +111,49 @@ func acquireGroupProfileRegistry(ctx context.Context, managers ...adapter.Outbou
 		nodeProfileRegistries.byManager = make(map[uintptr]*nodeProfileRegistryReference)
 	}
 	var reference *nodeProfileRegistryReference
+	var watchKey <-chan struct{}
 	if managerKey != 0 {
 		reference = nodeProfileRegistries.byManager[managerKey]
 	} else {
 		reference = nodeProfileRegistries.byProcess[processKey]
 	}
 	if reference == nil {
-		reference = &nodeProfileRegistryReference{registry: newNodeProfileRegistry(ctx), manager: managerKey}
+		registryParent := ctx
+		if managerKey != 0 {
+			// A manager may be shared by groups with different lifecycle
+			// contexts. Do not bind the registry to the first group's context;
+			// the per-context watchers below perform the final cancellation.
+			registryParent = context.Background()
+		}
+		reference = &nodeProfileRegistryReference{registry: newNodeProfileRegistry(registryParent), manager: managerKey, processKeys: make(map[<-chan struct{}]struct{})}
+		if managerKey != 0 && len(managers) > 0 {
+			reference.managerOwner = managers[0]
+		}
+		if processKey != nil {
+			reference.processKeys[processKey] = struct{}{}
+			watchKey = processKey
+		}
 		if managerKey != 0 {
 			nodeProfileRegistries.byManager[managerKey] = reference
 		} else {
 			nodeProfileRegistries.byProcess[processKey] = reference
 		}
-		go func(key <-chan struct{}, owned *nodeProfileRegistryReference) {
-			if key == nil {
-				return
-			}
-			<-key
-			nodeProfileRegistries.Lock()
-			if owned.manager != 0 {
-				if nodeProfileRegistries.byManager[owned.manager] == owned {
-					delete(nodeProfileRegistries.byManager, owned.manager)
-				}
-			} else if nodeProfileRegistries.byProcess[key] == owned {
-				delete(nodeProfileRegistries.byProcess, key)
-			}
-			nodeProfileRegistries.Unlock()
-			owned.registry.close()
-		}(processKey, reference)
+	} else if managerKey != 0 && processKey != nil {
+		if _, watched := reference.processKeys[processKey]; !watched {
+			reference.processKeys[processKey] = struct{}{}
+			watchKey = processKey
+		}
 	}
 	reference.refs++
 	registry := reference.registry
 	nodeProfileRegistries.Unlock()
+	if watchKey != nil {
+		watchNodeProfileRegistryContext(watchKey, reference)
+	}
 	var once sync.Once
 	return registry, func() {
 		once.Do(func() {
+			closeRegistry := false
 			nodeProfileRegistries.Lock()
 			var current *nodeProfileRegistryReference
 			if managerKey != 0 {
@@ -152,15 +162,61 @@ func acquireGroupProfileRegistry(ctx context.Context, managers ...adapter.Outbou
 				current = nodeProfileRegistries.byProcess[processKey]
 			}
 			if current == reference {
-				current.refs--
-				// The registry belongs to the process context, not to any one
+				if current.refs > 0 {
+					current.refs--
+				}
+				// The registry belongs to the runtime context, not to any one
 				// strategy group. Keeping it alive at zero group references lets a
 				// reload inherit the same endpoint evidence without retaining group
-				// objects; process cancellation performs the final cleanup.
+				// objects; lifecycle cancellation performs the final cleanup.
+				if current.refs == 0 && len(current.processKeys) == 0 {
+					closeRegistry = deleteNodeProfileRegistryLocked(current, managerKey, processKey)
+				}
 			}
 			nodeProfileRegistries.Unlock()
+			if closeRegistry {
+				reference.registry.close()
+			}
 		})
 	}
+}
+
+func deleteNodeProfileRegistryLocked(reference *nodeProfileRegistryReference, managerKey uintptr, processKey <-chan struct{}) bool {
+	if managerKey != 0 {
+		if nodeProfileRegistries.byManager[managerKey] != reference {
+			return false
+		}
+		delete(nodeProfileRegistries.byManager, managerKey)
+		return true
+	}
+	if nodeProfileRegistries.byProcess[processKey] != reference {
+		return false
+	}
+	delete(nodeProfileRegistries.byProcess, processKey)
+	return true
+}
+
+// watchNodeProfileRegistryContext keeps a manager-scoped registry alive until
+// every lifecycle that acquired it has ended. A manager can outlive one group
+// (for example during a provider reload), so closing on the first context
+// cancellation would discard shared health evidence while another group still
+// uses the same outbound manager.
+func watchNodeProfileRegistryContext(key <-chan struct{}, owned *nodeProfileRegistryReference) {
+	go func() {
+		<-key
+		closeRegistry := false
+		nodeProfileRegistries.Lock()
+		if _, watched := owned.processKeys[key]; watched {
+			delete(owned.processKeys, key)
+		}
+		if owned.refs == 0 && len(owned.processKeys) == 0 {
+			closeRegistry = deleteNodeProfileRegistryLocked(owned, owned.manager, key)
+		}
+		nodeProfileRegistries.Unlock()
+		if closeRegistry {
+			owned.registry.close()
+		}
+	}()
 }
 
 // existingGroupProfileRegistry lets dashboard/API helpers that only receive a
