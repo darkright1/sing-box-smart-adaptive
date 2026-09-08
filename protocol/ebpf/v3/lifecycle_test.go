@@ -288,6 +288,12 @@ func TestLifecycleMACPublishFailureQuarantinesOnlyMACFastPath(t *testing.T) {
 	if err := lc.PublishMACSourcePolicies([]ebpfv3.MACPolicyEntry{{Key: ebpfv3.MACKey{Addr: [6]byte{1, 2, 3, 4, 5, 6}}}}); err != nil {
 		t.Fatal(err)
 	}
+	if sink.flags&ebpfv3.FlagMACSource == 0 {
+		t.Fatal("successful replacement did not immediately re-enable MAC fast path")
+	}
+	if lc.Backend().Control.Flags&ebpfv3.FlagMACSource == 0 {
+		t.Fatal("model MAC flag was not restored after successful replacement")
+	}
 	if err := lc.ApplyControlFlags(true, true, true, true, true, 0); err != nil {
 		t.Fatal(err)
 	}

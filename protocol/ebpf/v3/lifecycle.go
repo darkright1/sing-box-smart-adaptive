@@ -245,6 +245,7 @@ func (l *Lifecycle) PublishMACSourcePolicies(entries []ebpfv3.MACPolicyEntry) er
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	wasQuarantined := l.macQuarantined
 	capHint := len(entries)
 	if capHint > ebpfv3.MaxSourcePolicies+1 {
 		capHint = ebpfv3.MaxSourcePolicies + 1
@@ -269,6 +270,23 @@ func (l *Lifecycle) PublishMACSourcePolicies(entries []ebpfv3.MACPolicyEntry) er
 		// keep the kernel/model transaction fail-closed if model validation is
 		// extended in the future.
 		return l.recoverMACPublishFailureLocked(err)
+	}
+	if wasQuarantined {
+		// The snapshot is now complete and authoritative again. Re-enable the
+		// MAC lookup in the same lifecycle transaction instead of waiting for a
+		// later, unrelated control refresh to turn the feature back on.
+		flags := l.backend.Control.Flags | ebpfv3.FlagMACSource
+		if l.sink != nil {
+			bank, generation := l.backend.Publisher.Snapshot()
+			if err := l.sink.WriteControlV3(l.backend.Control.Enabled != 0, flags, bank, generation, l.backend.Control.RoutingMark); err != nil {
+				// The snapshot itself is valid, but its activation is not. Keep the
+				// local quarantine so subsequent refreshes cannot re-enable it
+				// until another complete control commit succeeds.
+				l.macQuarantined = true
+				return err
+			}
+		}
+		l.backend.Control.Flags = flags
 	}
 	l.macQuarantined = false
 	return nil
