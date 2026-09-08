@@ -97,6 +97,7 @@ type memSink struct {
 
 	controlWrites int
 	flags         uint32
+	controlErr    error
 	deleteErr     error
 	invalidateErr error
 }
@@ -135,7 +136,7 @@ func (m *memSink) DeleteMergedStaticDirect(prefix netip.Prefix) error {
 func (m *memSink) WriteControlV3(enabled bool, flags uint32, activeBank, generation, routingMark uint32) error {
 	m.controlWrites++
 	m.flags = flags
-	return nil
+	return m.controlErr
 }
 func (m *memSink) PublishDNSHint(addr netip.Addr, direct bool, evidence uint8, generation uint32, ttl time.Duration) error {
 	m.dns++
@@ -188,6 +189,49 @@ func TestLifecycleBindSinkMirrorsKernel(t *testing.T) {
 	}
 	if err := lc.InvalidateGeneration(); err != nil || sink.invalid != 1 {
 		t.Fatalf("invalidate=%d err=%v", sink.invalid, err)
+	}
+}
+
+func TestLifecycleApplyControlFlagsKeepsModelWhenKernelWriteFails(t *testing.T) {
+	drop := false
+	lc, err := NewLifecycle(option.EBPFSharedNetworkOptions{
+		Enabled: true, Engine: EngineV3, DataPlane: "socket_assign", DropUDP443: &drop,
+		PolicyOffload: option.EBPFPolicyOffloadOptions{Enabled: true, ExactFlowLearning: true},
+	}, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lc.Close()
+	sink := &memSink{gen: 1, controlErr: errors.New("kernel control write failed")}
+	lc.BindSink(sink)
+	before := lc.Backend().Control
+	if err := lc.ApplyControlFlags(true, true, true, true, true, 0x2b00); err == nil {
+		t.Fatal("expected kernel control write error")
+	}
+	if got := lc.Backend().Control; got != before {
+		t.Fatalf("model control changed after kernel failure: before=%+v after=%+v", before, got)
+	}
+}
+
+func TestLifecycleLearnFlowValidatesBeforeKernelWrite(t *testing.T) {
+	drop := false
+	lc, err := NewLifecycle(option.EBPFSharedNetworkOptions{
+		Enabled: true, Engine: EngineV3, DataPlane: "socket_assign", DropUDP443: &drop,
+		PolicyOffload: option.EBPFPolicyOffloadOptions{Enabled: true, ExactFlowLearning: true},
+	}, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lc.Close()
+	sink := &memSink{gen: 1}
+	lc.BindSink(sink)
+	client := netip.MustParseAddrPort("10.0.0.2:1111")
+	dest := netip.MustParseAddrPort("8.8.8.8:443")
+	if err := lc.LearnFlow(client, dest, 99, true, time.Now()); err == nil {
+		t.Fatal("expected invalid protocol error")
+	}
+	if sink.flows != 0 {
+		t.Fatalf("kernel was mutated before validation: puts=%d", sink.flows)
 	}
 }
 

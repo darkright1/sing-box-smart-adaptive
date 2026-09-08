@@ -157,14 +157,18 @@ func (l *Lifecycle) ApplyControlFlags(enableIPv4, enableIPv6, enableTCP, enableU
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	flags := ControlFlags(l.options, enableIPv4, enableIPv6, enableTCP, enableUDP, dnsHijack, routingMark)
+	if l.sink != nil {
+		bank, generation := l.backend.Publisher.Snapshot()
+		// The kernel control map is authoritative.  Do not advance the model
+		// until the live feature mask has been committed successfully.
+		if err := l.sink.WriteControlV3(true, flags, bank, generation, routingMark); err != nil {
+			return err
+		}
+	}
 	l.backend.Control.Flags = flags
 	l.backend.Control.RoutingMark = routingMark
 	l.backend.Control.ABIVersion = ebpfv3.ABIVersion
 	l.backend.Control.Enabled = 1
-	if l.sink != nil {
-		bank, generation := l.backend.Publisher.Snapshot()
-		return l.sink.WriteControlV3(true, flags, bank, generation, routingMark)
-	}
 	return nil
 }
 
@@ -363,6 +367,12 @@ func (l *Lifecycle) LearnFlow(client, dest netip.AddrPort, protocol uint8, bareD
 		Verdict:          ebpfv3.VerdictDirect,
 		LeafIsBareDirect: true,
 		TTL:              l.flowTTL,
+	}
+	// Complete all semantic validation before touching the kernel. The memory
+	// publication below is then limited to capacity bookkeeping, so a later
+	// model-side validation error cannot leave a one-sided kernel verdict.
+	if _, err := ebpfv3.BuildFlowPair(request, l.backend.Control.PolicyGeneration, 1); err != nil {
+		return err
 	}
 	if l.sink != nil {
 		if err := l.sink.PutDirectFlow(protocol, client, dest, l.flowTTL); err != nil {
