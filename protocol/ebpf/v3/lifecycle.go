@@ -1,6 +1,7 @@
 package v3
 
 import (
+	"errors"
 	"fmt"
 	"net/netip"
 	"sync"
@@ -308,14 +309,24 @@ func (l *Lifecycle) MergeDynamicDirect(prefix netip.Prefix, ttl time.Duration) e
 	if !l.options.PolicyOffload.Enabled {
 		return nil
 	}
+	canonical, err := l.backend.ValidateDynamicDirect(prefix)
+	if err != nil {
+		return err
+	}
 	if l.sink != nil {
-		if err := l.sink.MergeDynamicDirect(prefix, ttl); err != nil {
+		if err := l.sink.MergeDynamicDirect(canonical, ttl); err != nil {
 			return err
 		}
 	}
-	if err := l.backend.MergeDynamicDirect(prefix, ttl); err != nil {
+	if err := l.backend.MergeDynamicDirect(canonical, ttl); err != nil {
+		// ValidateDynamicDirect makes this path unreachable for ordinary model
+		// errors. Keep a fail-closed recovery for future capacity/semantic
+		// changes: invalidate the generation so a successful kernel write cannot
+		// remain active without a matching model entry.
 		if l.sink != nil {
-			l.syncPolicyGenerationLocked(l.sink.PolicyGeneration())
+			if invalidateErr := l.invalidateGenerationLocked(); invalidateErr != nil {
+				return errors.Join(err, invalidateErr)
+			}
 		}
 		return err
 	}
@@ -462,6 +473,13 @@ func (l *Lifecycle) InvalidateGeneration() error {
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	return l.invalidateGenerationLocked()
+}
+
+func (l *Lifecycle) invalidateGenerationLocked() error {
+	if l == nil || l.backend == nil {
+		return nil
+	}
 	if l.sink != nil {
 		// The kernel controls whether stale verdicts are accepted. Commit its
 		// generation first; only then advance the in-process model to the exact
@@ -478,14 +496,12 @@ func (l *Lifecycle) InvalidateGeneration() error {
 		l.backend.InvalidateGeneration(generation)
 		return nil
 	}
-	if l.backend != nil {
-		l.backend.Control.PolicyGeneration++
-		if l.backend.Control.PolicyGeneration == 0 {
-			l.backend.Control.PolicyGeneration = 1
-		}
-		l.backend.Publisher.SyncGeneration(l.backend.Control.PolicyGeneration)
-		l.backend.InvalidateGeneration(l.backend.Control.PolicyGeneration)
+	l.backend.Control.PolicyGeneration++
+	if l.backend.Control.PolicyGeneration == 0 {
+		l.backend.Control.PolicyGeneration = 1
 	}
+	l.backend.Publisher.SyncGeneration(l.backend.Control.PolicyGeneration)
+	l.backend.InvalidateGeneration(l.backend.Control.PolicyGeneration)
 	return nil
 }
 

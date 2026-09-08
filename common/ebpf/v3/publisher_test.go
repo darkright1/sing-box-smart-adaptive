@@ -225,8 +225,27 @@ func TestMergeDynamicDirectIsSeparateAndBounded(t *testing.T) {
 	if err := b.MergeDynamicDirect(prefix, time.Minute); err != nil {
 		t.Fatal(err)
 	}
-	if got := len(b.dynamicDirects); got != 1 {
-		t.Fatalf("duplicate merge grew dynamic map: %d", got)
+	if got := len(b.dynamicDirects4); got != 1 {
+		t.Fatalf("duplicate merge grew IPv4 dynamic map: %d", got)
+	}
+	if got := len(b.dynamicDirects6); got != 0 {
+		t.Fatalf("unexpected IPv6 dynamic rows: %d", got)
+	}
+}
+
+func TestMergeDynamicDirectUsesIndependentFamilyCapacities(t *testing.T) {
+	b := NewMemoryBackend()
+	for i := 0; i < DefaultDynamicDirect; i++ {
+		v4 := netip.AddrFrom4([4]byte{198, 18, byte(i >> 8), byte(i)})
+		if err := b.MergeDynamicDirect(addrPrefix(v4), time.Minute); err != nil {
+			t.Fatalf("IPv4 merge %d: %v", i, err)
+		}
+	}
+	if err := b.MergeDynamicDirect(addrPrefix(netip.MustParseAddr("2001:db8::1")), time.Minute); err != nil {
+		t.Fatalf("IPv6 capacity should be independent of IPv4: %v", err)
+	}
+	if len(b.dynamicDirects4) != DefaultDynamicDirect || len(b.dynamicDirects6) != 1 {
+		t.Fatalf("unexpected family ledgers: v4=%d v6=%d", len(b.dynamicDirects4), len(b.dynamicDirects6))
 	}
 }
 

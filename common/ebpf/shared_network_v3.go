@@ -75,11 +75,10 @@ type V3Backend struct {
 	// banks alternate: A→B→C would otherwise try to delete B from bank A and
 	// leave A's stale prefixes live when bank A becomes active again.
 	lastStatic [2][]netip.Prefix
-	// dynamicDirects tracks learn-promoted /32|/128 rows and their monotonic
-	// deadlines in the separate expiring maps. Keeping this outside lastStatic
-	// makes static policy publication independent from runtime learning and
-	// allows expired rows to be reclaimed before the fixed-size LPM fills.
-	dynamicDirects  map[netip.Prefix]uint64
+	// Dynamic DIRECT ledgers mirror the two kernel LPM maps. Each family has an
+	// independent capacity budget and must be accounted for separately.
+	dynamicDirects4 map[netip.Prefix]uint64
+	dynamicDirects6 map[netip.Prefix]uint64
 	originalDstLost atomic.Uint64
 	flowEnabled     bool
 }
@@ -316,7 +315,8 @@ func PrepareSharedNetworkV3(
 		flowEnabled:       policyOffloadFlow,
 		statsPossibleCPUs: statsCPUs,
 		statsScratch:      make([]v3StatsValue, statsCPUs),
-		dynamicDirects:    make(map[netip.Prefix]uint64),
+		dynamicDirects4:   make(map[netip.Prefix]uint64),
+		dynamicDirects6:   make(map[netip.Prefix]uint64),
 	}
 	// Must match SB_V3_ABI_VERSION in v3/kern/abi.h. The version covers the
 	// PERCPU stats vector and the DNS observation map contract.
@@ -1007,6 +1007,10 @@ func (b *V3Backend) MergeDynamicDirect(prefix netip.Prefix, ttl time.Duration) e
 	if b.runtime == nil {
 		return osErrClosed
 	}
+	entries, err := b.dynamicEntriesForPrefix(prefix)
+	if err != nil {
+		return err
+	}
 	if ttl <= 0 {
 		ttl = 5 * time.Minute
 	}
@@ -1021,26 +1025,43 @@ func (b *V3Backend) MergeDynamicDirect(prefix netip.Prefix, ttl time.Duration) e
 	if err := b.purgeExpiredDynamicDirectLocked(now); err != nil {
 		return E.Cause(err, "reclaim expired v3 dynamic direct entries")
 	}
-	if existing, ok := b.dynamicDirects[prefix]; ok && existing > now {
+	if existing, ok := entries[prefix]; ok && existing > now {
 		if err := writeV3DynamicDirect(int(b.runtime.dynamic_direct4_fd), int(b.runtime.dynamic_direct6_fd), prefix,
 			b.control.PolicyGeneration, expires); err != nil {
 			return err
 		}
-		b.dynamicDirects[prefix] = expires
+		entries[prefix] = expires
 		return nil
 	}
-	if len(b.dynamicDirects) >= ebpfv3.DefaultDynamicDirect {
+	if len(entries) >= ebpfv3.DefaultDynamicDirect {
 		return E.New("v3 dynamic direct map capacity reached")
 	}
 	if err := writeV3DynamicDirect(int(b.runtime.dynamic_direct4_fd), int(b.runtime.dynamic_direct6_fd), prefix,
 		b.control.PolicyGeneration, expires); err != nil {
 		return err
 	}
-	if b.dynamicDirects == nil {
-		b.dynamicDirects = make(map[netip.Prefix]uint64)
-	}
-	b.dynamicDirects[prefix] = expires
+	entries[prefix] = expires
 	return nil
+}
+
+func (b *V3Backend) dynamicEntriesForPrefix(prefix netip.Prefix) (map[netip.Prefix]uint64, error) {
+	if b == nil {
+		return nil, osErrClosed
+	}
+	addr := prefix.Addr().Unmap()
+	if addr.Is4() {
+		if b.dynamicDirects4 == nil {
+			b.dynamicDirects4 = make(map[netip.Prefix]uint64)
+		}
+		return b.dynamicDirects4, nil
+	}
+	if addr.Is6() {
+		if b.dynamicDirects6 == nil {
+			b.dynamicDirects6 = make(map[netip.Prefix]uint64)
+		}
+		return b.dynamicDirects6, nil
+	}
+	return nil, E.New("invalid dynamic direct prefix family")
 }
 
 // MergeStaticDirect is retained as a source-compatible wrapper for callers
@@ -1066,13 +1087,17 @@ func (b *V3Backend) DeleteMergedStaticDirect(prefix netip.Prefix) error {
 	if b.runtime == nil {
 		return osErrClosed
 	}
-	if _, revocable := b.dynamicDirects[prefix]; !revocable {
+	entries, err := b.dynamicEntriesForPrefix(prefix)
+	if err != nil {
+		return err
+	}
+	if _, revocable := entries[prefix]; !revocable {
 		return nil
 	}
 	if err := deleteV3DynamicDirect(int(b.runtime.dynamic_direct4_fd), int(b.runtime.dynamic_direct6_fd), prefix); err != nil {
 		return err
 	}
-	delete(b.dynamicDirects, prefix)
+	delete(entries, prefix)
 	return nil
 }
 
@@ -1206,17 +1231,20 @@ func deleteV3DynamicDirect(fd4, fd6 int, prefix netip.Prefix) error {
 // The map is generation-checked in the kernel, but explicit deletion avoids
 // retaining expired rows and makes capacity independent from reload count.
 func (b *V3Backend) clearDynamicDirectLocked() error {
-	if b == nil || b.runtime == nil || len(b.dynamicDirects) == 0 {
+	if b == nil || b.runtime == nil || (len(b.dynamicDirects4) == 0 && len(b.dynamicDirects6) == 0) {
 		return nil
 	}
 	var joined error
-	for prefix := range b.dynamicDirects {
-		if err := deleteV3DynamicDirect(int(b.runtime.dynamic_direct4_fd), int(b.runtime.dynamic_direct6_fd), prefix); err != nil {
-			joined = errors.Join(joined, err)
+	for _, entries := range []map[netip.Prefix]uint64{b.dynamicDirects4, b.dynamicDirects6} {
+		for prefix := range entries {
+			if err := deleteV3DynamicDirect(int(b.runtime.dynamic_direct4_fd), int(b.runtime.dynamic_direct6_fd), prefix); err != nil {
+				joined = errors.Join(joined, err)
+			}
 		}
 	}
 	if joined == nil {
-		clear(b.dynamicDirects)
+		clear(b.dynamicDirects4)
+		clear(b.dynamicDirects6)
 	}
 	return joined
 }
@@ -1226,15 +1254,17 @@ func (b *V3Backend) purgeExpiredDynamicDirectLocked(now uint64) error {
 		return nil
 	}
 	var joined error
-	for prefix, expires := range b.dynamicDirects {
-		if expires == 0 || expires > now {
-			continue
+	for _, entries := range []map[netip.Prefix]uint64{b.dynamicDirects4, b.dynamicDirects6} {
+		for prefix, expires := range entries {
+			if expires == 0 || expires > now {
+				continue
+			}
+			if err := deleteV3DynamicDirect(int(b.runtime.dynamic_direct4_fd), int(b.runtime.dynamic_direct6_fd), prefix); err != nil {
+				joined = errors.Join(joined, err)
+				continue
+			}
+			delete(entries, prefix)
 		}
-		if err := deleteV3DynamicDirect(int(b.runtime.dynamic_direct4_fd), int(b.runtime.dynamic_direct6_fd), prefix); err != nil {
-			joined = errors.Join(joined, err)
-			continue
-		}
-		delete(b.dynamicDirects, prefix)
 	}
 	return joined
 }

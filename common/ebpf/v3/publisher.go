@@ -141,10 +141,10 @@ type MemoryBackend struct {
 	Flows       map[FlowKey]FlowValue
 	DNS         *DNSHintTable
 	MACPolicies map[MACKey]MACPolicyValue
-	// dynamicDirects records learned prefixes outside the static policy banks.
-	// The memory model mirrors the production map split so tests cannot hide a
-	// static/dynamic capacity or generation regression.
-	dynamicDirects  map[netip.Prefix]time.Time
+	// Dynamic DIRECT rows mirror the production v4/v6 map split. Keeping two
+	// ledgers is important: each kernel LPM map has its own capacity budget.
+	dynamicDirects4 map[netip.Prefix]time.Time
+	dynamicDirects6 map[netip.Prefix]time.Time
 	Publisher       *BankPublisher
 	Stats           [StatsCount]uint64
 	flowLimit       int
@@ -163,7 +163,8 @@ func NewMemoryBackend() *MemoryBackend {
 	b.Policy4[1] = make(map[LPM4Key]PolicyValue)
 	b.Policy6[0] = make(map[LPM6Key]PolicyValue)
 	b.Policy6[1] = make(map[LPM6Key]PolicyValue)
-	b.dynamicDirects = make(map[netip.Prefix]time.Time)
+	b.dynamicDirects4 = make(map[netip.Prefix]time.Time)
+	b.dynamicDirects6 = make(map[netip.Prefix]time.Time)
 	bank, gen := b.Publisher.Snapshot()
 	b.Control = Control{
 		ABIVersion:       ABIVersion,
@@ -226,7 +227,8 @@ func (b *MemoryBackend) PublishStatic(policies []CompiledPolicy) error {
 	b.Control.PolicyGeneration = gen
 	// A generation commit invalidates all learned dynamic rows. They are
 	// represented separately from the static snapshot in the memory model too.
-	clear(b.dynamicDirects)
+	clear(b.dynamicDirects4)
+	clear(b.dynamicDirects6)
 	b.invalidateGenerationMaps(gen)
 	b.Stats[25] = uint64(gen) // RELOAD_GENERATION index if aligned — best-effort
 	return nil
@@ -247,37 +249,77 @@ func (b *MemoryBackend) MergeDynamicDirect(prefix netip.Prefix, ttl time.Duratio
 	if err != nil {
 		return err
 	}
-	addr := prefix.Addr().Unmap()
+	entries, err := b.dynamicEntriesForPrefix(prefix)
+	if err != nil {
+		return err
+	}
 	expires := time.Now().Add(ttl)
 	now := time.Now()
-	for learnedPrefix, learnedExpiry := range b.dynamicDirects {
+	for learnedPrefix, learnedExpiry := range entries {
 		if !learnedExpiry.After(now) {
-			delete(b.dynamicDirects, learnedPrefix)
+			delete(entries, learnedPrefix)
 		}
 	}
-	if addr.Is4() {
-		if existing, ok := b.dynamicDirects[prefix]; ok && existing.After(now) {
-			b.dynamicDirects[prefix] = expires
-			return nil
-		}
-		if len(b.dynamicDirects) >= DefaultDynamicDirect {
-			return fmt.Errorf("dynamic direct policy exceeds eBPF map capacity")
-		}
-		b.dynamicDirects[prefix] = expires
+	if existing, ok := entries[prefix]; ok && existing.After(now) {
+		entries[prefix] = expires
 		return nil
+	}
+	if len(entries) >= DefaultDynamicDirect {
+		return fmt.Errorf("dynamic direct policy exceeds eBPF map capacity")
+	}
+	entries[prefix] = expires
+	return nil
+}
+
+// ValidateDynamicDirect performs all fallible model-side checks without
+// mutating the model. Lifecycle uses it before publishing to the kernel so a
+// capacity or family error cannot follow a successful kernel write.
+func (b *MemoryBackend) ValidateDynamicDirect(prefix netip.Prefix) (netip.Prefix, error) {
+	if b == nil || b.Publisher == nil {
+		return netip.Prefix{}, fmt.Errorf("nil memory backend")
+	}
+	canonical, err := CanonicalPrefix(prefix)
+	if err != nil {
+		return netip.Prefix{}, err
+	}
+	entries, err := b.dynamicEntriesForPrefix(canonical)
+	if err != nil {
+		return netip.Prefix{}, err
+	}
+	now := time.Now()
+	if existing, ok := entries[canonical]; ok && existing.After(now) {
+		return canonical, nil
+	}
+	active := 0
+	for _, expiry := range entries {
+		if expiry.After(now) {
+			active++
+		}
+	}
+	if active >= DefaultDynamicDirect {
+		return netip.Prefix{}, fmt.Errorf("dynamic direct policy exceeds eBPF map capacity")
+	}
+	return canonical, nil
+}
+
+func (b *MemoryBackend) dynamicEntriesForPrefix(prefix netip.Prefix) (map[netip.Prefix]time.Time, error) {
+	if b == nil {
+		return nil, fmt.Errorf("nil memory backend")
+	}
+	addr := prefix.Addr().Unmap()
+	if addr.Is4() {
+		if b.dynamicDirects4 == nil {
+			b.dynamicDirects4 = make(map[netip.Prefix]time.Time)
+		}
+		return b.dynamicDirects4, nil
 	}
 	if addr.Is6() {
-		if existing, ok := b.dynamicDirects[prefix]; ok && existing.After(now) {
-			b.dynamicDirects[prefix] = expires
-			return nil
+		if b.dynamicDirects6 == nil {
+			b.dynamicDirects6 = make(map[netip.Prefix]time.Time)
 		}
-		if len(b.dynamicDirects) >= DefaultDynamicDirect {
-			return fmt.Errorf("dynamic direct policy exceeds eBPF map capacity")
-		}
-		b.dynamicDirects[prefix] = expires
-		return nil
+		return b.dynamicDirects6, nil
 	}
-	return fmt.Errorf("invalid dynamic direct prefix family")
+	return nil, fmt.Errorf("invalid dynamic direct prefix family")
 }
 
 // MergeStaticDirect is kept as a source-compatible wrapper for older tests and
@@ -452,9 +494,13 @@ func (b *MemoryBackend) LookupDynamicDirect(dest netip.Addr, protocol uint8, dpo
 		bestPrefix netip.Prefix
 		bestExpiry time.Time
 	)
-	for prefix, expiry := range b.dynamicDirects {
+	entries := b.dynamicDirects4
+	if dest.Is6() {
+		entries = b.dynamicDirects6
+	}
+	for prefix, expiry := range entries {
 		if !expiry.After(now) {
-			delete(b.dynamicDirects, prefix)
+			delete(entries, prefix)
 			continue
 		}
 		if !prefix.Contains(dest) || (bestPrefix.IsValid() && prefix.Bits() <= bestPrefix.Bits()) {
@@ -523,9 +569,13 @@ func (b *MemoryBackend) DeleteMergedStaticDirect(prefix netip.Prefix) error {
 	if err != nil {
 		return err
 	}
-	if _, revocable := b.dynamicDirects[prefix]; !revocable {
+	entries := b.dynamicDirects4
+	if prefix.Addr().Is6() {
+		entries = b.dynamicDirects6
+	}
+	if _, revocable := entries[prefix]; !revocable {
 		return nil
 	}
-	delete(b.dynamicDirects, prefix)
+	delete(entries, prefix)
 	return nil
 }

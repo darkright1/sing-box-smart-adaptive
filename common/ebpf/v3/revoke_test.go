@@ -58,7 +58,7 @@ func TestMemoryBackendRevokeMergedStaticDirect(t *testing.T) {
 	if err := b.PublishStatic(nil); err != nil {
 		t.Fatal(err)
 	}
-	if len(b.dynamicDirects) != 0 {
+	if len(b.dynamicDirects4) != 0 || len(b.dynamicDirects6) != 0 {
 		t.Fatal("merged set not cleared after snapshot publish")
 	}
 }
