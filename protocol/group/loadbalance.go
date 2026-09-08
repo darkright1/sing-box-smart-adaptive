@@ -1000,10 +1000,11 @@ func strategyStickySessionsWithIndex(g *LoadBalanceGroup, selectIndex func(key u
 			cachedRecord, has = lruCache.Peek(key)
 		}
 		if has {
-			// Resolve the record against the fresh catalog. DialIdentity keeps
-			// credential variants distinct; EndpointIdentity allows a safe
-			// fallback when one credential disappeared during refresh.
-			if preferred := resolveSelectionRecord(outbounds, cachedRecord); preferred != nil && g.memberAvailable(preferred, metadata) {
+			// Runtime affinity is credential-sensitive. If the authenticated
+			// member disappeared during a provider refresh, treat the mapping as
+			// a miss and run the strategy again instead of silently moving the
+			// session to another credential on the same network path.
+			if preferred := resolveStickySessionRecord(outbounds, cachedRecord); preferred != nil && g.memberAvailable(preferred, metadata) {
 				if matcher != nil {
 					if !matcher(preferred) {
 						return nil

@@ -48,9 +48,11 @@ func outboundMatchesSelectionRecord(outbound adapter.Outbound, record adapter.Se
 	}
 }
 
-// resolveSelectionRecord follows the identity contract: authenticated dial
-// identity first, credential-free endpoint identity second, and the legacy
-// display tag only as a final compatibility fallback.
+// resolveSelectionRecord follows the persistence contract used by selector and
+// manual-selection state: authenticated dial identity first, credential-free
+// endpoint identity second, and the legacy display tag only as a final
+// compatibility fallback. Callers that require credential-sensitive affinity
+// must use resolveStickySessionRecord instead.
 func resolveSelectionRecord(outbounds []adapter.Outbound, record adapter.SelectedRecord) adapter.Outbound {
 	if record.DialIdentity != "" {
 		for _, outbound := range outbounds {
@@ -84,6 +86,25 @@ func resolveSelectionRecord(outbounds []adapter.Outbound, record adapter.Selecte
 		}
 	}
 	return nil
+}
+
+// resolveStickySessionRecord resolves a runtime sticky-session record without
+// silently changing authenticated members. A DialIdentity represents the
+// complete data-plane credential (for example a VLESS UUID), so once it is
+// present an exact match is required. Falling back to EndpointIdentity here
+// would move an existing session to another credential that merely shares the
+// same server/transport path. Older records without a DialIdentity are
+// retained for static/legacy members and may use the weaker path/tag match.
+func resolveStickySessionRecord(outbounds []adapter.Outbound, record adapter.SelectedRecord) adapter.Outbound {
+	if record.DialIdentity != "" {
+		for _, outbound := range outbounds {
+			if outboundMatchesSelectionRecord(outbound, record, 'd') {
+				return outbound
+			}
+		}
+		return nil
+	}
+	return resolveSelectionRecord(outbounds, record)
 }
 
 func storeSelectedRecord(cacheFile adapter.CacheFile, group string, outbound adapter.Outbound) error {

@@ -24,6 +24,23 @@ func TestResolveSelectionRecordEndpointFallbackPrefersDisplayTag(t *testing.T) {
 	}
 }
 
+func TestResolveStickySessionRecordDoesNotFallbackAcrossCredentials(t *testing.T) {
+	remaining := &providerDialTestNode{providerTestNode: providerTestNode{tag: "HK #2", identity: "path"}, dialIdentity: "dial-b"}
+	record := adapter.SelectedRecord{Version: 1, DisplayTag: "HK", EndpointIdentity: "path", DialIdentity: "dial-a"}
+	if got := resolveStickySessionRecord([]adapter.Outbound{remaining}, record); got != nil {
+		t.Fatalf("sticky resolver migrated to another credential: %v", got)
+	}
+}
+
+func TestResolveStickySessionRecordKeepsLegacyPathFallback(t *testing.T) {
+	first := &providerTestNode{tag: "HK", identity: "path"}
+	second := &providerTestNode{tag: "HK #2", identity: "path"}
+	record := adapter.SelectedRecord{Version: 1, DisplayTag: "HK #2", EndpointIdentity: "path"}
+	if got := resolveStickySessionRecord([]adapter.Outbound{first, second}, record); got != second {
+		t.Fatalf("legacy sticky record resolved to %v, want display-tag alias", got)
+	}
+}
+
 func TestSelectedRecordForOutboundKeepsOpaqueIdentities(t *testing.T) {
 	node := &providerDialTestNode{providerTestNode: providerTestNode{tag: "HK #2", identity: "endpoint:path"}, dialIdentity: "dial:credential"}
 	record := selectedRecordForOutbound(node)

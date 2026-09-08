@@ -77,6 +77,37 @@ func TestLoadBalanceStickySessionRemapsAfterProviderRefresh(t *testing.T) {
 	}
 }
 
+func TestLoadBalanceStickySessionReSelectsAfterCredentialRefresh(t *testing.T) {
+	first := &providerDialTestNode{providerTestNode: providerTestNode{tag: "first", identity: "path-a"}, dialIdentity: "dial-a"}
+	remaining := &providerDialTestNode{providerTestNode: providerTestNode{tag: "remaining", identity: "path-x"}, dialIdentity: "dial-b"}
+	other := &providerDialTestNode{providerTestNode: providerTestNode{tag: "other", identity: "path-x"}, dialIdentity: "dial-c"}
+	history := U.NewHistoryStorage()
+	now := time.Now()
+	for _, outbound := range []adapter.Outbound{first, remaining, other} {
+		history.StoreURLTestHistoryKey(U.KeyForOutbound(outbound, "", N.NetworkTCP), &adapter.URLTestHistory{Time: now, Delay: 20})
+	}
+	group := &LoadBalanceGroup{outbounds: []adapter.Outbound{first, remaining, other}, history: history}
+	selectedIndex := 0
+	group.strategyFn = strategyStickySessionsWithIndex(group, func(_ uint64, length int) int {
+		if selectedIndex >= length {
+			t.Fatalf("selected index %d exceeds member count %d", selectedIndex, length)
+		}
+		return selectedIndex
+	})
+	metadata := new(adapter.InboundContext)
+	if selected := group.Unwrap(metadata, true); selected != first {
+		t.Fatalf("initial sticky selection=%v, want first", selected)
+	}
+	// Remove the authenticated member. The two remaining nodes intentionally
+	// share its path; a sticky lookup must miss and re-run the strategy rather
+	// than silently selecting the first path match.
+	group.replaceOutbounds([]adapter.Outbound{remaining, other})
+	selectedIndex = 1
+	if selected := group.Unwrap(metadata, true); selected != other {
+		t.Fatalf("sticky refresh migrated by path/order to %v, want strategy result other", selected)
+	}
+}
+
 func TestLoadBalanceUDPFailureDoesNotPoisonTCPHealth(t *testing.T) {
 	outbound := &preMatchTestOutbound{tag: "udp-node"}
 	history := U.NewHistoryStorage()
