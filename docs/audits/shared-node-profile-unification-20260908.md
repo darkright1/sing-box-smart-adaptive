@@ -29,6 +29,14 @@ URLTest, or LoadBalance failure is published to the shared passive ledger for
 a short, bounded quarantine; a successful connection clears only that
 transport/family's quarantine.
 
+Selection keeps the layers explicit: `groupProfileBaselineAlive` only checks
+fresh active TCP evidence, while `groupTransportAvailable` applies the
+current TCP-family or UDP passive ledger. UDP selection therefore never
+inherits a TCP passive quarantine, and TCP selection never inherits UDP
+evidence. Dashboard sampling uses the requested probe target when one is
+provided; group summaries also read the exact target key instead of choosing
+the newest result from an unrelated URL.
+
 `common/urltest.HistoryStorage` remains as a compatibility projection for the
 dashboard and legacy API. It is not consulted by production group selection
 when a profile registry is present. Provider health checks likewise continue
