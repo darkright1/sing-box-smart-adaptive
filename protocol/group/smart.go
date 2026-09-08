@@ -769,11 +769,12 @@ func NewSmart(ctx context.Context, router adapter.Router, logger log.ContextLogg
 			logger.Info("smart policy backend: zig, selection mode: ", selectionMode.String())
 		}
 	}
-	probeRegistry, releaseProbeRegistry := acquireSmartProfileRegistry(ctx)
+	outboundManager := service.FromContext[adapter.OutboundManager](ctx)
+	probeRegistry, releaseProbeRegistry := acquireSmartProfileRegistry(ctx, outboundManager)
 	smart := &Smart{
 		Adapter:    outbound.NewAdapter(C.TypeSmart, tag, []string{N.NetworkTCP, N.NetworkUDP}, options.Outbounds),
 		ctx:        ctx,
-		outbound:   service.FromContext[adapter.OutboundManager](ctx),
+		outbound:   outboundManager,
 		connection: service.FromContext[adapter.ConnectionManager](ctx),
 		network:    service.FromContext[adapter.NetworkManager](ctx),
 		logger:     logger,

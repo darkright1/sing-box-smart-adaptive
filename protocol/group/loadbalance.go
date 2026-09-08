@@ -470,7 +470,7 @@ func NewLoadBalanceGroup(ctx context.Context, outboundManager adapter.OutboundMa
 	if link == "" {
 		link = "https://www.gstatic.com/generate_204"
 	}
-	profileRegistry, releaseProfileRegistry := acquireGroupProfileRegistry(ctx)
+	profileRegistry, releaseProfileRegistry := acquireGroupProfileRegistry(ctx, outboundManager)
 	loadBalanceGroup := &LoadBalanceGroup{
 		ctx:                          ctx,
 		outbound:                     outboundManager,

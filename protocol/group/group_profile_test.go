@@ -40,7 +40,7 @@ func TestGroupProfileRegistryIsSharedForProcessLifetime(t *testing.T) {
 	if first != second {
 		t.Fatal("groups in one process received different profile registries")
 	}
-	if existing := existingGroupProfileRegistry(); existing != first {
+	if existing := existingGroupProfileRegistry(nil); existing != first {
 		t.Fatal("API lookup did not find the active process profile registry")
 	}
 	releaseFirst()
@@ -51,6 +51,23 @@ func TestGroupProfileRegistryIsSharedForProcessLifetime(t *testing.T) {
 	}
 	releaseThird()
 	cancel()
+}
+
+func TestExistingGroupProfileRegistryDoesNotGuessAcrossProcesses(t *testing.T) {
+	ctxA, cancelA := context.WithCancel(context.Background())
+	ctxB, cancelB := context.WithCancel(context.Background())
+	first, releaseFirst := acquireGroupProfileRegistry(ctxA)
+	second, releaseSecond := acquireGroupProfileRegistry(ctxB)
+	if first == second {
+		t.Fatal("independent process contexts shared a profile registry")
+	}
+	if existing := existingGroupProfileRegistry(nil); existing != nil {
+		t.Fatal("manager-less dashboard lookup guessed between multiple registries")
+	}
+	releaseFirst()
+	releaseSecond()
+	cancelA()
+	cancelB()
 }
 
 func TestSmartURLTestAndLoadBalanceShareOneTCPProfile(t *testing.T) {
@@ -176,5 +193,15 @@ func TestNodeProfilesSeparateCredentialsOnOnePath(t *testing.T) {
 	}
 	if firstKey == secondKey {
 		t.Fatal("different credentials shared health result identity")
+	}
+}
+
+func TestNodeProfilesKeepAddressFamiliesSeparate(t *testing.T) {
+	node := &sharedProfileTestOutbound{tag: "node", endpoint: "path", dial: "dial"}
+	_, generic := groupTCPProfileKey(node, "https://probe", N.NetworkTCP)
+	_, v4 := groupTCPProfileKey(node, "https://probe", "tcp/ipv4")
+	_, v6 := groupTCPProfileKey(node, "https://probe", "tcp/ipv6")
+	if generic == v4 || generic == v6 || v4 == v6 {
+		t.Fatalf("TCP profile keys collapsed address families: generic=%q v4=%q v6=%q", generic, v4, v6)
 	}
 }

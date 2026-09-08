@@ -28,9 +28,20 @@ func groupProfileIdentity(outbound adapter.Outbound) (endpointKey, dialKey strin
 	return
 }
 
-func groupTCPProfileKey(outbound adapter.Outbound, link string) (endpointKey, profileKey string) {
+func groupTCPProfileKeyForIdentity(dialKey, link, network string) string {
+	if network == "" {
+		network = N.NetworkTCP
+	}
+	return nodeProfileKey(dialKey, link+"\x00"+network, 0)
+}
+
+func groupTCPProfileKey(outbound adapter.Outbound, link string, network ...string) (endpointKey, profileKey string) {
 	endpointKey, dialKey := groupProfileIdentity(outbound)
-	return endpointKey, nodeProfileKey(dialKey, link+"\x00"+N.NetworkTCP, 0)
+	profileNetwork := N.NetworkTCP
+	if len(network) > 0 && network[0] != "" {
+		profileNetwork = network[0]
+	}
+	return endpointKey, groupTCPProfileKeyForIdentity(dialKey, link, profileNetwork)
 }
 
 func groupUDPProfileKey(outbound adapter.Outbound) string {

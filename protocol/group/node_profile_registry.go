@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"reflect"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -68,16 +69,35 @@ func (r *nodeProfileRegistry) releaseSmartScheduler() {
 type nodeProfileRegistryReference struct {
 	registry *nodeProfileRegistry
 	refs     int
+	manager  uintptr
 }
 
 var nodeProfileRegistries struct {
 	sync.Mutex
 	byProcess map[<-chan struct{}]*nodeProfileRegistryReference
+	byManager map[uintptr]*nodeProfileRegistryReference
 }
 
-func acquireGroupProfileRegistry(ctx context.Context) (*nodeProfileRegistry, func()) {
+func outboundManagerIdentity(manager adapter.OutboundManager) uintptr {
+	if manager == nil {
+		return 0
+	}
+	value := reflect.ValueOf(manager)
+	switch value.Kind() {
+	case reflect.Pointer, reflect.Map, reflect.Func, reflect.Chan, reflect.UnsafePointer:
+		return value.Pointer()
+	default:
+		return 0
+	}
+}
+
+func acquireGroupProfileRegistry(ctx context.Context, managers ...adapter.OutboundManager) (*nodeProfileRegistry, func()) {
+	var managerKey uintptr
+	if len(managers) > 0 {
+		managerKey = outboundManagerIdentity(managers[0])
+	}
 	processKey := ctx.Done()
-	if processKey == nil {
+	if processKey == nil && managerKey == 0 {
 		registry := newNodeProfileRegistry(ctx)
 		return registry, registry.close
 	}
@@ -85,14 +105,33 @@ func acquireGroupProfileRegistry(ctx context.Context) (*nodeProfileRegistry, fun
 	if nodeProfileRegistries.byProcess == nil {
 		nodeProfileRegistries.byProcess = make(map[<-chan struct{}]*nodeProfileRegistryReference)
 	}
-	reference := nodeProfileRegistries.byProcess[processKey]
+	if nodeProfileRegistries.byManager == nil {
+		nodeProfileRegistries.byManager = make(map[uintptr]*nodeProfileRegistryReference)
+	}
+	var reference *nodeProfileRegistryReference
+	if managerKey != 0 {
+		reference = nodeProfileRegistries.byManager[managerKey]
+	} else {
+		reference = nodeProfileRegistries.byProcess[processKey]
+	}
 	if reference == nil {
-		reference = &nodeProfileRegistryReference{registry: newNodeProfileRegistry(ctx)}
-		nodeProfileRegistries.byProcess[processKey] = reference
+		reference = &nodeProfileRegistryReference{registry: newNodeProfileRegistry(ctx), manager: managerKey}
+		if managerKey != 0 {
+			nodeProfileRegistries.byManager[managerKey] = reference
+		} else {
+			nodeProfileRegistries.byProcess[processKey] = reference
+		}
 		go func(key <-chan struct{}, owned *nodeProfileRegistryReference) {
+			if key == nil {
+				return
+			}
 			<-key
 			nodeProfileRegistries.Lock()
-			if nodeProfileRegistries.byProcess[key] == owned {
+			if owned.manager != 0 {
+				if nodeProfileRegistries.byManager[owned.manager] == owned {
+					delete(nodeProfileRegistries.byManager, owned.manager)
+				}
+			} else if nodeProfileRegistries.byProcess[key] == owned {
 				delete(nodeProfileRegistries.byProcess, key)
 			}
 			nodeProfileRegistries.Unlock()
@@ -106,7 +145,12 @@ func acquireGroupProfileRegistry(ctx context.Context) (*nodeProfileRegistry, fun
 	return registry, func() {
 		once.Do(func() {
 			nodeProfileRegistries.Lock()
-			current := nodeProfileRegistries.byProcess[processKey]
+			var current *nodeProfileRegistryReference
+			if managerKey != 0 {
+				current = nodeProfileRegistries.byManager[managerKey]
+			} else {
+				current = nodeProfileRegistries.byProcess[processKey]
+			}
 			if current == reference {
 				current.refs--
 				// The registry belongs to the process context, not to any one
@@ -125,19 +169,28 @@ func acquireGroupProfileRegistry(ctx context.Context) (*nodeProfileRegistry, fun
 // Done channel; creating another registry there would silently defeat
 // cross-group single-flight. The normal group constructors remain the owners
 // and process cancellation still performs final cleanup.
-func existingGroupProfileRegistry() *nodeProfileRegistry {
+func existingGroupProfileRegistry(manager adapter.OutboundManager) *nodeProfileRegistry {
 	nodeProfileRegistries.Lock()
 	defer nodeProfileRegistries.Unlock()
-	for _, reference := range nodeProfileRegistries.byProcess {
-		if reference != nil && reference.registry != nil {
+	if key := outboundManagerIdentity(manager); key != 0 {
+		if reference := nodeProfileRegistries.byManager[key]; reference != nil {
 			return reference.registry
+		}
+	}
+	// Legacy callers without a manager can still reuse the sole process
+	// registry. Never guess when more than one process-scoped registry exists.
+	if len(nodeProfileRegistries.byProcess) == 1 {
+		for _, reference := range nodeProfileRegistries.byProcess {
+			if reference != nil {
+				return reference.registry
+			}
 		}
 	}
 	return nil
 }
 
-func acquireSmartProfileRegistry(ctx context.Context) (*nodeProfileRegistry, func()) {
-	registry, releaseReference := acquireGroupProfileRegistry(ctx)
+func acquireSmartProfileRegistry(ctx context.Context, managers ...adapter.OutboundManager) (*nodeProfileRegistry, func()) {
+	registry, releaseReference := acquireGroupProfileRegistry(ctx, managers...)
 	var once sync.Once
 	return registry, func() {
 		once.Do(func() {

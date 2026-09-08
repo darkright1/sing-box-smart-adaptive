@@ -444,7 +444,7 @@ func NewURLTestGroup(ctx context.Context, outboundManager adapter.OutboundManage
 	if history == nil {
 		return nil, E.New("missing URL test history storage")
 	}
-	profileRegistry, releaseProfileRegistry := acquireGroupProfileRegistry(ctx)
+	profileRegistry, releaseProfileRegistry := acquireGroupProfileRegistry(ctx, outboundManager)
 	return &URLTestGroup{
 		ctx:                          ctx,
 		outbound:                     outboundManager,
@@ -712,7 +712,7 @@ type urlTestBatch struct {
 }
 
 func URLTestOutbounds(ctx context.Context, outboundManager adapter.OutboundManager, history *urltest.HistoryStorage, logger log.Logger, outbounds []adapter.Outbound, link string, interval time.Duration, force bool) map[string]uint16 {
-	return urlTestOutbounds(ctx, outboundManager, history, logger, outbounds, link, interval, force, false, 10, existingGroupProfileRegistry())
+	return urlTestOutbounds(ctx, outboundManager, history, logger, outbounds, link, interval, force, false, 10, existingGroupProfileRegistry(outboundManager))
 }
 
 // DashboardURLTestOutbounds follows Surge's control-plane rule: sample the
@@ -720,7 +720,7 @@ func URLTestOutbounds(ctx context.Context, outboundManager adapter.OutboundManag
 // groups keep ownership of their own bounded scheduler. It is intentionally
 // separate from URLTestOutbounds so periodic full checks retain their contract.
 func DashboardURLTestOutbounds(ctx context.Context, outboundManager adapter.OutboundManager, history *urltest.HistoryStorage, logger log.Logger, outbounds []adapter.Outbound, link string) map[string]uint16 {
-	return dashboardURLTestOutbounds(ctx, outboundManager, history, logger, outbounds, link, existingGroupProfileRegistry())
+	return dashboardURLTestOutbounds(ctx, outboundManager, history, logger, outbounds, link, existingGroupProfileRegistry(outboundManager))
 }
 
 func dashboardURLTestOutbounds(ctx context.Context, outboundManager adapter.OutboundManager, history *urltest.HistoryStorage, logger log.Logger, outbounds []adapter.Outbound, link string, profiles *nodeProfileRegistry) map[string]uint16 {
