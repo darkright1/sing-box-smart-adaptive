@@ -74,11 +74,11 @@ func TestLifecycleLearnAndStatic(t *testing.T) {
 	lc.ObserveDNS(netip.MustParseAddr("9.9.9.9"), true, ebpfv3.DNSEvidenceStrong, time.Minute, time.Now())
 	lc.ObserveDNS(netip.MustParseAddr("9.9.9.9"), false, ebpfv3.DNSEvidenceStrong, time.Minute, time.Now())
 	key := ebpfv3.DNSIPKey{Family: ebpfv3.AFInet, Addr: [16]byte{9, 9, 9, 9}}
-	v, ok := lc.Backend().DNS.Lookup(key)
+	v, ok := lc.backend.DNS.Lookup(key)
 	if !ok || v.ProxyRefs == 0 || v.DirectRefs == 0 {
 		t.Fatalf("conflict state %+v ok=%v", v, ok)
 	}
-	okDirect, _ := ebpfv3.DNSHintAllowsDirect(v, lc.Backend().Control.PolicyGeneration, uint64(time.Now().UnixNano()))
+	okDirect, _ := ebpfv3.DNSHintAllowsDirect(v, lc.backend.Control.PolicyGeneration, uint64(time.Now().UnixNano()))
 	if okDirect {
 		t.Fatal("cdn conflict must not direct")
 	}
@@ -204,6 +204,22 @@ func TestLifecycleBindSinkMirrorsKernel(t *testing.T) {
 	}
 }
 
+func TestLifecycleBackendReturnsReadOnlyStatusSnapshot(t *testing.T) {
+	drop := false
+	lc, err := NewLifecycle(option.EBPFSharedNetworkOptions{
+		Enabled: true, Engine: EngineV3, DataPlane: "socket_assign", DropUDP443: &drop,
+	}, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lc.Close()
+	snapshot := lc.Backend()
+	snapshot.Control.Enabled = 0
+	if lc.backend.Control.Enabled == 0 {
+		t.Fatal("backend status snapshot aliases mutable control state")
+	}
+}
+
 func TestLifecycleApplyControlFlagsKeepsModelWhenKernelWriteFails(t *testing.T) {
 	drop := false
 	lc, err := NewLifecycle(option.EBPFSharedNetworkOptions{
@@ -216,11 +232,11 @@ func TestLifecycleApplyControlFlagsKeepsModelWhenKernelWriteFails(t *testing.T) 
 	defer lc.Close()
 	sink := &memSink{gen: 1, controlErr: errors.New("kernel control write failed")}
 	lc.BindSink(sink)
-	before := lc.Backend().Control
+	before := lc.backend.Control
 	if err := lc.ApplyControlFlags(true, true, true, true, true, 0x2b00); err == nil {
 		t.Fatal("expected kernel control write error")
 	}
-	if got := lc.Backend().Control; got != before {
+	if got := lc.backend.Control; got != before {
 		t.Fatalf("model control changed after kernel failure: before=%+v after=%+v", before, got)
 	}
 }
@@ -259,8 +275,8 @@ func TestLifecycleMACPublishFailureQuarantinesOnlyMACFastPath(t *testing.T) {
 	defer lc.Close()
 	sink := &memSink{gen: 1, macErr: errors.New("partial MAC snapshot")}
 	lc.BindSink(sink)
-	lc.Backend().Control.Flags = ebpfv3.FlagMACSource | ebpfv3.FlagExactFlow
-	before := lc.Backend().Control.PolicyGeneration
+	lc.backend.Control.Flags = ebpfv3.FlagMACSource | ebpfv3.FlagExactFlow
+	before := lc.backend.Control.PolicyGeneration
 	err = lc.PublishMACSourcePolicies([]ebpfv3.MACPolicyEntry{{
 		Key: ebpfv3.MACKey{Addr: [6]byte{1, 2, 3, 4, 5, 6}},
 	}})
@@ -270,13 +286,13 @@ func TestLifecycleMACPublishFailureQuarantinesOnlyMACFastPath(t *testing.T) {
 	if sink.invalid != 0 || sink.gen != before {
 		t.Fatalf("MAC failure unnecessarily invalidated generation: invalid=%d before=%d after=%d", sink.invalid, before, sink.gen)
 	}
-	if lc.Backend().Control.Flags&ebpfv3.FlagMACSource != 0 {
+	if lc.backend.Control.Flags&ebpfv3.FlagMACSource != 0 {
 		t.Fatal("MAC fast path remained enabled after uncertain publish")
 	}
-	if lc.Backend().Control.Flags&ebpfv3.FlagExactFlow == 0 {
+	if lc.backend.Control.Flags&ebpfv3.FlagExactFlow == 0 {
 		t.Fatal("unrelated exact-flow flag was cleared")
 	}
-	if len(lc.Backend().MACPolicies) != 0 {
+	if len(lc.backend.MACPolicies) != 0 {
 		t.Fatal("model MAC snapshot changed after kernel publish failure")
 	}
 	if err := lc.ApplyControlFlags(true, true, true, true, true, 0); err != nil {
@@ -294,7 +310,7 @@ func TestLifecycleMACPublishFailureQuarantinesOnlyMACFastPath(t *testing.T) {
 	if sink.flags&ebpfv3.FlagMACSource == 0 {
 		t.Fatal("successful replacement did not immediately re-enable MAC fast path")
 	}
-	if lc.Backend().Control.Flags&ebpfv3.FlagMACSource == 0 {
+	if lc.backend.Control.Flags&ebpfv3.FlagMACSource == 0 {
 		t.Fatal("model MAC flag was not restored after successful replacement")
 	}
 	if err := lc.ApplyControlFlags(true, true, true, true, true, 0); err != nil {
@@ -317,14 +333,14 @@ func TestLifecycleMACPublishKeepsQuarantineLocalWhenEscalationIsNotNeeded(t *tes
 	defer lc.Close()
 	sink := &memSink{gen: 1, macErr: errors.New("partial MAC snapshot"), invalidateErr: errors.New("generation bump failed")}
 	lc.BindSink(sink)
-	lc.Backend().Control.Flags |= ebpfv3.FlagMACSource
+	lc.backend.Control.Flags |= ebpfv3.FlagMACSource
 	err = lc.PublishMACSourcePolicies([]ebpfv3.MACPolicyEntry{{
 		Key: ebpfv3.MACKey{Addr: [6]byte{6, 5, 4, 3, 2, 1}},
 	}})
 	if err == nil {
 		t.Fatal("expected MAC publish recovery error")
 	}
-	if lc.Backend().Control.Flags&ebpfv3.FlagMACSource != 0 {
+	if lc.backend.Control.Flags&ebpfv3.FlagMACSource != 0 {
 		t.Fatal("MAC fast path remained enabled after recovery failure")
 	}
 	if sink.invalid != 0 {
@@ -344,8 +360,8 @@ func TestLifecycleMACPublishEscalatesToGenerationOnControlFailure(t *testing.T) 
 	defer lc.Close()
 	sink := &memSink{gen: 1, macErr: errors.New("partial MAC snapshot"), controlErr: errors.New("control write failed")}
 	lc.BindSink(sink)
-	lc.Backend().Control.Flags = ebpfv3.FlagMACSource | ebpfv3.FlagExactFlow
-	before := lc.Backend().Control.PolicyGeneration
+	lc.backend.Control.Flags = ebpfv3.FlagMACSource | ebpfv3.FlagExactFlow
+	before := lc.backend.Control.PolicyGeneration
 	if err := lc.PublishMACSourcePolicies([]ebpfv3.MACPolicyEntry{{Key: ebpfv3.MACKey{Addr: [6]byte{1, 1, 1, 1, 1, 1}}}}); err == nil {
 		t.Fatal("expected MAC publish recovery error")
 	}
@@ -369,18 +385,18 @@ func TestLifecycleMACPublishDisablesWholeDataplaneAsLastResort(t *testing.T) {
 		controlErr: errors.New("control write failed"), invalidateErr: errors.New("generation bump failed"),
 	}
 	lc.BindSink(sink)
-	lc.Backend().Control.Flags = ebpfv3.FlagMACSource
+	lc.backend.Control.Flags = ebpfv3.FlagMACSource
 	if err := lc.PublishMACSourcePolicies([]ebpfv3.MACPolicyEntry{{Key: ebpfv3.MACKey{Addr: [6]byte{2, 2, 2, 2, 2, 2}}}}); err == nil {
 		t.Fatal("expected MAC publish recovery error")
 	}
 	if sink.disabled != 1 {
 		t.Fatalf("whole dataplane fuse not used: disabled=%d", sink.disabled)
 	}
-	if lc.Backend().Control.Enabled != 0 {
+	if lc.backend.Control.Enabled != 0 {
 		t.Fatal("model still reports dataplane enabled after last-resort fuse")
 	}
 	_ = lc.ApplyControlFlags(true, true, true, true, true, 0)
-	if sink.enabled || lc.Backend().Control.Enabled != 0 {
+	if sink.enabled || lc.backend.Control.Enabled != 0 {
 		t.Fatal("ordinary control refresh resurrected a quarantined dataplane")
 	}
 }
@@ -405,7 +421,7 @@ func TestLifecycleFailedWholeDataplaneFuseRemainsQuarantined(t *testing.T) {
 		t.Fatal("expected MAC publish recovery error")
 	}
 	_ = lc.ApplyControlFlags(true, true, true, true, true, 0)
-	if sink.enabled || lc.Backend().Control.Enabled != 0 {
+	if sink.enabled || lc.backend.Control.Enabled != 0 {
 		t.Fatal("failed whole-dataplane fuse was not sticky")
 	}
 }
@@ -422,7 +438,7 @@ func TestLifecycleMACQuarantinePreservesDisabledDataplane(t *testing.T) {
 	defer lc.Close()
 	sink := &memSink{gen: 1, macErr: errors.New("partial MAC snapshot")}
 	lc.BindSink(sink)
-	lc.Backend().Control.Enabled = 0
+	lc.backend.Control.Enabled = 0
 	if err := lc.PublishMACSourcePolicies([]ebpfv3.MACPolicyEntry{{Key: ebpfv3.MACKey{Addr: [6]byte{3, 3, 3, 3, 3, 3}}}}); err == nil {
 		t.Fatal("expected MAC publish error")
 	}
@@ -454,11 +470,11 @@ func TestLifecycleRevokeFlowKeepsModelWhenKernelDeleteFails(t *testing.T) {
 	pair, err := ebpfv3.BuildFlowPair(ebpfv3.FlowPublishRequest{
 		Client: client, Destination: dest, Protocol: ebpfv3.ProtocolTCP,
 		Verdict: ebpfv3.VerdictProxy,
-	}, lc.Backend().Control.PolicyGeneration, 1)
+	}, lc.backend.Control.PolicyGeneration, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, ok := lc.Backend().Flows[pair.Forward]; !ok {
+	if _, ok := lc.backend.Flows[pair.Forward]; !ok {
 		t.Fatal("model flow was removed after kernel revoke failure")
 	}
 }
@@ -480,11 +496,11 @@ func TestLifecycleInvalidateGenerationKeepsModelWhenKernelBumpFails(t *testing.T
 	if err := lc.LearnFlow(client, dest, ebpfv3.ProtocolTCP, true, time.Now()); err != nil {
 		t.Fatal(err)
 	}
-	before := lc.Backend().Control.PolicyGeneration
+	before := lc.backend.Control.PolicyGeneration
 	if err := lc.InvalidateGeneration(); err == nil {
 		t.Fatal("expected kernel generation bump error")
 	}
-	if got := lc.Backend().Control.PolicyGeneration; got != before {
+	if got := lc.backend.Control.PolicyGeneration; got != before {
 		t.Fatalf("model generation changed after kernel failure: before=%d after=%d", before, got)
 	}
 	pair, err := ebpfv3.BuildFlowPair(ebpfv3.FlowPublishRequest{
@@ -494,7 +510,7 @@ func TestLifecycleInvalidateGenerationKeepsModelWhenKernelBumpFails(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, ok := lc.Backend().Flows[pair.Forward]; !ok {
+	if _, ok := lc.backend.Flows[pair.Forward]; !ok {
 		t.Fatal("model flow was removed after kernel generation failure")
 	}
 }
@@ -550,13 +566,13 @@ func TestLifecyclePublishStaticDirectMirrorsMemorySnapshot(t *testing.T) {
 	if sink.static != 1 {
 		t.Fatalf("kernel snapshot received %d prefixes", sink.static)
 	}
-	if got := lc.Backend().LookupStatic(prefix.Addr(), ebpfv3.ProtocolTCP, 443); got == nil {
+	if got := lc.backend.LookupStatic(prefix.Addr(), ebpfv3.ProtocolTCP, 443); got == nil {
 		t.Fatal("memory snapshot did not receive direct prefix")
 	} else if got.Verdict != uint8(ebpfv3.VerdictDirect) || got.Source != uint8(ebpfv3.SourceStatic) {
 		t.Fatalf("unexpected memory policy: %+v", *got)
 	}
-	if lc.Backend().Control.PolicyGeneration != sink.gen {
-		t.Fatalf("generation diverged: memory=%d kernel=%d", lc.Backend().Control.PolicyGeneration, sink.gen)
+	if lc.backend.Control.PolicyGeneration != sink.gen {
+		t.Fatalf("generation diverged: memory=%d kernel=%d", lc.backend.Control.PolicyGeneration, sink.gen)
 	}
 }
 
@@ -572,10 +588,10 @@ func TestLifecycleStaticPreparationBlocksKernelOnModelConflict(t *testing.T) {
 	defer lc.Close()
 	sink := &memSink{gen: 1}
 	lc.BindSink(sink)
-	if _, ok := lc.Backend().Publisher.BeginCompile(); !ok {
+	if _, ok := lc.backend.Publisher.BeginCompile(); !ok {
 		t.Fatal("failed to reserve model compile")
 	}
-	defer lc.Backend().Publisher.AbortCompile()
+	defer lc.backend.Publisher.AbortCompile()
 	if err := lc.PublishStaticDirect([]netip.Prefix{netip.MustParsePrefix("203.0.113.8/32")}); err == nil {
 		t.Fatal("expected model preparation conflict")
 	}
@@ -596,13 +612,13 @@ func TestLifecycleGenerationSyncKeepsPublisherMonotonic(t *testing.T) {
 	defer lc.Close()
 	lc.SyncPolicyGeneration(10)
 	lc.SyncPolicyGeneration(12)
-	if got := lc.Backend().Publisher.Generation(); got != 12 {
+	if got := lc.backend.Publisher.Generation(); got != 12 {
 		t.Fatalf("publisher generation=%d want 12", got)
 	}
-	if err := lc.Backend().PublishStatic(nil); err != nil {
+	if err := lc.backend.PublishStatic(nil); err != nil {
 		t.Fatal(err)
 	}
-	if got := lc.Backend().Control.PolicyGeneration; got != 13 {
+	if got := lc.backend.Control.PolicyGeneration; got != 13 {
 		t.Fatalf("control generation=%d want 13", got)
 	}
 }
@@ -626,7 +642,7 @@ func TestLifecycleMergeStaticDirectMirrorsSinkAndModel(t *testing.T) {
 	if sink.merged != 1 {
 		t.Fatalf("sink merges=%d", sink.merged)
 	}
-	if got := lc.Backend().LookupDynamicDirect(prefix.Addr(), ebpfv3.ProtocolTCP, 443); got == nil {
+	if got := lc.backend.LookupDynamicDirect(prefix.Addr(), ebpfv3.ProtocolTCP, 443); got == nil {
 		t.Fatal("memory model did not receive merged policy")
 	}
 }

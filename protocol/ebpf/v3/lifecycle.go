@@ -58,18 +58,41 @@ func (l *Lifecycle) BindSink(sink DataplaneSink) {
 	l.sink = sink
 }
 
-// Backend exposes the in-process map model (tests + future kernel sync).
-func (l *Lifecycle) Backend() *ebpfv3.MemoryBackend {
+// BackendSnapshot is the read-only lifecycle status exposed to diagnostics.
+// Mutable map state remains private to Lifecycle so callers cannot bypass its
+// transaction mutex or hold the MemoryBackend compile reservation themselves.
+type BackendSnapshot struct {
+	Control        ebpfv3.Control
+	ActiveBank     uint32
+	Generation     uint32
+	FlowCount      int
+	MACPolicyCount int
+}
+
+// Backend returns a point-in-time status snapshot, never the mutable model.
+func (l *Lifecycle) Backend() BackendSnapshot {
 	if l == nil {
-		return nil
+		return BackendSnapshot{}
 	}
-	return l.backend
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.backend == nil {
+		return BackendSnapshot{}
+	}
+	snapshot := BackendSnapshot{
+		Control:        l.backend.Control,
+		FlowCount:      len(l.backend.Flows),
+		MACPolicyCount: len(l.backend.MACPolicies),
+	}
+	if l.backend.Publisher != nil {
+		snapshot.ActiveBank, snapshot.Generation = l.backend.Publisher.Snapshot()
+	}
+	return snapshot
 }
 
 // SyncPolicyGeneration keeps the audit model aligned with a generation that
-// was committed by the live kernel publisher.  Callers must not mutate the
-// Backend control block directly: LearnFlow, ObserveDNS, reload and Close all
-// share this lock.
+// was committed by the live kernel publisher. LearnFlow, ObserveDNS, reload
+// and Close all share this lock.
 func (l *Lifecycle) SyncPolicyGeneration(generation uint32) {
 	if l == nil || generation == 0 {
 		return
