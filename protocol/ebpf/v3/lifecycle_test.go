@@ -1,6 +1,7 @@
 package v3
 
 import (
+	"errors"
 	"net/netip"
 	"testing"
 	"time"
@@ -96,6 +97,8 @@ type memSink struct {
 
 	controlWrites int
 	flags         uint32
+	deleteErr     error
+	invalidateErr error
 }
 
 func (m *memSink) PublishStaticDirect(prefixes []netip.Prefix, generation uint32, bank uint32) error {
@@ -119,7 +122,7 @@ func (m *memSink) PutDirectFlow(protocol uint8, source, destination netip.AddrPo
 }
 func (m *memSink) DeleteDirectFlow(protocol uint8, source, destination netip.AddrPort) error {
 	m.deleted++
-	return nil
+	return m.deleteErr
 }
 func (m *memSink) PublishMACPolicies(entries []ebpfv3.MACPolicyEntry) error {
 	m.mac += len(entries)
@@ -140,6 +143,9 @@ func (m *memSink) PublishDNSHint(addr netip.Addr, direct bool, evidence uint8, g
 }
 func (m *memSink) InvalidateFlowDirect() error {
 	m.invalid++
+	if m.invalidateErr != nil {
+		return m.invalidateErr
+	}
 	m.gen++
 	return nil
 }
@@ -182,6 +188,74 @@ func TestLifecycleBindSinkMirrorsKernel(t *testing.T) {
 	}
 	if err := lc.InvalidateGeneration(); err != nil || sink.invalid != 1 {
 		t.Fatalf("invalidate=%d err=%v", sink.invalid, err)
+	}
+}
+
+func TestLifecycleRevokeFlowKeepsModelWhenKernelDeleteFails(t *testing.T) {
+	drop := false
+	lc, err := NewLifecycle(option.EBPFSharedNetworkOptions{
+		Enabled: true, Engine: EngineV3, DataPlane: "socket_assign", DropUDP443: &drop,
+		PolicyOffload: option.EBPFPolicyOffloadOptions{Enabled: true, ExactFlowLearning: true},
+	}, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lc.Close()
+	sink := &memSink{gen: 1, deleteErr: errors.New("kernel delete failed")}
+	lc.BindSink(sink)
+	client := netip.MustParseAddrPort("10.0.0.2:1111")
+	dest := netip.MustParseAddrPort("8.8.8.8:443")
+	if err := lc.LearnFlow(client, dest, ebpfv3.ProtocolTCP, true, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if err := lc.RevokeFlow(client, dest, ebpfv3.ProtocolTCP); err == nil {
+		t.Fatal("expected kernel revoke error")
+	}
+	pair, err := ebpfv3.BuildFlowPair(ebpfv3.FlowPublishRequest{
+		Client: client, Destination: dest, Protocol: ebpfv3.ProtocolTCP,
+		Verdict: ebpfv3.VerdictProxy,
+	}, lc.Backend().Control.PolicyGeneration, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := lc.Backend().Flows[pair.Forward]; !ok {
+		t.Fatal("model flow was removed after kernel revoke failure")
+	}
+}
+
+func TestLifecycleInvalidateGenerationKeepsModelWhenKernelBumpFails(t *testing.T) {
+	drop := false
+	lc, err := NewLifecycle(option.EBPFSharedNetworkOptions{
+		Enabled: true, Engine: EngineV3, DataPlane: "socket_assign", DropUDP443: &drop,
+		PolicyOffload: option.EBPFPolicyOffloadOptions{Enabled: true, ExactFlowLearning: true},
+	}, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lc.Close()
+	sink := &memSink{gen: 1, invalidateErr: errors.New("kernel generation bump failed")}
+	lc.BindSink(sink)
+	client := netip.MustParseAddrPort("10.0.0.2:1111")
+	dest := netip.MustParseAddrPort("8.8.8.8:443")
+	if err := lc.LearnFlow(client, dest, ebpfv3.ProtocolTCP, true, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	before := lc.Backend().Control.PolicyGeneration
+	if err := lc.InvalidateGeneration(); err == nil {
+		t.Fatal("expected kernel generation bump error")
+	}
+	if got := lc.Backend().Control.PolicyGeneration; got != before {
+		t.Fatalf("model generation changed after kernel failure: before=%d after=%d", before, got)
+	}
+	pair, err := ebpfv3.BuildFlowPair(ebpfv3.FlowPublishRequest{
+		Client: client, Destination: dest, Protocol: ebpfv3.ProtocolTCP,
+		Verdict: ebpfv3.VerdictProxy,
+	}, before, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := lc.Backend().Flows[pair.Forward]; !ok {
+		t.Fatal("model flow was removed after kernel generation failure")
 	}
 }
 

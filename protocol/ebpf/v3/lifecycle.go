@@ -382,13 +382,26 @@ func (l *Lifecycle) RevokeFlow(client, dest netip.AddrPort, protocol uint8) erro
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	if err := l.backend.RevokeFlow(client, dest, protocol); err != nil {
+	// Validate before touching the kernel. MemoryBackend.RevokeFlow performs
+	// the same validation, but doing it up front prevents a future model-side
+	// validation change from creating a kernel/model split after a successful
+	// kernel delete.
+	if _, err := ebpfv3.BuildFlowPair(ebpfv3.FlowPublishRequest{
+		Client: client, Destination: dest, Protocol: protocol,
+		Verdict: ebpfv3.VerdictProxy,
+	}, l.backend.Control.PolicyGeneration, 1); err != nil {
 		return err
 	}
 	if l.sink != nil {
-		return l.sink.DeleteDirectFlow(protocol, client, dest)
+		// The kernel is the authoritative dataplane.  Remove it first so a
+		// failed kernel operation cannot be hidden by a model-only revoke.
+		// Keeping the model entry on failure preserves diagnostics and lets the
+		// caller invalidate the generation as a fail-closed fallback.
+		if err := l.sink.DeleteDirectFlow(protocol, client, dest); err != nil {
+			return err
+		}
 	}
-	return nil
+	return l.backend.RevokeFlow(client, dest, protocol)
 }
 
 // ObserveDNS records DNS/FakeIP evidence with conflict isolation and mirrors
@@ -439,6 +452,22 @@ func (l *Lifecycle) InvalidateGeneration() error {
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	if l.sink != nil {
+		// The kernel controls whether stale verdicts are accepted. Commit its
+		// generation first; only then advance the in-process model to the exact
+		// generation reported by the sink.
+		if err := l.sink.InvalidateFlowDirect(); err != nil {
+			return err
+		}
+		generation := l.sink.PolicyGeneration()
+		if generation == 0 {
+			return fmt.Errorf("kernel invalidation returned zero generation")
+		}
+		l.backend.Control.PolicyGeneration = generation
+		l.backend.Publisher.SyncGeneration(generation)
+		l.backend.InvalidateGeneration(generation)
+		return nil
+	}
 	if l.backend != nil {
 		l.backend.Control.PolicyGeneration++
 		if l.backend.Control.PolicyGeneration == 0 {
@@ -446,9 +475,6 @@ func (l *Lifecycle) InvalidateGeneration() error {
 		}
 		l.backend.Publisher.SyncGeneration(l.backend.Control.PolicyGeneration)
 		l.backend.InvalidateGeneration(l.backend.Control.PolicyGeneration)
-	}
-	if l.sink != nil {
-		return l.sink.InvalidateFlowDirect()
 	}
 	return nil
 }

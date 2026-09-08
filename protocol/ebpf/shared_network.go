@@ -611,7 +611,22 @@ func (s *sharedNetwork) revokeExactFlow(protocol uint8, client, dest netip.AddrP
 	// a v2 revoke: the tuple only exists in the v2 backend in that state.
 	if s.engineV3 && s.v3 != nil {
 		if err := s.v3.RevokeFlow(client, dest, protocol); err != nil {
-			s.parent.logger.Debug("eBPF v3 flow revoke: ", err)
+			// A failed kernel delete can leave a stale exact-flow row.  Bump the
+			// dataplane generation immediately: the TC program rejects rows from
+			// the previous generation, while the lifecycle keeps the failed model
+			// entry until the invalidation completes.
+			s.parent.logger.Error("eBPF v3 flow revoke failed; invalidating exact-flow generation: ", err)
+			if invalidateErr := s.v3.InvalidateGeneration(); invalidateErr != nil {
+				s.parent.logger.Error("eBPF v3 exact-flow generation invalidate failed: ", invalidateErr)
+				// Last-resort safety fuse: if the generation bump itself cannot
+				// reach the kernel, stop accepting exact-flow verdicts so stale
+				// rows cannot continue to bypass userspace.
+				if s.backend != nil {
+					if disableErr := s.backend.SetFlowDirect(false); disableErr != nil {
+						s.parent.logger.Error("eBPF exact-flow safety disable failed: ", disableErr)
+					}
+				}
+			}
 		}
 		return
 	}
