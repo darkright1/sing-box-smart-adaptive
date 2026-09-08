@@ -139,9 +139,12 @@ func (m *memSink) DeleteMergedStaticDirect(prefix netip.Prefix) error {
 }
 func (m *memSink) WriteControlV3(enabled bool, flags uint32, activeBank, generation, routingMark uint32) error {
 	m.controlWrites++
+	if m.controlErr != nil {
+		return m.controlErr
+	}
 	m.enabled = enabled
 	m.flags = flags
-	return m.controlErr
+	return nil
 }
 func (m *memSink) PublishDNSHint(addr netip.Addr, direct bool, evidence uint8, generation uint32, ttl time.Duration) error {
 	m.dns++
@@ -375,6 +378,35 @@ func TestLifecycleMACPublishDisablesWholeDataplaneAsLastResort(t *testing.T) {
 	}
 	if lc.Backend().Control.Enabled != 0 {
 		t.Fatal("model still reports dataplane enabled after last-resort fuse")
+	}
+	_ = lc.ApplyControlFlags(true, true, true, true, true, 0)
+	if sink.enabled || lc.Backend().Control.Enabled != 0 {
+		t.Fatal("ordinary control refresh resurrected a quarantined dataplane")
+	}
+}
+
+func TestLifecycleFailedWholeDataplaneFuseRemainsQuarantined(t *testing.T) {
+	drop := false
+	lc, err := NewLifecycle(option.EBPFSharedNetworkOptions{
+		Enabled: true, Engine: EngineV3, DataPlane: "socket_assign", DropUDP443: &drop,
+		PolicyOffload: option.EBPFPolicyOffloadOptions{Enabled: true, MACSourcePolicy: true},
+	}, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lc.Close()
+	sink := &memSink{
+		gen: 1, macErr: errors.New("partial MAC snapshot"),
+		controlErr: errors.New("control write failed"), invalidateErr: errors.New("generation bump failed"),
+		disableErr: errors.New("dataplane disable failed"),
+	}
+	lc.BindSink(sink)
+	if err := lc.PublishMACSourcePolicies([]ebpfv3.MACPolicyEntry{{Key: ebpfv3.MACKey{Addr: [6]byte{4, 4, 4, 4, 4, 4}}}}); err == nil {
+		t.Fatal("expected MAC publish recovery error")
+	}
+	_ = lc.ApplyControlFlags(true, true, true, true, true, 0)
+	if sink.enabled || lc.Backend().Control.Enabled != 0 {
+		t.Fatal("failed whole-dataplane fuse was not sticky")
 	}
 }
 

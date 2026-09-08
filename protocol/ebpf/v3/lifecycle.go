@@ -23,6 +23,10 @@ type Lifecycle struct {
 
 	flowTTL        time.Duration
 	macQuarantined bool
+	// dataplaneQuarantined is a process-lifetime safety fuse. It is set only
+	// after the narrow MAC and generation recovery paths both fail; ordinary
+	// control refreshes must never resurrect a dataplane in that state.
+	dataplaneQuarantined bool
 }
 
 // NewLifecycle constructs control-plane state. Does not attach TC.
@@ -165,18 +169,23 @@ func (l *Lifecycle) ApplyControlFlags(enableIPv4, enableIPv6, enableTCP, enableU
 	if l.macQuarantined {
 		flags &^= ebpfv3.FlagMACSource
 	}
+	enabled := l.backend.Control.Enabled != 0 && !l.dataplaneQuarantined
 	if l.sink != nil {
 		bank, generation := l.backend.Publisher.Snapshot()
 		// The kernel control map is authoritative.  Do not advance the model
 		// until the live feature mask has been committed successfully.
-		if err := l.sink.WriteControlV3(true, flags, bank, generation, routingMark); err != nil {
+		if err := l.sink.WriteControlV3(enabled, flags, bank, generation, routingMark); err != nil {
 			return err
 		}
 	}
 	l.backend.Control.Flags = flags
 	l.backend.Control.RoutingMark = routingMark
 	l.backend.Control.ABIVersion = ebpfv3.ABIVersion
-	l.backend.Control.Enabled = 1
+	if enabled {
+		l.backend.Control.Enabled = 1
+	} else {
+		l.backend.Control.Enabled = 0
+	}
 	return nil
 }
 
@@ -314,10 +323,17 @@ func (l *Lifecycle) recoverMACPublishFailureLocked(cause error) error {
 	if invalidateErr == nil {
 		return errors.Join(cause, disableErr)
 	}
-	wholeErr := l.sink.Disable()
-	if wholeErr == nil && l.backend != nil {
+	// The final fuse is fail-closed even when its syscall reports an error: the
+	// kernel state is no longer trustworthy, so later refreshes must not issue
+	// an enable write until a new lifecycle/backend is constructed.
+	l.dataplaneQuarantined = true
+	if l.backend != nil {
+		// Reflect the terminal fail-closed state even if the detach syscall
+		// itself reports an error. The quarantine bit prevents any later
+		// control refresh from attempting to resurrect the dataplane.
 		l.backend.Control.Enabled = 0
 	}
+	wholeErr := l.sink.Disable()
 	return errors.Join(cause, disableErr, invalidateErr, wholeErr)
 }
 
