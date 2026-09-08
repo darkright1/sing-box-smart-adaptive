@@ -56,3 +56,16 @@ func TestSelectDashboardOutboundsSamplesRecentAndStale(t *testing.T) {
 		}
 	}
 }
+
+func TestSelectDashboardOutboundsKeepsProbeTargetsSeparate(t *testing.T) {
+	history := urltest.NewHistoryStorage()
+	first := &smartCloseStubOutbound{Adapter: outbound.NewAdapter(C.TypeDirect, "target-a", []string{N.NetworkTCP}, nil)}
+	second := &smartCloseStubOutbound{Adapter: outbound.NewAdapter(C.TypeDirect, "target-b", []string{N.NetworkTCP}, nil)}
+	now := time.Now()
+	history.StoreURLTestHistoryKey(urltest.KeyForOutbound(first, "https://probe-a.example/204", N.NetworkTCP), &adapter.URLTestHistory{Time: now, Delay: 10})
+	history.StoreURLTestHistoryKey(urltest.KeyForOutbound(second, "https://probe-b.example/204", N.NetworkTCP), &adapter.URLTestHistory{Time: now, Delay: 20})
+	selected := selectDashboardOutbounds(history, []adapter.Outbound{first, second}, 1, "https://probe-b.example/204")
+	if len(selected) != 1 || selected[0] != second {
+		t.Fatalf("dashboard selected %v for target-specific probe, want target-b", selected)
+	}
+}

@@ -725,7 +725,7 @@ func DashboardURLTestOutbounds(ctx context.Context, outboundManager adapter.Outb
 
 func dashboardURLTestOutbounds(ctx context.Context, outboundManager adapter.OutboundManager, history *urltest.HistoryStorage, logger log.Logger, outbounds []adapter.Outbound, link string, profiles *nodeProfileRegistry) map[string]uint16 {
 	leaves, dashboardGroups := collectDashboardOutbounds(outboundManager, outbounds)
-	selectedLeaves := selectDashboardOutbounds(history, leaves, dashboardURLTestLimit)
+	selectedLeaves := selectDashboardOutbounds(history, leaves, dashboardURLTestLimit, link)
 	result := make(map[string]uint16)
 	var resultAccess sync.Mutex
 	if len(selectedLeaves) > 0 {
@@ -765,8 +765,8 @@ func urlTestOutbounds(ctx context.Context, outboundManager adapter.OutboundManag
 	testBatch.test(outbounds, link, interval, force)
 	b.Wait()
 	for _, outboundGroup := range testBatch.groups {
-		key := historyKeyForOutbound(outboundManager, outboundGroup, "", N.NetworkTCP)
-		groupHistory := history.LoadLatestURLTestHistoryKey(key)
+		key := historyKeyForOutbound(outboundManager, outboundGroup, link, N.NetworkTCP)
+		groupHistory := history.LoadURLTestHistoryKey(key)
 		if groupHistory != nil {
 			testBatch.result[outboundGroup.Tag()] = groupHistory.Delay
 		}
@@ -805,7 +805,7 @@ func collectDashboardOutbounds(outboundManager adapter.OutboundManager, outbound
 	return leaves, groups
 }
 
-func selectDashboardOutbounds(history *urltest.HistoryStorage, outbounds []adapter.Outbound, limit int) []adapter.Outbound {
+func selectDashboardOutbounds(history *urltest.HistoryStorage, outbounds []adapter.Outbound, limit int, probeLinks ...string) []adapter.Outbound {
 	if limit <= 0 || len(outbounds) <= limit {
 		return outbounds
 	}
@@ -817,7 +817,11 @@ func selectDashboardOutbounds(history *urltest.HistoryStorage, outbounds []adapt
 	for _, outbound := range outbounds {
 		var itemHistory *adapter.URLTestHistory
 		if history != nil {
-			itemHistory = history.LoadLatestURLTestHistoryForOutbound(outbound, N.NetworkTCP)
+			if len(probeLinks) > 0 && probeLinks[0] != "" {
+				itemHistory = history.LoadURLTestHistoryKey(urltest.KeyForOutbound(outbound, probeLinks[0], N.NetworkTCP))
+			} else {
+				itemHistory = history.LoadLatestURLTestHistoryForOutbound(outbound, N.NetworkTCP)
+			}
 		}
 		items = append(items, candidate{outbound: outbound, history: itemHistory})
 	}
@@ -859,7 +863,11 @@ func selectDashboardOutbounds(history *urltest.HistoryStorage, outbounds []adapt
 		seen[item.outbound.Tag()] = struct{}{}
 		selected = append(selected, item.outbound)
 	}
-	for _, item := range recent[:min(len(recent), limit/2)] {
+	// Always reserve at least one slot for the most recent target-specific
+	// observation. With a one-entry dashboard budget, limit/2 would be zero
+	// and the stale/untested pass could select an unrelated target instead.
+	recentCount := (limit + 1) / 2
+	for _, item := range recent[:min(len(recent), recentCount)] {
 		appendCandidate(item)
 	}
 	for _, item := range oldest {
