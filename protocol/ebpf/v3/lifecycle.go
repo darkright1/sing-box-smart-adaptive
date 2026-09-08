@@ -310,7 +310,8 @@ func (l *Lifecycle) disableMACSourceLocked() error {
 	flags := l.backend.Control.Flags &^ ebpfv3.FlagMACSource
 	if l.sink != nil {
 		bank, generation := l.backend.Publisher.Snapshot()
-		if err := l.sink.WriteControlV3(true, flags, bank, generation, l.backend.Control.RoutingMark); err != nil {
+		enabled := l.backend.Control.Enabled != 0
+		if err := l.sink.WriteControlV3(enabled, flags, bank, generation, l.backend.Control.RoutingMark); err != nil {
 			return err
 		}
 	}
