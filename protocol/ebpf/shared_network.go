@@ -550,6 +550,12 @@ func (s v3KernelSink) WriteControlV3(enabled bool, flags uint32, activeBank, gen
 	}
 	return s.dp.WriteControlV3(enabled, flags, activeBank, generation, routingMark)
 }
+func (s v3KernelSink) Disable() error {
+	if s.dp == nil {
+		return nil
+	}
+	return s.dp.Disable()
+}
 func (s v3KernelSink) MergeDynamicDirect(prefix netip.Prefix, ttl time.Duration) error {
 	if s.dp == nil {
 		return nil

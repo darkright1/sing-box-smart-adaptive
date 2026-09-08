@@ -101,6 +101,8 @@ type memSink struct {
 	macErr        error
 	deleteErr     error
 	invalidateErr error
+	disableErr    error
+	disabled      int
 }
 
 func (m *memSink) PublishStaticDirect(prefixes []netip.Prefix, generation uint32, bank uint32) error {
@@ -150,6 +152,10 @@ func (m *memSink) InvalidateFlowDirect() error {
 	}
 	m.gen++
 	return nil
+}
+func (m *memSink) Disable() error {
+	m.disabled++
+	return m.disableErr
 }
 func (m *memSink) PolicyGeneration() uint32 { return m.gen }
 
@@ -236,7 +242,7 @@ func TestLifecycleLearnFlowValidatesBeforeKernelWrite(t *testing.T) {
 	}
 }
 
-func TestLifecycleMACPublishFailureInvalidatesGeneration(t *testing.T) {
+func TestLifecycleMACPublishFailureQuarantinesOnlyMACFastPath(t *testing.T) {
 	drop := false
 	lc, err := NewLifecycle(option.EBPFSharedNetworkOptions{
 		Enabled: true, Engine: EngineV3, DataPlane: "socket_assign", DropUDP443: &drop,
@@ -248,6 +254,7 @@ func TestLifecycleMACPublishFailureInvalidatesGeneration(t *testing.T) {
 	defer lc.Close()
 	sink := &memSink{gen: 1, macErr: errors.New("partial MAC snapshot")}
 	lc.BindSink(sink)
+	lc.Backend().Control.Flags = ebpfv3.FlagMACSource | ebpfv3.FlagExactFlow
 	before := lc.Backend().Control.PolicyGeneration
 	err = lc.PublishMACSourcePolicies([]ebpfv3.MACPolicyEntry{{
 		Key: ebpfv3.MACKey{Addr: [6]byte{1, 2, 3, 4, 5, 6}},
@@ -255,15 +262,39 @@ func TestLifecycleMACPublishFailureInvalidatesGeneration(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected MAC publish error")
 	}
-	if sink.invalid != 1 || sink.gen == before {
-		t.Fatalf("MAC failure did not invalidate generation: invalid=%d before=%d after=%d", sink.invalid, before, sink.gen)
+	if sink.invalid != 0 || sink.gen != before {
+		t.Fatalf("MAC failure unnecessarily invalidated generation: invalid=%d before=%d after=%d", sink.invalid, before, sink.gen)
+	}
+	if lc.Backend().Control.Flags&ebpfv3.FlagMACSource != 0 {
+		t.Fatal("MAC fast path remained enabled after uncertain publish")
+	}
+	if lc.Backend().Control.Flags&ebpfv3.FlagExactFlow == 0 {
+		t.Fatal("unrelated exact-flow flag was cleared")
 	}
 	if len(lc.Backend().MACPolicies) != 0 {
 		t.Fatal("model MAC snapshot changed after kernel publish failure")
 	}
+	if err := lc.ApplyControlFlags(true, true, true, true, true, 0); err != nil {
+		t.Fatal(err)
+	}
+	if sink.flags&ebpfv3.FlagMACSource != 0 {
+		t.Fatal("quarantined MAC fast path was re-enabled by control refresh")
+	}
+	// A later complete snapshot clears the quarantine and permits the flag
+	// again; recovery must not require a process restart.
+	sink.macErr = nil
+	if err := lc.PublishMACSourcePolicies([]ebpfv3.MACPolicyEntry{{Key: ebpfv3.MACKey{Addr: [6]byte{1, 2, 3, 4, 5, 6}}}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := lc.ApplyControlFlags(true, true, true, true, true, 0); err != nil {
+		t.Fatal(err)
+	}
+	if sink.flags&ebpfv3.FlagMACSource == 0 {
+		t.Fatal("successful snapshot did not clear MAC quarantine")
+	}
 }
 
-func TestLifecycleMACPublishDisablesFastPathWhenRecoveryFails(t *testing.T) {
+func TestLifecycleMACPublishKeepsQuarantineLocalWhenEscalationIsNotNeeded(t *testing.T) {
 	drop := false
 	lc, err := NewLifecycle(option.EBPFSharedNetworkOptions{
 		Enabled: true, Engine: EngineV3, DataPlane: "socket_assign", DropUDP443: &drop,
@@ -284,6 +315,58 @@ func TestLifecycleMACPublishDisablesFastPathWhenRecoveryFails(t *testing.T) {
 	}
 	if lc.Backend().Control.Flags&ebpfv3.FlagMACSource != 0 {
 		t.Fatal("MAC fast path remained enabled after recovery failure")
+	}
+	if sink.invalid != 0 {
+		t.Fatalf("local MAC quarantine should not escalate when control write succeeds: invalid=%d", sink.invalid)
+	}
+}
+
+func TestLifecycleMACPublishEscalatesToGenerationOnControlFailure(t *testing.T) {
+	drop := false
+	lc, err := NewLifecycle(option.EBPFSharedNetworkOptions{
+		Enabled: true, Engine: EngineV3, DataPlane: "socket_assign", DropUDP443: &drop,
+		PolicyOffload: option.EBPFPolicyOffloadOptions{Enabled: true, MACSourcePolicy: true},
+	}, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lc.Close()
+	sink := &memSink{gen: 1, macErr: errors.New("partial MAC snapshot"), controlErr: errors.New("control write failed")}
+	lc.BindSink(sink)
+	lc.Backend().Control.Flags = ebpfv3.FlagMACSource | ebpfv3.FlagExactFlow
+	before := lc.Backend().Control.PolicyGeneration
+	if err := lc.PublishMACSourcePolicies([]ebpfv3.MACPolicyEntry{{Key: ebpfv3.MACKey{Addr: [6]byte{1, 1, 1, 1, 1, 1}}}}); err == nil {
+		t.Fatal("expected MAC publish recovery error")
+	}
+	if sink.invalid != 1 || sink.gen == before {
+		t.Fatalf("control failure did not escalate to generation invalidation: invalid=%d before=%d after=%d", sink.invalid, before, sink.gen)
+	}
+}
+
+func TestLifecycleMACPublishDisablesWholeDataplaneAsLastResort(t *testing.T) {
+	drop := false
+	lc, err := NewLifecycle(option.EBPFSharedNetworkOptions{
+		Enabled: true, Engine: EngineV3, DataPlane: "socket_assign", DropUDP443: &drop,
+		PolicyOffload: option.EBPFPolicyOffloadOptions{Enabled: true, MACSourcePolicy: true},
+	}, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lc.Close()
+	sink := &memSink{
+		gen: 1, macErr: errors.New("partial MAC snapshot"),
+		controlErr: errors.New("control write failed"), invalidateErr: errors.New("generation bump failed"),
+	}
+	lc.BindSink(sink)
+	lc.Backend().Control.Flags = ebpfv3.FlagMACSource
+	if err := lc.PublishMACSourcePolicies([]ebpfv3.MACPolicyEntry{{Key: ebpfv3.MACKey{Addr: [6]byte{2, 2, 2, 2, 2, 2}}}}); err == nil {
+		t.Fatal("expected MAC publish recovery error")
+	}
+	if sink.disabled != 1 {
+		t.Fatalf("whole dataplane fuse not used: disabled=%d", sink.disabled)
+	}
+	if lc.Backend().Control.Enabled != 0 {
+		t.Fatal("model still reports dataplane enabled after last-resort fuse")
 	}
 }
 

@@ -19,6 +19,20 @@
   minimal builds now enforce the same supported-protocol filter when providers
   are parsed through the production lifecycle, not only in direct parser tests.
 
+## Unreleased — eBPF v3 MAC snapshot safety
+
+- Count unique normalized MAC keys for capacity preflight; duplicate provider or
+  rule entries no longer consume phantom map slots or trigger false rejection.
+- Keep uncertain one-map MAC publications behind a subsystem-local quarantine:
+  a failed update disables only MAC lookup first, preserving healthy flow/DNS
+  and static generations. A failed control write escalates to generation
+  invalidation, then to a whole-dataplane disable as the final fail-closed
+  fuse.
+- Retire dynamic DIRECT and source-MAC model rows whenever the shared kernel
+  generation changes, preventing diagnostics from reporting rows that TC will
+  ignore. Successful MAC replacement clears the quarantine without restart.
+- Add failure-path, escalation, duplicate-key, and generation-retirement tests.
+
 ## Unreleased — connection close diagnostics
 
 - Record a bounded, race-safe `closeReason` for routed TCP/UDP history entries.

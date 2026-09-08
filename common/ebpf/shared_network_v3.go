@@ -1289,9 +1289,6 @@ func (b *V3Backend) PublishMACPolicies(entries []ebpfv3.MACPolicyEntry) error {
 	if b == nil {
 		return osErrClosed
 	}
-	if len(entries) > ebpfv3.MaxSourcePolicies {
-		return E.New("mac source policy exceeds map capacity")
-	}
 	b.access.Lock()
 	defer b.access.Unlock()
 	if b.runtime == nil {
@@ -1332,7 +1329,11 @@ func (b *V3Backend) PublishMACPolicies(entries []ebpfv3.MACPolicyEntry) error {
 		}
 		previous[key] = value
 	}
-	desired := make(map[v3MACKey]v3MACPolicyValue, len(entries))
+	capHint := len(entries)
+	if capHint > ebpfv3.MaxSourcePolicies+1 {
+		capHint = ebpfv3.MaxSourcePolicies + 1
+	}
+	desired := make(map[v3MACKey]v3MACPolicyValue, capHint)
 	for _, entry := range entries {
 		var zero ebpfv3.MACKey
 		if entry.Key == zero {
@@ -1354,6 +1355,9 @@ func (b *V3Backend) PublishMACPolicies(entries []ebpfv3.MACPolicyEntry) error {
 			Reserved: entry.Key.Reserved,
 			Ifindex:  entry.Key.Ifindex,
 		}] = value
+	}
+	if len(desired) > ebpfv3.MaxSourcePolicies {
+		return E.New("mac source policy exceeds map capacity")
 	}
 	restore := func() error {
 		var restoreErr error

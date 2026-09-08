@@ -126,6 +126,38 @@ func TestFlowModelReleasedOnGenerationChange(t *testing.T) {
 	}
 }
 
+func TestGenerationInvalidatesAllLearnedModelRows(t *testing.T) {
+	b := NewMemoryBackend()
+	if err := b.MergeDynamicDirect(netip.MustParsePrefix("203.0.113.9/32"), time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.PublishMACPolicies([]MACPolicyEntry{{Key: MACKey{Addr: [6]byte{1, 2, 3, 4, 5, 6}}}}); err != nil {
+		t.Fatal(err)
+	}
+	if len(b.dynamicDirects4) != 1 || len(b.MACPolicies) != 1 {
+		t.Fatalf("setup rows missing: dynamic=%d mac=%d", len(b.dynamicDirects4), len(b.MACPolicies))
+	}
+	b.InvalidateGeneration(b.Control.PolicyGeneration + 1)
+	if len(b.dynamicDirects4) != 0 || len(b.dynamicDirects6) != 0 || len(b.MACPolicies) != 0 {
+		t.Fatalf("stale learned rows survived generation change: dynamic4=%d dynamic6=%d mac=%d", len(b.dynamicDirects4), len(b.dynamicDirects6), len(b.MACPolicies))
+	}
+}
+
+func TestPublishMACPoliciesCountsUniqueNormalizedKeys(t *testing.T) {
+	b := NewMemoryBackend()
+	key := MACKey{Addr: [6]byte{0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff}}
+	entries := make([]MACPolicyEntry, MaxSourcePolicies+1)
+	for i := range entries {
+		entries[i] = MACPolicyEntry{Key: key, Value: MACPolicyValue{Verdict: uint8(VerdictDirect)}}
+	}
+	if err := b.PublishMACPolicies(entries); err != nil {
+		t.Fatalf("duplicate keys should consume one map slot: %v", err)
+	}
+	if len(b.MACPolicies) != 1 {
+		t.Fatalf("unique MAC snapshot size=%d want 1", len(b.MACPolicies))
+	}
+}
+
 func TestFlowModelBounded(t *testing.T) {
 	b := NewMemoryBackend()
 	for i := 0; i < maxMemoryFlowEntries/2+64; i++ {

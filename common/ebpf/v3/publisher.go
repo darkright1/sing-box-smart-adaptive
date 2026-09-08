@@ -415,12 +415,19 @@ func (b *MemoryBackend) invalidateGenerationMaps(generation uint32) {
 	if b.DNS != nil {
 		b.DNS.InvalidateGeneration(generation)
 	}
+	// The kernel tags dynamic DIRECT and source-MAC rows with the same global
+	// policy generation.  Retire their model copies as well; otherwise a
+	// generation bump would make the model report rows that TC must ignore.
+	clear(b.dynamicDirects4)
+	clear(b.dynamicDirects6)
+	clear(b.MACPolicies)
 	b.nextFlowPruneNs = 0
 }
 
-// InvalidateGeneration drops exact-flow and DNS evidence from older policy
-// epochs. The kernel maps use generation checks for correctness; the memory
-// model also removes stale entries so those checks do not become a leak.
+// InvalidateGeneration drops all generation-scoped learned evidence from the
+// older policy epoch. The kernel maps use generation checks for correctness;
+// the memory model removes the corresponding rows so diagnostics and tests do
+// not report entries that TC will ignore.
 func (b *MemoryBackend) InvalidateGeneration(generation uint32) {
 	if b == nil {
 		return
@@ -536,10 +543,11 @@ func (b *MemoryBackend) PublishMACPolicies(entries []MACPolicyEntry) error {
 	if b == nil {
 		return fmt.Errorf("nil memory backend")
 	}
-	if len(entries) > MaxSourcePolicies {
-		return fmt.Errorf("mac source policy exceeds map capacity")
+	capHint := len(entries)
+	if capHint > MaxSourcePolicies+1 {
+		capHint = MaxSourcePolicies + 1
 	}
-	snapshot := make(map[MACKey]MACPolicyValue, len(entries))
+	snapshot := make(map[MACKey]MACPolicyValue, capHint)
 	for _, entry := range entries {
 		var zero MACKey
 		if entry.Key == zero {
@@ -553,6 +561,9 @@ func (b *MemoryBackend) PublishMACPolicies(entries []MACPolicyEntry) error {
 			entry.Value.Source = uint8(SourceStatic)
 		}
 		snapshot[entry.Key] = entry.Value
+	}
+	if len(snapshot) > MaxSourcePolicies {
+		return fmt.Errorf("mac source policy exceeds map capacity")
 	}
 	b.MACPolicies = snapshot
 	return nil

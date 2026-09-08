@@ -21,7 +21,8 @@ type Lifecycle struct {
 	backend *ebpfv3.MemoryBackend
 	sink    DataplaneSink
 
-	flowTTL time.Duration
+	flowTTL        time.Duration
+	macQuarantined bool
 }
 
 // NewLifecycle constructs control-plane state. Does not attach TC.
@@ -158,6 +159,12 @@ func (l *Lifecycle) ApplyControlFlags(enableIPv4, enableIPv6, enableTCP, enableU
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	flags := ControlFlags(l.options, enableIPv4, enableIPv6, enableTCP, enableUDP, dnsHijack, routingMark)
+	// A failed snapshot publication leaves the one-map kernel state unknown.
+	// Keep MAC lookup disabled until a complete replacement succeeds; this is
+	// local to the MAC subsystem and does not retire healthy flow/DNS state.
+	if l.macQuarantined {
+		flags &^= ebpfv3.FlagMACSource
+	}
 	if l.sink != nil {
 		bank, generation := l.backend.Publisher.Snapshot()
 		// The kernel control map is authoritative.  Do not advance the model
@@ -238,7 +245,18 @@ func (l *Lifecycle) PublishMACSourcePolicies(entries []ebpfv3.MACPolicyEntry) er
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	if len(entries) > ebpfv3.MaxSourcePolicies {
+	capHint := len(entries)
+	if capHint > ebpfv3.MaxSourcePolicies+1 {
+		capHint = ebpfv3.MaxSourcePolicies + 1
+	}
+	unique := make(map[ebpfv3.MACKey]struct{}, capHint)
+	for _, entry := range entries {
+		var zero ebpfv3.MACKey
+		if entry.Key != zero {
+			unique[entry.Key] = struct{}{}
+		}
+	}
+	if len(unique) > ebpfv3.MaxSourcePolicies {
 		return fmt.Errorf("mac source policy exceeds map capacity")
 	}
 	if l.sink != nil {
@@ -252,23 +270,37 @@ func (l *Lifecycle) PublishMACSourcePolicies(entries []ebpfv3.MACPolicyEntry) er
 		// extended in the future.
 		return l.recoverMACPublishFailureLocked(err)
 	}
+	l.macQuarantined = false
 	return nil
 }
 
 // recoverMACPublishFailureLocked retires an uncertain one-map MAC snapshot.
-// A partial kernel update must never remain live with the old model epoch. If
-// generation invalidation itself cannot be committed, disable the MAC fast
-// path so traffic returns to the userspace decision path.
+// A partial kernel update must never remain live. First disable only the MAC
+// lookup: this is sufficient to make an uncertain one-map snapshot inert and
+// avoids invalidating unrelated static/flow/DNS rows. If that narrow control
+// write fails, escalate to the shared generation fuse; if even that fails,
+// disable the entire dataplane.
 func (l *Lifecycle) recoverMACPublishFailureLocked(cause error) error {
-	if l == nil || l.sink == nil {
+	if l == nil {
 		return cause
+	}
+	l.macQuarantined = true
+	disableErr := l.disableMACSourceLocked()
+	if disableErr == nil {
+		return cause
+	}
+	if l.sink == nil {
+		return errors.Join(cause, disableErr)
 	}
 	invalidateErr := l.invalidateGenerationLocked()
 	if invalidateErr == nil {
-		return cause
+		return errors.Join(cause, disableErr)
 	}
-	disableErr := l.disableMACSourceLocked()
-	return errors.Join(cause, invalidateErr, disableErr)
+	wholeErr := l.sink.Disable()
+	if wholeErr == nil && l.backend != nil {
+		l.backend.Control.Enabled = 0
+	}
+	return errors.Join(cause, disableErr, invalidateErr, wholeErr)
 }
 
 func (l *Lifecycle) disableMACSourceLocked() error {
