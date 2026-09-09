@@ -233,6 +233,22 @@ var (
 
 var errSmartNoCandidates = errors.New("smart group has no leaf candidates")
 
+// smartDashboardProbeKey marks a ranking/probe operation initiated by a
+// dashboard delay request. Dashboard probes are advisory: they may refresh
+// latency counters, but they must never become a hidden selection command or
+// open/close a circuit that can evict a manual pin. The marker is carried
+// through context.WithoutCancel used by the background sweep.
+type smartDashboardProbeKey struct{}
+
+func withSmartDashboardProbe(ctx context.Context) context.Context {
+	return context.WithValue(ctx, smartDashboardProbeKey{}, true)
+}
+
+func isSmartDashboardProbe(ctx context.Context) bool {
+	value, _ := ctx.Value(smartDashboardProbeKey{}).(bool)
+	return value
+}
+
 type smartAffinity struct {
 	Candidate string
 	ExpiresAt time.Time
@@ -2861,7 +2877,7 @@ func (s *Smart) URLTest(ctx context.Context) (map[string]uint16, error) {
 // normal Smart worker, but only a small advisory budget per request.  A later
 // scheduled cycle fills the remaining catalog without a control-plane burst.
 func (s *Smart) DashboardURLTest(ctx context.Context) (map[string]uint16, error) {
-	return s.probeWithBudget(ctx, s.dashboardProbeBudget)
+	return s.probeWithBudget(withSmartDashboardProbe(ctx), s.dashboardProbeBudget)
 }
 
 // PerformUpdateCheck is the non-blocking hook used by the Clash API after a
@@ -2884,6 +2900,7 @@ func (s *Smart) probe(ctx context.Context) (map[string]uint16, error) {
 }
 
 func (s *Smart) probeWithBudget(ctx context.Context, budget int) (result map[string]uint16, err error) {
+	dashboardProbe := isSmartDashboardProbe(ctx)
 	result = make(map[string]uint16)
 	// The portrait sweep must outlive the caller's deadline: a panel timeout
 	// must not discard in-flight dial evidence, or the catalog can never fill
@@ -3056,9 +3073,9 @@ func (s *Smart) probeWithBudget(ctx context.Context, budget int) (result map[str
 					if family.delay > 0 {
 						elapsed = time.Duration(family.delay) * time.Millisecond
 					}
-					s.observeDial(time.Now(), networkKey, "", probe.candidate.Tag(), family.transport, true, elapsed)
+					s.observeProbeResult(dashboardProbe, time.Now(), networkKey, "", probe.candidate.Tag(), family.transport, true, elapsed)
 				} else if family.err != nil && family.performed {
-					s.observeDial(time.Now(), networkKey, "", probe.candidate.Tag(), family.transport, false, family.elapsed)
+					s.observeProbeResult(dashboardProbe, time.Now(), networkKey, "", probe.candidate.Tag(), family.transport, false, family.elapsed)
 				}
 			}
 			if probe.err != nil && familySuccess == 0 {
@@ -3090,12 +3107,16 @@ func (s *Smart) probeWithBudget(ctx context.Context, budget int) (result map[str
 			observationKey := profileID + "\x00" + N.NetworkTCP
 			if _, exists := observed[observationKey]; !exists {
 				observed[observationKey] = struct{}{}
-				s.observeDial(time.Now(), networkKey, "", probe.candidate.Tag(), N.NetworkTCP, true, time.Duration(probe.delay)*time.Millisecond)
+				s.observeProbeResult(dashboardProbe, time.Now(), networkKey, "", probe.candidate.Tag(), N.NetworkTCP, true, time.Duration(probe.delay)*time.Millisecond)
 			}
 			if !published {
 				// The first successful basic probe makes a cold group usable while
 				// the remaining candidates continue to build profiles in parallel.
-				ranking, _, _, _ := s.rankPooled(s.ctx, N.NetworkTCP, M.Socksaddr{})
+				rankCtx := s.ctx
+				if dashboardProbe {
+					rankCtx = withSmartDashboardProbe(rankCtx)
+				}
+				ranking, _, _, _ := s.rankPooled(rankCtx, N.NetworkTCP, M.Socksaddr{})
 				ranking.Release()
 				published = true
 			}
@@ -3139,7 +3160,7 @@ func (s *Smart) probeWithBudget(ctx context.Context, budget int) (result map[str
 		commonFailure := summary.performed > 1 && summary.successes == 0
 		penalizedProfiles := make(map[string]struct{}, len(summary.collected))
 		for _, probe := range summary.collected {
-			if probe.err != nil && probe.penalize && probe.performed && !commonFailure {
+			if !dashboardProbe && probe.err != nil && probe.penalize && probe.performed && !commonFailure {
 				profileID := profileIDFor(probe.candidate.Tag())
 				if _, exists := penalizedProfiles[profileID]; exists {
 					continue
@@ -3151,7 +3172,7 @@ func (s *Smart) probeWithBudget(ctx context.Context, budget int) (result map[str
 				if s.probeRegistry == nil || s.probeRegistry.dead(metadata.probeKey) {
 					penalizedProfiles[profileID] = struct{}{}
 					s.noteCandidateProbe(probe.candidate.Tag(), time.Now())
-					s.observeDial(time.Now(), networkKey, "", probe.candidate.Tag(), N.NetworkTCP, false, s.probeTimeout)
+					s.observeProbeResult(dashboardProbe, time.Now(), networkKey, "", probe.candidate.Tag(), N.NetworkTCP, false, s.probeTimeout)
 				}
 			}
 		}
@@ -3160,7 +3181,11 @@ func (s *Smart) probeWithBudget(ctx context.Context, budget int) (result map[str
 			// Publish the baseline immediately.  Ranking is otherwise refreshed only
 			// by a real dial, which makes traffic-idle groups look permanently warming
 			// even though their active probes have already populated the store.
-			ranking, _, _, _ := s.rankPooled(s.ctx, N.NetworkTCP, M.Socksaddr{})
+			rankCtx := s.ctx
+			if dashboardProbe {
+				rankCtx = withSmartDashboardProbe(rankCtx)
+			}
+			ranking, _, _, _ := s.rankPooled(rankCtx, N.NetworkTCP, M.Socksaddr{})
 			ranking.Release()
 		}
 		if commonFailure {
@@ -3279,6 +3304,7 @@ var smartUDPProbeTargets = [...]smartUDPProbeTarget{
 }
 
 func (s *Smart) probeUDPWithBudget(ctx context.Context, candidates []adapter.Outbound, budget int) {
+	dashboardProbe := isSmartDashboardProbe(ctx)
 	if ctx.Err() != nil || s.closing.Load() || len(candidates) == 0 {
 		return
 	}
@@ -3417,9 +3443,9 @@ dispatch:
 			}
 			observedUDP[observationKey] = struct{}{}
 			if family.err == nil && family.performed {
-				s.observeDial(time.Now(), networkKey, "__udp_probe__", result.candidate.Tag(), family.transport, true, family.elapsed)
+				s.observeProbeResult(dashboardProbe, time.Now(), networkKey, "__udp_probe__", result.candidate.Tag(), family.transport, true, family.elapsed)
 			} else if family.err != nil && family.performed {
-				s.observeDial(time.Now(), networkKey, "__udp_probe__", result.candidate.Tag(), family.transport, false, family.elapsed)
+				s.observeProbeResult(dashboardProbe, time.Now(), networkKey, "__udp_probe__", result.candidate.Tag(), family.transport, false, family.elapsed)
 			}
 		}
 		if result.err == nil && result.freshSuccess {
@@ -3428,7 +3454,7 @@ dispatch:
 			observationKey := profileID + "\x00" + N.NetworkUDP
 			if _, exists := observedUDP[observationKey]; !exists {
 				observedUDP[observationKey] = struct{}{}
-				s.observeDial(time.Now(), networkKey, "__udp_probe__", result.candidate.Tag(), N.NetworkUDP, true, result.elapsed)
+				s.observeProbeResult(dashboardProbe, time.Now(), networkKey, "__udp_probe__", result.candidate.Tag(), N.NetworkUDP, true, result.elapsed)
 			}
 		}
 	}
@@ -3553,6 +3579,20 @@ func (s *Smart) observeDial(now time.Time, network, site, candidate, transport s
 	if metadata.policyID != 0 {
 		s.observePolicyBackend(smartSelectionKey(network, site, transport), metadata.policyID, success, elapsed, now)
 	}
+}
+
+// observeProbeResult keeps dashboard-triggered measurements advisory. They
+// still contribute latency/success counters for the next normal decision, but
+// cannot alter breaker state or feed the Zig policy owner. In particular, a
+// single panel ping must not evict a manual pin or make the visible incumbent
+// change underneath an active connection.
+func (s *Smart) observeProbeResult(dashboard bool, now time.Time, network, site, candidate, transport string, success bool, elapsed time.Duration) {
+	if dashboard {
+		profileID := s.candidateProfileID(candidate)
+		s.store.observeDialAdvisory(now, network, site, profileID, transport, success, elapsed)
+		return
+	}
+	s.observeDial(now, network, site, candidate, transport, success, elapsed)
 }
 
 // observeDataPlaneFailure records a real connection or established-flow
@@ -3863,6 +3903,24 @@ func (s *Smart) rankPooled(ctx context.Context, transport string, destination M.
 		return reason
 	}
 	if len(ranks) == 0 {
+		return ranking, networkKey, siteKey, siteDisplay
+	}
+	// A dashboard delay request is observational only.  It may refresh the
+	// latency portrait, but it must not run the selection state machine: doing
+	// so would let a single panel ping replace a healthy incumbent or release a
+	// manual pin while real traffic is still using it.  Keep the incumbent at
+	// the head of the returned snapshot without recording a new Zig selection,
+	// switch challenge, cooldown, or pin release.
+	if isSmartDashboardProbe(ctx) {
+		incumbent := pinned
+		if incumbent == "" {
+			incumbent = lastSelected
+		}
+		if index := smartRankIndex(ranks, incumbent); index >= 0 {
+			ranks[index].status.Reason = "dashboard probe; incumbent retained"
+			moveSmartRankFirst(ranks, index)
+			s.updateStatus(networkKey, siteDisplay, transport, ranks, "dashboard probe; incumbent retained")
+		}
 		return ranking, networkKey, siteKey, siteDisplay
 	}
 	if smartPolicyBackendRequired() && !usePolicyBackend {

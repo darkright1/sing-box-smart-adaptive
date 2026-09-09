@@ -911,6 +911,30 @@ func TestSmartManualPinIgnoresPerformanceScore(t *testing.T) {
 	}
 }
 
+func TestSmartDashboardProbeRetainsManualPin(t *testing.T) {
+	first := newSmartFakeOutbound("manual", nil)
+	second := newSmartFakeOutbound("automatic", nil)
+	smart := newTestSmart(first, second)
+	if !smart.SelectOutbound(first.Tag()) {
+		t.Fatal("failed to set manual pin")
+	}
+	// Make the pinned candidate look unusable to the normal state machine.  A
+	// dashboard probe must still be read-only: it cannot release the pin or let
+	// a one-off panel measurement replace it.
+	now := time.Now()
+	for range smart.store.breakerFailures {
+		smart.store.observeDial(now, smart.networkFingerprint(), "", first.Tag(), N.NetworkTCP, false, time.Millisecond)
+	}
+	ranking, _, _, _ := smart.rankPooled(withSmartDashboardProbe(context.Background()), N.NetworkTCP, M.ParseSocksaddr("example.com:443"))
+	defer ranking.Release()
+	if len(ranking.ranks) != 2 || ranking.ranks[0].outbound.Tag() != first.Tag() {
+		t.Fatalf("dashboard probe changed incumbent: ranks=%v", ranking.ranks)
+	}
+	if got := smart.SmartStatus().Pinned; got != first.Tag() {
+		t.Fatalf("dashboard probe released manual pin: %q", got)
+	}
+}
+
 func TestSmartUnstartedHalfOpenAttemptReleasesReservation(t *testing.T) {
 	first := newSmartFakeOutbound("first", nil)
 	second := newSmartFakeOutbound("second", nil)

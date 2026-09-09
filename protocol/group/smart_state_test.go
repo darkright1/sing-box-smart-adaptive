@@ -64,6 +64,21 @@ func TestSmartProbeUsesOnlyConnectivity204(t *testing.T) {
 	}
 }
 
+func TestSmartDashboardProbeDoesNotOpenCircuit(t *testing.T) {
+	store := newSmartStore(time.Hour, 2, time.Minute)
+	now := time.Now()
+	for range 5 {
+		store.observeDialAdvisory(now, N.NetworkTCP, "", "node", N.NetworkTCP, false, time.Millisecond)
+	}
+	estimate := store.estimate(now, N.NetworkTCP, "", "node", N.NetworkTCP, 1)
+	if estimate.State == "open" {
+		t.Fatalf("dashboard failures opened circuit: %+v", estimate)
+	}
+	if estimate.CircuitUntil.After(now) {
+		t.Fatalf("dashboard failures set circuit deadline: %s", estimate.CircuitUntil)
+	}
+}
+
 func TestSmartProbeScheduleFollowsTrafficActivity(t *testing.T) {
 	smart := &Smart{
 		probeInterval: 10 * time.Minute,

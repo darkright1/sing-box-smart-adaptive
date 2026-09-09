@@ -206,6 +206,32 @@ func (s *smartStore) observeDial(now time.Time, network, site, candidate, transp
 	}
 }
 
+// observeDialAdvisory records dashboard/manual probe quality without touching
+// breaker counters or clearing an existing circuit. A panel measurement is a
+// user-visible hint, not real data-plane evidence: it must never make a
+// healthy manual pin disappear because one probe raced a transient outage.
+func (s *smartStore) observeDialAdvisory(now time.Time, network, site, candidate, transport string, success bool, elapsed time.Duration) {
+	s.access.Lock()
+	defer s.access.Unlock()
+	observe := func(key smartMetricKey) {
+		metric := s.metric(key, now)
+		metric.decay(now, s.halfLife)
+		if success {
+			metric.Successes++
+			if elapsed > 0 {
+				metric.updateConnect(float64(elapsed.Microseconds()) / 1000)
+			}
+		} else {
+			metric.Failures++
+		}
+		metric.LastUpdated = now
+	}
+	observe(smartMetricKey{Network: network, Candidate: candidate, Transport: transport})
+	if site != "" {
+		observe(smartMetricKey{Network: network, Site: site, Candidate: candidate, Transport: transport})
+	}
+}
+
 func (s *smartStore) pruneCandidates(keep map[string]struct{}) {
 	if s == nil {
 		return
