@@ -233,6 +233,11 @@ var (
 
 var errSmartNoCandidates = errors.New("smart group has no leaf candidates")
 
+const (
+	smartProbeRequestNormal uint32 = 1 << iota
+	smartProbeRequestDashboard
+)
+
 // smartDashboardProbeKey marks a ranking/probe operation initiated by a
 // dashboard delay request. Dashboard probes are advisory: they may refresh
 // latency counters, but they must never become a hidden selection command or
@@ -588,6 +593,7 @@ type Smart struct {
 	probeStartupDelay          time.Duration
 	probeNow                   chan struct{}
 	manualProbeBudget          atomic.Int32
+	probeRequestMode           atomic.Uint32
 	families                   *trafficfamily.Resolver
 }
 
@@ -1874,10 +1880,14 @@ func (s *Smart) run(ctx context.Context) {
 			if s.closing.Load() {
 				return
 			}
+			requestMode := s.probeRequestMode.Swap(0)
 			probeCtx, cancel := context.WithTimeout(ctx, s.probeCycleTimeout)
 			budget := s.requestedProbeBudget(time.Now())
 			if manualBudget := int(s.manualProbeBudget.Swap(0)); manualBudget > 0 && manualBudget < budget {
 				budget = manualBudget
+			}
+			if requestMode&smartProbeRequestNormal == 0 && requestMode&smartProbeRequestDashboard != 0 {
+				probeCtx = withSmartDashboardProbe(probeCtx)
 			}
 			_, _ = s.probeWithBudget(probeCtx, budget)
 			cancel()
@@ -1940,9 +1950,18 @@ func (s *Smart) requestProbe() {
 }
 
 func (s *Smart) requestProbeWithBudget(budget int) {
+	s.enqueueProbeRequest(smartProbeRequestNormal, budget)
+}
+
+func (s *Smart) requestDashboardProbeWithBudget(budget int) {
+	s.enqueueProbeRequest(smartProbeRequestDashboard, budget)
+}
+
+func (s *Smart) enqueueProbeRequest(mode uint32, budget int) {
 	if s == nil || s.closing.Load() {
 		return
 	}
+	s.probeRequestMode.Or(mode)
 	if budget > 0 {
 		for {
 			current := s.manualProbeBudget.Load()
@@ -2892,7 +2911,7 @@ func (s *Smart) PerformUpdateCheck() {
 	// wakeup. Keep it on the dashboard budget (full catalog when unbounded);
 	// otherwise an active Smart group would expand one manual test into its
 	// 16-candidate profiling cycle.
-	s.requestProbeWithBudget(s.dashboardProbeBudget)
+	s.requestDashboardProbeWithBudget(s.dashboardProbeBudget)
 }
 
 func (s *Smart) probe(ctx context.Context) (map[string]uint16, error) {
