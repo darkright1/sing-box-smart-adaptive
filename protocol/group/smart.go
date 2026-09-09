@@ -1883,7 +1883,11 @@ func (s *Smart) run(ctx context.Context) {
 			requestMode := s.probeRequestMode.Swap(0)
 			probeCtx, cancel := context.WithTimeout(ctx, s.probeCycleTimeout)
 			budget := s.requestedProbeBudget(time.Now())
-			if manualBudget := int(s.manualProbeBudget.Swap(0)); manualBudget > 0 && manualBudget < budget {
+			if requestMode&smartProbeRequestNormal != 0 {
+				// A real traffic wakeup outranks a coalesced dashboard request;
+				// never let the dashboard's small budget restrict recovery.
+				s.manualProbeBudget.Store(0)
+			} else if manualBudget := int(s.manualProbeBudget.Swap(0)); manualBudget > 0 && manualBudget < budget {
 				budget = manualBudget
 			}
 			if requestMode&smartProbeRequestNormal == 0 && requestMode&smartProbeRequestDashboard != 0 {
