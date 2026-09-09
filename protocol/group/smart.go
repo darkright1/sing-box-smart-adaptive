@@ -2349,7 +2349,7 @@ func (s *Smart) DialContext(ctx context.Context, network string, destination M.S
 			s.clearBrokenPin(candidate.Tag(), networkKey, siteKey, transport)
 			s.requestProbe()
 		}, s.establishedStallTimeout, ctx)
-		if _, wrapped := observed.(*smartObservedConn); !wrapped {
+		if _, wrapped := observed.(smartObservedWrapper); !wrapped {
 			s.recordUnobservedConnection(smartStatusSelectionKey(networkKey, siteDisplay, transport), endpointID)
 		}
 		return observed, nil
@@ -2836,7 +2836,7 @@ func (s *Smart) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.
 			s.clearBrokenPin(candidate.Tag(), networkKey, siteKey, transport)
 			s.requestProbe()
 		})
-		if _, wrapped := observed.(*smartObservedPacketConn); !wrapped {
+		if _, wrapped := observed.(smartObservedWrapper); !wrapped {
 			s.recordUnobservedConnection(smartStatusSelectionKey(networkKey, siteDisplay, transport), endpointID)
 		}
 		return s.interruptGroup.NewPacketConnWithKey(observed, interrupt.IsExternalConnectionFromContext(ctx), interrupt.IsProviderConnectionFromContext(ctx), smartConnectionKey(networkKey, siteKey, transport, candidate.Tag())), nil
@@ -5591,6 +5591,16 @@ type smartObservedConn struct {
 	requestCtx       context.Context
 }
 
+// smartObservedWrapper is implemented by every stream and packet observation
+// wrapper. Packet wrappers embed smartObservedPacketConn, so a concrete type
+// assertion against *smartObservedPacketConn would reject the extended reader,
+// writer, and reader/writer wrappers even though they are fully observed.
+type smartObservedWrapper interface {
+	smartObservedWrapperMarker()
+}
+
+func (*smartObservedConn) smartObservedWrapperMarker() {}
+
 func newSmartObservedConn(conn net.Conn, startedAt time.Time, onFirstByte func(time.Duration), onClose func(int64, time.Duration), onFailure func()) net.Conn {
 	return newSmartObservedConnWithStall(conn, startedAt, onFirstByte, onClose, onFailure, 0)
 }
@@ -6034,6 +6044,8 @@ type smartObservedPacketConn struct {
 	watchdogPending    bool
 	requestCtx         context.Context
 }
+
+func (*smartObservedPacketConn) smartObservedWrapperMarker() {}
 
 func newSmartObservedPacketConn(conn net.PacketConn, startedAt time.Time, expectResponse bool, onNoResponse func(time.Duration)) net.PacketConn {
 	return newSmartObservedPacketConnWithWatchdog(conn, startedAt, expectResponse, 0, onNoResponse)

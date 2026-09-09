@@ -18,6 +18,7 @@ import (
 	"github.com/sagernet/sing-box/common/nodefilter"
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/protocol/group/trafficfamily"
+	"github.com/sagernet/sing/common/buf"
 	"github.com/sagernet/sing/common/bufio"
 	"github.com/sagernet/sing/common/control"
 	M "github.com/sagernet/sing/common/metadata"
@@ -701,6 +702,18 @@ type smartObservedTestPacketConn struct {
 	writeErr error
 }
 
+type smartObservedTestPacketReaderWriter struct {
+	*smartObservedTestPacketConn
+}
+
+func (*smartObservedTestPacketReaderWriter) ReadPacket(*buf.Buffer) (M.Socksaddr, error) {
+	return M.Socksaddr{}, nil
+}
+
+func (*smartObservedTestPacketReaderWriter) WritePacket(*buf.Buffer, M.Socksaddr) error {
+	return nil
+}
+
 func (c *smartObservedTestPacketConn) ReadFrom(payload []byte) (int, net.Addr, error) {
 	if c.readErr != nil {
 		return 0, nil, c.readErr
@@ -724,6 +737,19 @@ func (*smartObservedTestPacketConn) LocalAddr() net.Addr              { return &
 func (*smartObservedTestPacketConn) SetDeadline(time.Time) error      { return nil }
 func (*smartObservedTestPacketConn) SetReadDeadline(time.Time) error  { return nil }
 func (*smartObservedTestPacketConn) SetWriteDeadline(time.Time) error { return nil }
+
+func TestSmartObservedExtendedPacketWrapperIsRecognized(t *testing.T) {
+	observed := newSmartObservedPacketConnWithWatchdogThreshold(
+		&smartObservedTestPacketReaderWriter{smartObservedTestPacketConn: &smartObservedTestPacketConn{}},
+		time.Now(), true, 1, 0, nil,
+	)
+	if _, ok := observed.(*smartObservedExtendedPacketConn); !ok {
+		t.Fatalf("observed packet connection type=%T, want extended wrapper", observed)
+	}
+	if _, ok := observed.(smartObservedWrapper); !ok {
+		t.Fatalf("extended packet wrapper %T does not advertise observation marker", observed)
+	}
+}
 
 func TestSmartTransactionalUDPNoResponseReportsOnce(t *testing.T) {
 	var failures atomic.Int64
