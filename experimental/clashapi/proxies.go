@@ -309,6 +309,12 @@ func getProxyDelay(server *Server) func(w http.ResponseWriter, r *http.Request) 
 		proxy := r.Context().Value(CtxKeyProxy).(adapter.Outbound)
 		ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond*time.Duration(timeout))
 		defer cancel()
+		// A delay request for Smart is observational.  Carry the dashboard
+		// marker through its DialContext path so a panel ping cannot be mistaken
+		// for real traffic and replace a healthy incumbent or manual pin.
+		if _, isSmart := proxy.(adapter.SmartGroup); isSmart {
+			ctx = adapter.WithDashboardProbe(ctx)
+		}
 
 		delay, err := urltest.URLTest(ctx, url, proxy)
 		defer func() {

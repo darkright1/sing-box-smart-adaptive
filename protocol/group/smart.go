@@ -242,16 +242,12 @@ const (
 // dashboard delay request. Dashboard probes are advisory: they may refresh
 // latency counters, but they must never become a hidden selection command or
 // open/close a circuit that can evict a manual pin. The marker is carried
-// through context.WithoutCancel used by the background sweep.
-type smartDashboardProbeKey struct{}
-
 func withSmartDashboardProbe(ctx context.Context) context.Context {
-	return context.WithValue(ctx, smartDashboardProbeKey{}, true)
+	return adapter.WithDashboardProbe(ctx)
 }
 
 func isSmartDashboardProbe(ctx context.Context) bool {
-	value, _ := ctx.Value(smartDashboardProbeKey{}).(bool)
-	return value
+	return adapter.IsDashboardProbe(ctx)
 }
 
 type smartAffinity struct {
@@ -2274,7 +2270,10 @@ func (s *Smart) DialContext(ctx context.Context, network string, destination M.S
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	s.noteTrafficActivity()
+	dashboardProbe := isSmartDashboardProbe(ctx)
+	if !dashboardProbe {
+		s.noteTrafficActivity()
+	}
 	transport := smartTransportKey(network, destination)
 	ranking, networkKey, siteKey, siteDisplay := s.rankPooled(ctx, transport, destination)
 	defer func() { ranking.Release() }()
@@ -2285,7 +2284,7 @@ func (s *Smart) DialContext(ctx context.Context, network string, destination M.S
 	if len(ranks) == 0 {
 		return nil, E.New("smart group is warming: no supported candidate")
 	}
-	if !hasEligibleSmartRank(ranks) {
+	if !hasEligibleSmartRank(ranks) && !dashboardProbe {
 		// All circuits being open is an outage state, not a reason to strand the
 		// group indefinitely. Run a small, single-flight half-open URLTest-style
 		// recovery sample, then rank again if any endpoint proves reachable.
@@ -2308,6 +2307,12 @@ func (s *Smart) DialContext(ctx context.Context, network string, destination M.S
 		endpointID := result.attempt.rank.status.EndpointID
 		if endpointID == "" {
 			endpointID = smartEndpointID(result.attempt.rank.identity, result.attempt.rank.policyID)
+		}
+		if dashboardProbe {
+			// The Clash delay endpoint is a read-only control-plane operation.
+			// Do not account it as a real dial or commit its candidate as the
+			// Smart incumbent; the caller will close this socket after probing.
+			return conn, nil
 		}
 		s.recordActualDial(smartStatusSelectionKey(networkKey, siteDisplay, transport), endpointID, result.attempt.rank.selectionGeneration)
 		observedTransport := result.observedTransport
@@ -2571,6 +2576,7 @@ dispatch:
 }
 
 func (s *Smart) dialContextAdaptive(ctx context.Context, network string, destination M.Socksaddr, attempts []smartDialAttempt, networkKey, siteKey, transport string) (net.Conn, smartDialResult, []error, bool) {
+	dashboardProbe := isSmartDashboardProbe(ctx)
 	parentCtx, cancelAll := context.WithCancel(ctx)
 	defer cancelAll()
 	results := make(chan smartDialResult, len(attempts))
@@ -2688,18 +2694,24 @@ func (s *Smart) dialContextAdaptive(ctx context.Context, network string, destina
 			}
 			candidate := result.attempt.candidate
 			if result.err != nil {
-				failureType := "transport"
-				if isSmartProtocolHandshakeFailure(result.err) {
-					failureType = "protocol"
+				if dashboardProbe {
+					// A panel check is advisory. It must not quarantine a node or
+					// wake the normal recovery worker because of one probe failure.
+					s.observeProbeResult(true, time.Now(), networkKey, siteKey, candidate.Tag(), transport, false, result.elapsed)
+				} else {
+					failureType := "transport"
+					if isSmartProtocolHandshakeFailure(result.err) {
+						failureType = "protocol"
+					}
+					s.observeDataPlaneFailureWithType(time.Now(), networkKey, siteKey, candidate.Tag(), transport, result.elapsed, failureType)
+					s.clearBrokenPin(candidate.Tag(), networkKey, siteKey, transport)
+					// A real data-plane failure must wake recovery itself. Dashboard
+					// latency tests may also refresh the shared profile, but production
+					// failover must never depend on a user opening the proxy page. The
+					// buffered request channel coalesces concurrent failures and the
+					// shared probe registry single-flights work per endpoint.
+					s.requestProbe()
 				}
-				s.observeDataPlaneFailureWithType(time.Now(), networkKey, siteKey, candidate.Tag(), transport, result.elapsed, failureType)
-				s.clearBrokenPin(candidate.Tag(), networkKey, siteKey, transport)
-				// A real data-plane failure must wake recovery itself.  Dashboard
-				// latency tests may also refresh the shared profile, but production
-				// failover must never depend on a user opening the proxy page.  The
-				// buffered request channel coalesces concurrent failures and the
-				// shared probe registry single-flights work per endpoint.
-				s.requestProbe()
 				attemptErrors = append(attemptErrors, E.Cause(result.err, "smart candidate ", candidate.Tag()))
 				if started < len(attempts) {
 					startAttempt(attempts[started])
@@ -2709,10 +2721,14 @@ func (s *Smart) dialContextAdaptive(ctx context.Context, network string, destina
 				resetHedge()
 				continue
 			}
-			s.observeDial(time.Now(), networkKey, siteKey, candidate.Tag(), transport, true, result.elapsed)
-			s.recordSharedDataPlaneEvidence(candidate.Tag(), transport, true)
+			if dashboardProbe {
+				s.observeProbeResult(true, time.Now(), networkKey, siteKey, candidate.Tag(), transport, true, result.elapsed)
+			} else {
+				s.observeDial(time.Now(), networkKey, siteKey, candidate.Tag(), transport, true, result.elapsed)
+				s.recordSharedDataPlaneEvidence(candidate.Tag(), transport, true)
+			}
 			if result.observedTransport != "" && result.observedTransport != transport {
-				s.observeDial(time.Now(), networkKey, siteKey, candidate.Tag(), result.observedTransport, true, result.elapsed)
+				s.observeProbeResult(dashboardProbe, time.Now(), networkKey, siteKey, candidate.Tag(), result.observedTransport, true, result.elapsed)
 			}
 			result.hadPriorFailure = len(attemptErrors) > 0
 			cancelAll()

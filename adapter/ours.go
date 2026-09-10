@@ -173,6 +173,22 @@ type SmartGroup interface {
 	ClearTemporarySelection()
 }
 
+// WithDashboardProbe marks a control-plane delay check.  Group outbounds use
+// this marker to keep the check advisory: it may measure the incumbent, but it
+// must not commit a new selection, open a circuit, or interrupt live flows.
+func WithDashboardProbe(ctx context.Context) context.Context {
+	return context.WithValue(ctx, dashboardProbeContextKey{}, true)
+}
+
+// IsDashboardProbe reports whether an operation was initiated by a dashboard
+// delay request rather than by real traffic or the periodic scheduler.
+func IsDashboardProbe(ctx context.Context) bool {
+	value, _ := ctx.Value(dashboardProbeContextKey{}).(bool)
+	return value
+}
+
+type dashboardProbeContextKey struct{}
+
 // PreMatchOutboundGroup lets groups pick a stable leaf for transparent pre-match
 // without advancing consumptive selection (retry/hedge/observation stay on L4).
 type PreMatchOutboundGroup interface {

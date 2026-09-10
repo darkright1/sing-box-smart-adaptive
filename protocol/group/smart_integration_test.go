@@ -961,6 +961,56 @@ func TestSmartDashboardProbeRetainsManualPin(t *testing.T) {
 	}
 }
 
+func TestSmartDashboardDialDoesNotCommitSelection(t *testing.T) {
+	first := newSmartFakeOutbound("manual", nil)
+	second := newSmartFakeOutbound("automatic", nil)
+	smart := newTestSmart(first, second)
+	if !smart.SelectOutbound(first.Tag()) {
+		t.Fatal("failed to set manual pin")
+	}
+
+	conn, err := smart.DialContext(withSmartDashboardProbe(context.Background()), N.NetworkTCP, M.ParseSocksaddr("example.com:443"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	peer := <-first.peers
+	defer peer.Close()
+
+	status := smart.SmartStatus()
+	if status.Pinned != first.Tag() {
+		t.Fatalf("dashboard dial changed manual pin: %q", status.Pinned)
+	}
+	if status.SwitchesTotal != 0 || status.FailureFailovers != 0 {
+		t.Fatalf("dashboard dial changed switch accounting: %+v", status)
+	}
+}
+
+func TestSmartDashboardDialFailureIsAdvisory(t *testing.T) {
+	first := newSmartFakeOutbound("manual", errors.New("connection reset by peer"))
+	second := newSmartFakeOutbound("automatic", nil)
+	smart := newTestSmart(first, second)
+	if !smart.SelectOutbound(first.Tag()) {
+		t.Fatal("failed to set manual pin")
+	}
+
+	conn, err := smart.DialContext(withSmartDashboardProbe(context.Background()), N.NetworkTCP, M.ParseSocksaddr("example.com:443"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	peer := <-second.peers
+	defer peer.Close()
+
+	status := smart.SmartStatus()
+	if status.Pinned != first.Tag() {
+		t.Fatalf("dashboard failure released manual pin: %q", status.Pinned)
+	}
+	if status.FailureFailovers != 0 {
+		t.Fatalf("dashboard failure changed failover accounting: %+v", status)
+	}
+}
+
 func TestSmartUnstartedHalfOpenAttemptReleasesReservation(t *testing.T) {
 	first := newSmartFakeOutbound("first", nil)
 	second := newSmartFakeOutbound("second", nil)
