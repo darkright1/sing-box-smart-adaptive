@@ -636,6 +636,36 @@ func TestSmartAllOpenRecoveryUsesHalfOpenBasicProbe(t *testing.T) {
 	}
 }
 
+func TestSmartEmergencyURLTestFallbackBypassesPassiveFloor(t *testing.T) {
+	fast := newSmartFakeOutbound("fallback-fast", nil)
+	slow := newSmartFakeOutbound("fallback-slow", nil)
+	smart := newTestSmart(fast, slow)
+	smart.maxAttempts = 2
+	ranks := []smartRank{
+		{outbound: slow, eligible: false, passiveThroughputLow: true, status: adapter.SmartCandidateStatus{Tag: slow.Tag(), State: "open"}},
+		{outbound: fast, eligible: false, passiveThroughputLow: true, status: adapter.SmartCandidateStatus{Tag: fast.Tag(), State: "open"}},
+	}
+	recovered := []smartRecoveryCandidate{
+		{candidate: fast, measured: 20 * time.Millisecond},
+		{candidate: slow, measured: 80 * time.Millisecond},
+	}
+	fallback := smart.emergencyURLTestRanks(ranks, recovered)
+	if len(fallback) != 2 {
+		t.Fatalf("fallback ranks=%d, want 2", len(fallback))
+	}
+	if fallback[0].outbound != fast || fallback[1].outbound != slow {
+		t.Fatalf("fallback order=%s,%s, want fast,slow", fallback[0].outbound.Tag(), fallback[1].outbound.Tag())
+	}
+	for _, rank := range fallback {
+		if !rank.eligible || rank.status.State == "open" || rank.passiveThroughputLow {
+			t.Fatalf("fallback rank remained gated: %+v", rank)
+		}
+		if rank.status.Reason != "URLTest emergency fallback" {
+			t.Fatalf("fallback reason=%q", rank.status.Reason)
+		}
+	}
+}
+
 func TestSmartProbePublishesFirstSuccessBeforeCycleCompletes(t *testing.T) {
 	fast := newSmartFakeOutbound("stream-fast", nil)
 	slow := newSmartFakeOutbound("stream-slow", nil)

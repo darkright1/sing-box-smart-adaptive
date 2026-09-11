@@ -2288,10 +2288,19 @@ func (s *Smart) DialContext(ctx context.Context, network string, destination M.S
 		// All circuits being open is an outage state, not a reason to strand the
 		// group indefinitely. Run a small, single-flight half-open URLTest-style
 		// recovery sample, then rank again if any endpoint proves reachable.
-		if s.recoverOpenCandidates(ctx, ranking.candidates, transport) {
+		recovered := s.recoverOpenCandidatesResult(ctx, ranking.candidates, transport)
+		if len(recovered) > 0 {
 			ranking.Release()
 			ranking, networkKey, siteKey, siteDisplay = s.rankPooled(ctx, transport, destination)
 			ranks = ranking.ranks
+			// A successful recovery probe may still be hidden by the passive
+			// throughput floor. That floor is a soft bulk-quality signal, not
+			// proof that the endpoint cannot establish a service connection.
+			// Use the measured URLTest latency as a bounded emergency fallback so
+			// a low-throughput observation cannot strand the whole group.
+			if !hasEligibleSmartRank(ranks) {
+				ranks = s.emergencyURLTestRanks(ranks, recovered)
+			}
 		}
 		if !hasEligibleSmartRank(ranks) {
 			return nil, E.New("smart group has no service-reachable candidate")
@@ -2414,6 +2423,11 @@ func (s *Smart) collectDialAttempts(ranks []smartRank, networkKey, siteKey, tran
 	return attempts
 }
 
+type smartRecoveryCandidate struct {
+	candidate adapter.Outbound
+	measured  time.Duration
+}
+
 // recoverOpenCandidates is the outage escape hatch for the staged selector.
 // Once every candidate is circuit-open, waiting for the ordinary probe cadence
 // would strand new connections. A short, rotating half-open sample instead
@@ -2421,14 +2435,18 @@ func (s *Smart) collectDialAttempts(ranks []smartRank, networkKey, siteKey, tran
 // circuit and lets the normal health-tier ranking choose it as primary. The
 // registry keeps the sample single-flight across Smart groups.
 func (s *Smart) recoverOpenCandidates(ctx context.Context, candidates []adapter.Outbound, transport string) bool {
+	return len(s.recoverOpenCandidatesResult(ctx, candidates, transport)) > 0
+}
+
+func (s *Smart) recoverOpenCandidatesResult(ctx context.Context, candidates []adapter.Outbound, transport string) []smartRecoveryCandidate {
 	if s == nil || ctx.Err() != nil || s.closing.Load() || len(candidates) == 0 {
-		return false
+		return nil
 	}
 	baseTransport := smartTransportBase(transport)
 	now := time.Now()
 	next := s.recoveryProbeUntilUnixNano.Load()
 	if next > now.UnixNano() || !s.recoveryProbeUntilUnixNano.CompareAndSwap(next, now.Add(defaultSmartRecoveryProbeCooldown).UnixNano()) {
-		return false
+		return nil
 	}
 	eligible := make([]adapter.Outbound, 0, len(candidates))
 	for _, candidate := range candidates {
@@ -2437,7 +2455,7 @@ func (s *Smart) recoverOpenCandidates(ctx context.Context, candidates []adapter.
 		}
 	}
 	if len(eligible) == 0 {
-		return false
+		return nil
 	}
 	budget := max(defaultSmartColdProbeBudget, max(s.maxAttempts, 1))
 	if budget > 8 {
@@ -2548,6 +2566,7 @@ dispatch:
 	networkKey := s.networkFingerprint()
 	successes := 0
 	observedProfiles := make(map[string]struct{}, len(eligible))
+	recovered := make([]smartRecoveryCandidate, 0, len(results))
 	for result := range results {
 		profileID := s.candidateProfileID(result.candidate.Tag())
 		if !result.performed {
@@ -2564,15 +2583,61 @@ dispatch:
 		if result.err == nil {
 			successes++
 			s.observeDial(time.Now(), networkKey, "", result.candidate.Tag(), transport, true, result.measured)
+			recovered = append(recovered, smartRecoveryCandidate{candidate: result.candidate, measured: result.measured})
 		} else if result.performed {
 			s.observeDial(time.Now(), networkKey, "", result.candidate.Tag(), transport, false, result.measured)
 		}
 	}
 	if successes > 0 {
 		s.noteProbeCycle(successes)
-		return true
+		sort.SliceStable(recovered, func(i, j int) bool { return recovered[i].measured < recovered[j].measured })
 	}
-	return false
+	return recovered
+}
+
+// emergencyURLTestRanks converts successful recovery probes into a temporary
+// ranking when the normal bulk throughput gate would otherwise mark every
+// endpoint open. The probe result is authoritative only for this bounded
+// dial attempt; the underlying throughput evidence remains intact and can
+// continue to influence later choices once real traffic supplies useful data.
+func (s *Smart) emergencyURLTestRanks(ranks []smartRank, recovered []smartRecoveryCandidate) []smartRank {
+	if len(ranks) == 0 || len(recovered) == 0 {
+		return ranks
+	}
+	byTag := make(map[string]smartRank, len(ranks))
+	for _, rank := range ranks {
+		if rank.outbound != nil {
+			byTag[rank.outbound.Tag()] = rank
+		}
+	}
+	result := make([]smartRank, 0, min(len(recovered), s.maxAttempts))
+	seen := make(map[string]struct{}, len(recovered))
+	for _, recovery := range recovered {
+		if recovery.candidate == nil {
+			continue
+		}
+		tag := recovery.candidate.Tag()
+		if _, exists := seen[tag]; exists {
+			continue
+		}
+		rank, exists := byTag[tag]
+		if !exists {
+			continue
+		}
+		// Recovery proved that the endpoint can establish the probe service.
+		// Keep this as a warming, one-attempt escape hatch rather than clearing
+		// the stored passive throughput evidence or circuit ledger globally.
+		rank.eligible = true
+		rank.passiveThroughputLow = false
+		rank.status.State = "warming"
+		rank.status.Reason = "URLTest emergency fallback"
+		result = append(result, rank)
+		seen[tag] = struct{}{}
+		if len(result) >= max(s.maxAttempts, 1) {
+			break
+		}
+	}
+	return result
 }
 
 func (s *Smart) dialContextAdaptive(ctx context.Context, network string, destination M.Socksaddr, attempts []smartDialAttempt, networkKey, siteKey, transport string) (net.Conn, smartDialResult, []error, bool) {
@@ -2775,10 +2840,14 @@ func (s *Smart) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.
 		return nil, E.New("smart group is warming: no supported candidate")
 	}
 	if !hasEligibleSmartRank(ranks) {
-		if s.recoverOpenCandidates(ctx, ranking.candidates, transport) {
+		recovered := s.recoverOpenCandidatesResult(ctx, ranking.candidates, transport)
+		if len(recovered) > 0 {
 			ranking.Release()
 			ranking, networkKey, siteKey, siteDisplay = s.rankPooled(ctx, transport, destination)
 			ranks = ranking.ranks
+			if !hasEligibleSmartRank(ranks) {
+				ranks = s.emergencyURLTestRanks(ranks, recovered)
+			}
 		}
 		if !hasEligibleSmartRank(ranks) {
 			return nil, E.New("smart group has no service-reachable UDP candidate")
