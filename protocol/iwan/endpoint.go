@@ -125,6 +125,7 @@ func NewEndpoint(ctx context.Context, router adapter.Router, logger log.ContextL
 	if options.Mode == "client" {
 		device, deviceErr := transport.NewDevice(transport.DeviceOptions{
 			Context: ctx, Logger: logger, System: options.System, Handler: ep,
+			UDPTimeout:      C.UDPTimeout,
 			InterfaceFinder: service.FromContext[adapter.NetworkManager](ctx).InterfaceFinder(),
 			Name:            options.Name, MTU: options.MTU,
 			Configuration: transport.Configuration{MTU: options.MTU, Address: options.Address},
