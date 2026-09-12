@@ -82,13 +82,15 @@ type DNSServer struct {
 }
 
 func NewDevice(options DeviceOptions) (Device, error) {
-	if !options.System {
-		return newStackDevice(options)
-	}
-	if !tun.WithGVisor {
+	// System mode is the explicit kernel-TUN path.  Do not wrap it in
+	// systemStackDevice when gVisor is available: that wrapper creates a
+	// second userspace L3 stack and silently defeats the server-side
+	// gVisor-bypass contract.  Router/gVisor remains the default compatibility
+	// path when System is false.
+	if options.System {
 		return newSystemDevice(options)
 	}
-	return newSystemStackDevice(options)
+	return newStackDevice(options)
 }
 
 type baseDevice struct {
