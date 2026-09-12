@@ -56,6 +56,8 @@ type Endpoint struct {
 	readDone    chan struct{}
 	readErr     chan error
 	readStarted atomic.Bool
+	lastRx      atomic.Int64
+	fragID      atomic.Uint32
 	writeMu     sync.Mutex
 	frags       *FragReassembler
 }
@@ -217,6 +219,7 @@ func (e *Endpoint) Start(stage adapter.StartStage) error {
 		return err
 	}
 	e.ready.Store(true)
+	e.lastRx.Store(time.Now().UnixNano())
 	e.readStarted.Store(true)
 	go e.readLoop()
 	go e.echoLoop()
@@ -232,6 +235,13 @@ func (e *Endpoint) echoLoop() {
 		}
 		packet, err := e.session.Echo()
 		if err != nil {
+			return
+		}
+		if last := e.lastRx.Load(); last != 0 && time.Since(time.Unix(0, last)) > 15*time.Second {
+			// A missing ECHO response means the UDP session is no longer
+			// usable. Closing the socket wakes readLoop and lets the normal
+			// endpoint lifecycle report the failure to its owner.
+			_ = e.conn.Close()
 			return
 		}
 		e.writeControl(packet)
@@ -252,7 +262,13 @@ func (e *Endpoint) readLoop() {
 			}
 			return
 		}
-		payload, control, err := e.session.Handle(packet[:n])
+		e.lastRx.Store(time.Now().UnixNano())
+		wire, err := e.session.Unwrap(packet[:n])
+		if err != nil {
+			e.logger.Debug("iWAN source-routing packet rejected: ", err)
+			continue
+		}
+		payload, control, err := e.session.Handle(wire)
 		if err != nil {
 			e.logger.Debug("iWAN packet rejected: ", err)
 			continue
@@ -275,7 +291,7 @@ func (e *Endpoint) readLoop() {
 		case PTEchoReq:
 			e.writeControl(BuildEchoResponse(control, nil))
 		case PTIPFrag:
-			fragment, fragmentErr := ParseFrag(packet[:n])
+			fragment, fragmentErr := ParseFrag(wire)
 			if fragmentErr != nil {
 				continue
 			}
@@ -296,7 +312,9 @@ func (e *Endpoint) writeControl(packet []byte) {
 	e.writeMu.Lock()
 	defer e.writeMu.Unlock()
 	if e.conn != nil {
-		_, _ = e.conn.Write(packet)
+		if wire, err := e.session.Wrap(packet); err == nil {
+			_, _ = e.conn.Write(wire)
+		}
 	}
 }
 
@@ -309,12 +327,16 @@ func (e *Endpoint) writeOutbound(packetBuffers []*buf.Buffer) error {
 	defer e.writeMu.Unlock()
 	for _, packetBuffer := range packetBuffers {
 		if packetBuffer.Len()+HeaderLen > int(e.options.MTU) {
-			fragments, fragmentErr := FragmentData(e.session.DataHeader(), packetBuffer.Bytes(), int(e.options.MTU), uint32(time.Now().UnixNano()))
+			fragments, fragmentErr := FragmentData(e.session.DataHeader(), packetBuffer.Bytes(), int(e.options.MTU), e.fragID.Add(1))
 			if fragmentErr != nil {
 				return fragmentErr
 			}
 			for _, fragment := range fragments {
-				if _, err := e.conn.Write(fragment); err != nil {
+				wire, wrapErr := e.session.Wrap(fragment)
+				if wrapErr != nil {
+					return wrapErr
+				}
+				if _, err := e.conn.Write(wire); err != nil {
 					return err
 				}
 			}
@@ -324,7 +346,11 @@ func (e *Endpoint) writeOutbound(packetBuffers []*buf.Buffer) error {
 		if err != nil {
 			return err
 		}
-		if _, err = e.conn.Write(packet); err != nil {
+		wire, err := e.session.Wrap(packet)
+		if err != nil {
+			return err
+		}
+		if _, err = e.conn.Write(wire); err != nil {
 			return err
 		}
 	}
@@ -343,6 +369,9 @@ func (e *Endpoint) Close() error {
 			return
 		}
 		if e.conn != nil {
+			if e.session != nil && e.session.Ready() {
+				e.writeControl(BuildClose(e.session.DataHeader(), nil))
+			}
 			err = e.conn.Close()
 		}
 		if e.device != nil {
@@ -386,6 +415,9 @@ func (e *Endpoint) DetachReturn(path tun.Return) error {
 	return e.device.DetachReturn(path)
 }
 func (e *Endpoint) WritePackets(packets [][]byte) error {
+	if e.options.Mode != "client" {
+		return E.New("iWAN server endpoint cannot write without a client session")
+	}
 	if e.device == nil {
 		return E.New("iWAN server endpoint cannot write packets without a peer")
 	}
@@ -428,6 +460,9 @@ func (e *Endpoint) NewPacketConnectionEx(ctx context.Context, conn N.PacketConn,
 }
 
 func (e *Endpoint) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
+	if e.options.Mode != "client" {
+		return nil, E.New("iWAN server endpoint cannot dial outbound connections")
+	}
 	if !e.ready.Load() {
 		return nil, E.New("iWAN endpoint is not ready")
 	}
@@ -445,6 +480,9 @@ func (e *Endpoint) DialContext(ctx context.Context, network string, destination 
 }
 
 func (e *Endpoint) ListenPacketWithDestination(ctx context.Context, destination M.Socksaddr) (net.PacketConn, netip.Addr, error) {
+	if e.options.Mode != "client" {
+		return nil, netip.Addr{}, E.New("iWAN server endpoint cannot listen outbound packets")
+	}
 	if !e.ready.Load() {
 		return nil, netip.Addr{}, E.New("iWAN endpoint is not ready")
 	}

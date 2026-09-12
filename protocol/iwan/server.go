@@ -24,6 +24,7 @@ type serverRuntime struct {
 	allocMu  sync.Mutex
 	peers    map[string]*serverPeer
 	done     chan struct{}
+	fragID   atomic.Uint32
 }
 
 type serverPeer struct {
@@ -33,6 +34,8 @@ type serverPeer struct {
 	password string
 	key      [16]byte
 	encrypt  bool
+	links    []uint32
+	srPass   string
 	device   transport.Device
 	address  netip.Addr
 	lastSeen atomic.Int64
@@ -79,8 +82,13 @@ func (s *serverRuntime) readLoop() {
 	defer close(s.done)
 	var packet [64 * 1024]byte
 	for {
+		_ = s.conn.SetReadDeadline(time.Now().Add(time.Second))
 		n, remote, err := s.conn.ReadFromUDP(packet[:])
 		if err != nil {
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				s.reap(time.Now())
+				continue
+			}
 			return
 		}
 		s.handle(packet[:n], remote)
@@ -88,21 +96,41 @@ func (s *serverRuntime) readLoop() {
 }
 
 func (s *serverRuntime) handle(packet []byte, remote *net.UDPAddr) {
-	h, err := ParseHeader(packet)
-	if err != nil {
-		return
-	}
 	key := remote.String()
 	s.access.Lock()
 	peer := s.peers[key]
 	s.access.Unlock()
+	if len(packet) > 0 && packet[0] == PTSegRT {
+		if peer == nil || len(peer.links) == 0 || peer.srPass == "" {
+			return
+		}
+		var err error
+		packet, err = UnwrapSR(packet, peer.links, peer.srPass)
+		if err != nil {
+			return
+		}
+	}
+	h, err := ParseHeader(packet)
+	if err != nil {
+		return
+	}
 	switch h.Type {
 	case PTOpen:
 		s.handleOpen(packet, remote, peer)
 	case PTEchoReq:
-		if peer != nil {
+		if peer != nil && h.SID == peer.header.SID && h.Token == peer.header.Token {
+			if _, _, verifyErr := VerifySigned(packet); verifyErr != nil {
+				return
+			}
 			peer.lastSeen.Store(time.Now().UnixNano())
 			s.write(peer, BuildEchoResponse(h, nil))
+		}
+	case PTEchoResp:
+		if peer != nil && h.SID == peer.header.SID && h.Token == peer.header.Token {
+			if _, _, verifyErr := VerifySigned(packet); verifyErr != nil {
+				return
+			}
+			peer.lastSeen.Store(time.Now().UnixNano())
 		}
 	case PTData, PTDataEnc:
 		if peer == nil || h.SID != peer.header.SID || h.Token != peer.header.Token {
@@ -125,7 +153,7 @@ func (s *serverRuntime) handle(packet []byte, remote *net.UDPAddr) {
 			inbound.Release()
 		}
 	case PTIPFrag:
-		if peer == nil {
+		if peer == nil || h.SID != peer.header.SID || h.Token != peer.header.Token {
 			return
 		}
 		fragment, fragmentErr := ParseFrag(packet)
@@ -142,7 +170,11 @@ func (s *serverRuntime) handle(packet []byte, remote *net.UDPAddr) {
 			inbound.Release()
 		}
 	case PTClose:
-		s.remove(key)
+		if peer != nil && h.SID == peer.header.SID && h.Token == peer.header.Token {
+			if _, _, verifyErr := VerifySigned(packet); verifyErr == nil {
+				s.remove(key)
+			}
+		}
 	}
 }
 
@@ -175,7 +207,7 @@ func (s *serverRuntime) createPeer(h Header, fields OpenFields, remote *net.UDPA
 		s.writeRaw(remote, BuildOpenReject(h, []byte("address pool exhausted")))
 		return
 	}
-	peer := &serverPeer{remote: remote, header: Header{Type: PTData, Encrypt: boolByte(fields.Encrypt), SID: h.SID, Token: h.Token}, user: fields.User, password: fields.Password, key: xorCredentialKey(fields.User, fields.Password), encrypt: fields.Encrypt, address: address, frags: NewFragReassembler()}
+	peer := &serverPeer{remote: remote, header: Header{Type: PTData, Encrypt: boolByte(fields.Encrypt), SID: h.SID, Token: h.Token}, user: fields.User, password: fields.Password, key: xorCredentialKey(fields.User, fields.Password), encrypt: fields.Encrypt, links: append([]uint32(nil), fields.Links...), srPass: s.endpoint.options.SRPassword, address: address, frags: NewFragReassembler()}
 	device, err := transport.NewDevice(transport.DeviceOptions{Context: s.endpoint.ctx, Logger: s.endpoint.logger, System: s.endpoint.options.System, Handler: s.endpoint, Name: s.endpoint.options.Name, MTU: uint32(fields.MTU), Configuration: transport.Configuration{MTU: uint32(fields.MTU), Address: []netip.Prefix{netip.PrefixFrom(address, 32)}}})
 	if err != nil {
 		s.writeRaw(remote, BuildOpenReject(h, []byte("device unavailable")))
@@ -204,18 +236,27 @@ func (s *serverRuntime) writePeer(peer *serverPeer, packets []*buf.Buffer) error
 	defer peer.writeMu.Unlock()
 	for _, packet := range packets {
 		if packet.Len()+HeaderLen > int(peer.device.PortMTU()) {
-			fragments, fragmentErr := FragmentData(peer.header, packet.Bytes(), int(peer.device.PortMTU()), uint32(time.Now().UnixNano()))
+			fragments, fragmentErr := FragmentData(peer.header, packet.Bytes(), int(peer.device.PortMTU()), s.fragID.Add(1))
 			if fragmentErr != nil {
 				return fragmentErr
 			}
 			for _, fragment := range fragments {
-				if _, err := s.conn.WriteToUDP(fragment, peer.remote); err != nil {
+				wire, wrapErr := s.wrapPeer(peer, fragment)
+				if wrapErr != nil {
+					return wrapErr
+				}
+				if _, err := s.conn.WriteToUDP(wire, peer.remote); err != nil {
 					return err
 				}
 			}
 			continue
 		}
 		wire := BuildData(peer.header, packet.Bytes(), peer.user, peer.password, peer.encrypt)
+		var wrapErr error
+		wire, wrapErr = s.wrapPeer(peer, wire)
+		if wrapErr != nil {
+			return wrapErr
+		}
 		if _, err := s.conn.WriteToUDP(wire, peer.remote); err != nil {
 			return err
 		}
@@ -229,7 +270,16 @@ func (s *serverRuntime) write(peer *serverPeer, packet []byte) {
 	}
 	peer.writeMu.Lock()
 	defer peer.writeMu.Unlock()
-	_, _ = s.conn.WriteToUDP(packet, peer.remote)
+	if wire, err := s.wrapPeer(peer, packet); err == nil {
+		_, _ = s.conn.WriteToUDP(wire, peer.remote)
+	}
+}
+
+func (s *serverRuntime) wrapPeer(peer *serverPeer, packet []byte) ([]byte, error) {
+	if len(peer.links) == 0 || peer.srPass == "" {
+		return packet, nil
+	}
+	return WrapSR(packet, peer.links, peer.srPass, 1)
 }
 
 func (s *serverRuntime) writeRaw(remote *net.UDPAddr, packet []byte) {
@@ -275,6 +325,21 @@ func (s *serverRuntime) remove(key string) {
 	s.access.Unlock()
 	if peer != nil && peer.device != nil {
 		_ = peer.device.Close()
+	}
+}
+
+func (s *serverRuntime) reap(now time.Time) {
+	var expired []string
+	s.access.Lock()
+	for key, peer := range s.peers {
+		last := peer.lastSeen.Load()
+		if last == 0 || now.Sub(time.Unix(0, last)) > 45*time.Second {
+			expired = append(expired, key)
+		}
+	}
+	s.access.Unlock()
+	for _, key := range expired {
+		s.remove(key)
 	}
 }
 

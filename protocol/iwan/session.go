@@ -115,6 +115,12 @@ func (s *Session) Handle(packet []byte) (payload []byte, control Header, err err
 		if !s.client {
 			return nil, Header{}, errors.New("unexpected OPENACK")
 		}
+		// OPENACK must belong to the exact OPEN emitted by this session.  A
+		// valid signature alone is not sufficient because a shared UDP socket
+		// may receive another client's control frame.
+		if control.SID != s.header.SID || control.Token != s.header.Token {
+			return nil, control, errors.New("iWAN OPENACK session identity mismatch")
+		}
 		_, payload, err = VerifySigned(packet)
 		if err != nil {
 			return nil, Header{}, err
@@ -156,6 +162,9 @@ func (s *Session) Handle(packet []byte) (payload []byte, control Header, err err
 		s.ready = true
 		return nil, control, nil
 	case PTOpenRej:
+		if control.SID != s.header.SID || control.Token != s.header.Token {
+			return nil, control, errors.New("iWAN OPEN reject session identity mismatch")
+		}
 		return nil, control, fmt.Errorf("iWAN OPEN rejected")
 	case PTData, PTDataEnc:
 		if !s.ready {
@@ -175,9 +184,48 @@ func (s *Session) Handle(packet []byte) (payload []byte, control Header, err err
 			xorInPlace(s.key, payload, payload)
 		}
 		return payload, control, nil
+	case PTIPFrag, PTEchoReq, PTEchoResp, PTClose:
+		if !s.ready {
+			return nil, control, errors.New("iWAN session is not ready")
+		}
+		if control.SID != s.header.SID || control.Token != s.header.Token {
+			return nil, control, errors.New("iWAN control session identity mismatch")
+		}
+		if control.Type == PTEchoReq || control.Type == PTEchoResp || control.Type == PTClose {
+			if _, _, verifyErr := VerifySigned(packet); verifyErr != nil {
+				return nil, control, verifyErr
+			}
+		}
+		return nil, control, nil
 	default:
 		return nil, control, nil
 	}
+}
+
+// Unwrap unwraps an optional source-routing envelope and returns the inner
+// packet.  The links/password are session-scoped so callers cannot
+// accidentally apply another peer's SR credentials.
+func (s *Session) Unwrap(packet []byte) ([]byte, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(packet) == 0 || packet[0] != PTSegRT {
+		return packet, nil
+	}
+	if len(s.links) == 0 || s.srPass == "" {
+		return nil, errors.New("iWAN source-routing packet without session credentials")
+	}
+	return UnwrapSR(packet, s.links, s.srPass)
+}
+
+// Wrap applies the configured source-routing envelope to an inner control or
+// data packet.  It is a no-op when SR is not configured.
+func (s *Session) Wrap(packet []byte) ([]byte, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.links) == 0 || s.srPass == "" {
+		return packet, nil
+	}
+	return WrapSR(packet, s.links, s.srPass, 1)
 }
 
 func (s *Session) Address() (netip.Addr, netip.Addr) {
