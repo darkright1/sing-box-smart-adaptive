@@ -23,7 +23,7 @@ const (
 	PTClose             = 0x17
 	PTDataEnc           = 0x18
 	PTIPFrag            = 0x22
-	PTSegRT             = 0x25
+	PTSegRT             = 0x28
 	HeaderLen           = 8
 	SignLen             = 16
 	IWAN_FRAG_MAXPAY    = 2047

@@ -241,6 +241,12 @@ func (e *Endpoint) echoLoop() {
 			// A missing ECHO response means the UDP session is no longer
 			// usable. Closing the socket wakes readLoop and lets the normal
 			// endpoint lifecycle report the failure to its owner.
+			e.started.Store(false)
+			e.ready.Store(false)
+			select {
+			case e.readErr <- errors.New("iWAN echo timeout"):
+			default:
+			}
 			_ = e.conn.Close()
 			return
 		}
@@ -254,7 +260,10 @@ func (e *Endpoint) readLoop() {
 	for e.started.Load() {
 		n, err := e.conn.Read(packet[:])
 		if err != nil {
-			if e.started.Load() && !errors.Is(err, net.ErrClosed) && !errors.Is(err, io.EOF) {
+			wasRunning := e.started.Load()
+			e.ready.Store(false)
+			e.started.Store(false)
+			if wasRunning && !errors.Is(err, net.ErrClosed) && !errors.Is(err, io.EOF) {
 				select {
 				case e.readErr <- err:
 				default:
@@ -303,6 +312,12 @@ func (e *Endpoint) readLoop() {
 				}
 			}
 		case PTClose:
+			e.ready.Store(false)
+			e.started.Store(false)
+			select {
+			case e.readErr <- errors.New("iWAN peer closed session"):
+			default:
+			}
 			return
 		}
 	}
@@ -312,9 +327,7 @@ func (e *Endpoint) writeControl(packet []byte) {
 	e.writeMu.Lock()
 	defer e.writeMu.Unlock()
 	if e.conn != nil {
-		if wire, err := e.session.Wrap(packet); err == nil {
-			_, _ = e.conn.Write(wire)
-		}
+		_, _ = e.conn.Write(packet)
 	}
 }
 
@@ -332,11 +345,7 @@ func (e *Endpoint) writeOutbound(packetBuffers []*buf.Buffer) error {
 				return fragmentErr
 			}
 			for _, fragment := range fragments {
-				wire, wrapErr := e.session.Wrap(fragment)
-				if wrapErr != nil {
-					return wrapErr
-				}
-				if _, err := e.conn.Write(wire); err != nil {
+				if _, err := e.conn.Write(fragment); err != nil {
 					return err
 				}
 			}
@@ -346,11 +355,7 @@ func (e *Endpoint) writeOutbound(packetBuffers []*buf.Buffer) error {
 		if err != nil {
 			return err
 		}
-		wire, err := e.session.Wrap(packet)
-		if err != nil {
-			return err
-		}
-		if _, err = e.conn.Write(wire); err != nil {
+		if _, err = e.conn.Write(packet); err != nil {
 			return err
 		}
 	}

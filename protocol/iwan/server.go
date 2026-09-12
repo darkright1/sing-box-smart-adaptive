@@ -270,9 +270,7 @@ func (s *serverRuntime) write(peer *serverPeer, packet []byte) {
 	}
 	peer.writeMu.Lock()
 	defer peer.writeMu.Unlock()
-	if wire, err := s.wrapPeer(peer, packet); err == nil {
-		_, _ = s.conn.WriteToUDP(wire, peer.remote)
-	}
+	_, _ = s.conn.WriteToUDP(packet, peer.remote)
 }
 
 func (s *serverRuntime) wrapPeer(peer *serverPeer, packet []byte) ([]byte, error) {
