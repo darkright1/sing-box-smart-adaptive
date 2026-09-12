@@ -18,9 +18,8 @@ health/lifecycle reporting.
 - `option.IWANEndpointOptions` defines the shared client/server schema.
 - `protocol/iwan` contains the independently maintained wire codec and its
   protocol-vector tests, compiled only with `with_iwan`.
-- `include/iwan.go`/`include/iwan_stub.go` provide explicit private-build
-  rejection and a safe public-build rejection. The endpoint constructor is
-  deliberately fail-closed until the Router-backed transport is complete.
+- `include/iwan.go`/`include/iwan_stub.go` provide private-build registration
+  and a safe public-build rejection.
 
 ## Remaining production gates
 
@@ -37,5 +36,6 @@ private adapter must provide:
 5. Linux client/server integration tests and a private artifact audit proving
    no iWAN symbols or configuration are present in public builds.
 
-Until those gates pass, the endpoint is intentionally registered as an
-unsupported feature in both builds and no production deployment is allowed.
+The current private endpoint is client-capable with the gVisor stack. Server
+admission and multi-session routing remain a separate gate; do not deploy the
+server mode until those tests pass.

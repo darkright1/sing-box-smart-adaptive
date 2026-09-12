@@ -7,6 +7,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"net/netip"
 	"sync"
 )
 
@@ -28,6 +29,8 @@ type Session struct {
 	key       [16]byte
 	header    Header
 	ready     bool
+	address   netip.Addr
+	gateway   netip.Addr
 }
 
 type SessionOptions struct {
@@ -86,7 +89,14 @@ func (s *Session) Open() ([]byte, error) {
 			s.header.Token = 1
 		}
 	}
-	return BuildOpen(s.user, s.password, s.mtu, s.encrypt, s.pipeID, s.pipeIndex, s.links)
+	frame, err := BuildOpen(s.user, s.password, s.mtu, s.encrypt, s.pipeID, s.pipeIndex, s.links)
+	if err != nil {
+		return nil, err
+	}
+	// BuildOpen intentionally remains a stateless compatibility helper. The
+	// session wrapper supplies its stable SID/token while preserving the exact
+	// signed payload emitted by that helper.
+	return Signed(Header{Type: PTOpen, Encrypt: boolByte(s.encrypt), SID: s.header.SID, Token: s.header.Token}, frame[HeaderLen+SignLen:]), nil
 }
 
 // Handle validates and consumes a control/data frame. DATA payloads are
@@ -104,11 +114,44 @@ func (s *Session) Handle(packet []byte) (payload []byte, control Header, err err
 		if !s.client {
 			return nil, Header{}, errors.New("unexpected OPENACK")
 		}
-		if _, _, err = VerifySigned(packet); err != nil {
+		_, payload, err = VerifySigned(packet)
+		if err != nil {
 			return nil, Header{}, err
+		}
+		tlvs, decodeErr := DecodeTLVs(payload)
+		if decodeErr != nil {
+			return nil, Header{}, decodeErr
+		}
+		var ack AckFields
+		for _, tlv := range tlvs {
+			switch tlv.Type {
+			case 3:
+				if len(tlv.Value) == 2 {
+					ack.MTU = binary.BigEndian.Uint16(tlv.Value)
+				}
+			case 4:
+				if len(tlv.Value) == 4 {
+					ack.IP = binary.BigEndian.Uint32(tlv.Value)
+				}
+			case 6:
+				if len(tlv.Value) == 4 {
+					ack.Gateway = binary.BigEndian.Uint32(tlv.Value)
+				}
+			case 8:
+				if len(tlv.Value) == 1 {
+					ack.Encrypt = tlv.Value[0] != 0
+				}
+			}
+		}
+		if ack.MTU < 46 || ack.IP == 0 {
+			return nil, Header{}, errors.New("iWAN OPENACK missing address or mtu")
 		}
 		s.header = control
 		s.header.Type = PTData
+		s.encrypt = ack.Encrypt
+		s.mtu = ack.MTU
+		s.address = netip.AddrFrom4([4]byte{byte(ack.IP >> 24), byte(ack.IP >> 16), byte(ack.IP >> 8), byte(ack.IP)})
+		s.gateway = netip.AddrFrom4([4]byte{byte(ack.Gateway >> 24), byte(ack.Gateway >> 16), byte(ack.Gateway >> 8), byte(ack.Gateway)})
 		s.ready = true
 		return nil, control, nil
 	case PTOpenRej:
@@ -134,6 +177,12 @@ func (s *Session) Handle(packet []byte) (payload []byte, control Header, err err
 	default:
 		return nil, control, nil
 	}
+}
+
+func (s *Session) Address() (netip.Addr, netip.Addr) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.address, s.gateway
 }
 
 func (s *Session) Data(payload []byte) ([]byte, error) {
