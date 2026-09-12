@@ -39,8 +39,8 @@ func (s *serverRuntime) writePeerBatch(peer *serverPeer, packets []*buf.Buffer) 
 	messages := workspace.messages[:0]
 	pooled := workspace.pooled[:0]
 	defer func() {
-		clear(workspace.messages)
-		clear(workspace.pooled)
+		clear(workspace.messages[:cap(workspace.messages)])
+		clear(workspace.pooled[:cap(workspace.pooled)])
 		workspace.messages = messages[:0]
 		workspace.pooled = pooled[:0]
 		iwanPeerWriteBatchWorkspacePool.Put(workspace)

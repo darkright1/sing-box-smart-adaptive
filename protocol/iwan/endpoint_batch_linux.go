@@ -41,8 +41,8 @@ func (e *Endpoint) writeOutboundBatch(packetBuffers []*buf.Buffer) (bool, error)
 	messages := workspace.messages[:0]
 	pooled := workspace.pooled[:0]
 	defer func() {
-		clear(workspace.messages)
-		clear(workspace.pooled)
+		clear(workspace.messages[:cap(workspace.messages)])
+		clear(workspace.pooled[:cap(workspace.pooled)])
 		workspace.messages = messages[:0]
 		workspace.pooled = pooled[:0]
 		iwanWriteBatchWorkspacePool.Put(workspace)
