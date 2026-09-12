@@ -247,6 +247,9 @@ func (s *serverRuntime) writePeer(peer *serverPeer, packets []*buf.Buffer) error
 	defer buf.ReleaseMulti(packets)
 	peer.writeMu.Lock()
 	defer peer.writeMu.Unlock()
+	if handled, err := s.writePeerBatch(peer, packets); handled {
+		return err
+	}
 	for _, packet := range packets {
 		if packet.Len()+HeaderLen > int(peer.device.PortMTU()) {
 			fragments, fragmentErr := FragmentData(peer.header, packet.Bytes(), int(peer.device.PortMTU()), s.fragID.Add(1))

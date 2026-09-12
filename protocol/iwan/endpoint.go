@@ -504,6 +504,9 @@ func (e *Endpoint) writeOutbound(packetBuffers []*buf.Buffer) error {
 	}
 	e.writeMu.Lock()
 	defer e.writeMu.Unlock()
+	if handled, err := e.writeOutboundBatch(packetBuffers); handled {
+		return err
+	}
 	for _, packetBuffer := range packetBuffers {
 		if packetBuffer.Len()+HeaderLen > int(e.options.MTU) {
 			fragments, fragmentErr := FragmentData(e.session.DataHeader(), packetBuffer.Bytes(), int(e.options.MTU), e.fragID.Add(1))

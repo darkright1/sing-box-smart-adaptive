@@ -4,13 +4,93 @@ package iwan
 
 import (
 	"errors"
+	"fmt"
 	"io"
 	"net"
 
+	"github.com/sagernet/sing/common/buf"
 	"golang.org/x/net/ipv4"
 )
 
 const iwanClientReadBatchSize = 16
+const iwanClientWriteBatchSize = 32
+
+// writeOutboundBatch is the native IPv4 egress fast path.  Framing and
+// encryption still happen in Go, but the syscall boundary is amortized across
+// a batch and all pooled frames remain owned until WriteBatch returns.
+func (e *Endpoint) writeOutboundBatch(packetBuffers []*buf.Buffer) (bool, error) {
+	conn, ok := e.conn.(*net.UDPConn)
+	if !ok || !isIPv4UDPConn(conn) {
+		return false, nil
+	}
+	packetConn := ipv4.NewPacketConn(conn)
+	messages := make([]ipv4.Message, 0, iwanClientWriteBatchSize)
+	pooled := make([]pooledWirePacket, 0, iwanClientWriteBatchSize)
+	flush := func() error {
+		for len(messages) > 0 {
+			n, err := packetConn.WriteBatch(messages, 0)
+			if n > 0 {
+				messages = messages[n:]
+			}
+			if err != nil {
+				return err
+			}
+			if n == 0 {
+				return fmt.Errorf("iWAN batch write made no progress")
+			}
+		}
+		return nil
+	}
+	releasePooled := func() {
+		for _, item := range pooled {
+			releaseWirePacket(item.packet, item.pool)
+		}
+		pooled = pooled[:0]
+	}
+	defer releasePooled()
+	appendMessage := func(packet []byte, releasePacket []byte, pool *wirePacket) error {
+		messages = append(messages, ipv4.Message{Buffers: [][]byte{packet}})
+		pooled = append(pooled, pooledWirePacket{packet: releasePacket, pool: pool})
+		if len(messages) == cap(messages) {
+			if err := flush(); err != nil {
+				return err
+			}
+			messages = messages[:0]
+			releasePooled()
+		}
+		return nil
+	}
+	for _, packetBuffer := range packetBuffers {
+		if packetBuffer.Len()+HeaderLen > int(e.options.MTU) {
+			fragments, err := FragmentData(e.session.DataHeader(), packetBuffer.Bytes(), int(e.options.MTU), e.fragID.Add(1))
+			if err != nil {
+				return true, err
+			}
+			for _, fragment := range fragments {
+				if err = appendMessage(fragment, nil, nil); err != nil {
+					return true, err
+				}
+			}
+			continue
+		}
+		wire, pool, err := e.session.DataPooled(packetBuffer.Bytes())
+		if err != nil {
+			return true, err
+		}
+		if err = appendMessage(wire, wire, pool); err != nil {
+			return true, err
+		}
+	}
+	if err := flush(); err != nil {
+		return true, err
+	}
+	return true, nil
+}
+
+type pooledWirePacket struct {
+	packet []byte
+	pool   *wirePacket
+}
 
 // readLoopBatch uses recvmmsg when the dialer exposes a native UDP socket.
 // Dialers that wrap the socket continue through readLoopSingle, preserving
