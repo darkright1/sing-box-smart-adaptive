@@ -86,6 +86,13 @@ func (s *serverRuntime) start() error {
 }
 
 func (s *serverRuntime) readLoop() {
+	if s.readLoopBatch() {
+		return
+	}
+	s.readLoopSingle()
+}
+
+func (s *serverRuntime) readLoopSingle() {
 	defer close(s.done)
 	var packet [64 * 1024]byte
 	for {
