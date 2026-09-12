@@ -37,6 +37,7 @@ type serverPeer struct {
 	address  netip.Addr
 	lastSeen atomic.Int64
 	writeMu  sync.Mutex
+	frags    *FragReassembler
 }
 
 func newServerRuntime(endpoint *Endpoint) *serverRuntime {
@@ -123,6 +124,23 @@ func (s *serverRuntime) handle(packet []byte, remote *net.UDPAddr) {
 		if err = peer.device.WriteInboundBuffers([]*buf.Buffer{inbound}); err != nil {
 			inbound.Release()
 		}
+	case PTIPFrag:
+		if peer == nil {
+			return
+		}
+		fragment, fragmentErr := ParseFrag(packet)
+		if fragmentErr != nil {
+			return
+		}
+		payload, fragmentErr := peer.frags.Add(fragment, time.Now().UnixNano())
+		if fragmentErr != nil || len(payload) == 0 {
+			return
+		}
+		inbound := buf.NewSize(len(payload))
+		_, _ = inbound.Write(payload)
+		if err = peer.device.WriteInboundBuffers([]*buf.Buffer{inbound}); err != nil {
+			inbound.Release()
+		}
 	case PTClose:
 		s.remove(key)
 	}
@@ -157,7 +175,7 @@ func (s *serverRuntime) createPeer(h Header, fields OpenFields, remote *net.UDPA
 		s.writeRaw(remote, BuildOpenReject(h, []byte("address pool exhausted")))
 		return
 	}
-	peer := &serverPeer{remote: remote, header: Header{Type: PTData, Encrypt: boolByte(fields.Encrypt), SID: h.SID, Token: h.Token}, user: fields.User, password: fields.Password, key: xorCredentialKey(fields.User, fields.Password), encrypt: fields.Encrypt, address: address}
+	peer := &serverPeer{remote: remote, header: Header{Type: PTData, Encrypt: boolByte(fields.Encrypt), SID: h.SID, Token: h.Token}, user: fields.User, password: fields.Password, key: xorCredentialKey(fields.User, fields.Password), encrypt: fields.Encrypt, address: address, frags: NewFragReassembler()}
 	device, err := transport.NewDevice(transport.DeviceOptions{Context: s.endpoint.ctx, Logger: s.endpoint.logger, System: s.endpoint.options.System, Handler: s.endpoint, Name: s.endpoint.options.Name, MTU: uint32(fields.MTU), Configuration: transport.Configuration{MTU: uint32(fields.MTU), Address: []netip.Prefix{netip.PrefixFrom(address, 32)}}})
 	if err != nil {
 		s.writeRaw(remote, BuildOpenReject(h, []byte("device unavailable")))
@@ -185,6 +203,18 @@ func (s *serverRuntime) writePeer(peer *serverPeer, packets []*buf.Buffer) error
 	peer.writeMu.Lock()
 	defer peer.writeMu.Unlock()
 	for _, packet := range packets {
+		if packet.Len()+HeaderLen > int(peer.device.PortMTU()) {
+			fragments, fragmentErr := FragmentData(peer.header, packet.Bytes(), int(peer.device.PortMTU()), uint32(time.Now().UnixNano()))
+			if fragmentErr != nil {
+				return fragmentErr
+			}
+			for _, fragment := range fragments {
+				if _, err := s.conn.WriteToUDP(fragment, peer.remote); err != nil {
+					return err
+				}
+			}
+			continue
+		}
 		wire := BuildData(peer.header, packet.Bytes(), peer.user, peer.password, peer.encrypt)
 		if _, err := s.conn.WriteToUDP(wire, peer.remote); err != nil {
 			return err

@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"net/netip"
 	"sync"
+	"time"
 )
 
 // Session is the transport-neutral iWAN control/data state machine.  Keeping
@@ -198,4 +199,21 @@ func (s *Session) Ready() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.ready
+}
+
+func (s *Session) DataHeader() Header {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.header
+}
+
+func (s *Session) Echo() ([]byte, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.ready {
+		return nil, errors.New("iWAN session is not ready")
+	}
+	h := s.header
+	h.Type = PTEchoReq
+	return (Echo{Header: h, Tick: uint64(time.Now().UnixNano() / 1000)}).Marshal(), nil
 }

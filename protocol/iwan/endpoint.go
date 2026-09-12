@@ -57,6 +57,7 @@ type Endpoint struct {
 	readErr     chan error
 	readStarted atomic.Bool
 	writeMu     sync.Mutex
+	frags       *FragReassembler
 }
 
 func NewEndpoint(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.IWANEndpointOptions) (adapter.Endpoint, error) {
@@ -117,6 +118,7 @@ func NewEndpoint(ctx context.Context, router adapter.Router, logger log.ContextL
 		session:   session,
 		readDone:  make(chan struct{}),
 		readErr:   make(chan error, 1),
+		frags:     NewFragReassembler(),
 	}
 	if options.Mode == "client" {
 		device, deviceErr := transport.NewDevice(transport.DeviceOptions{
@@ -217,7 +219,23 @@ func (e *Endpoint) Start(stage adapter.StartStage) error {
 	e.ready.Store(true)
 	e.readStarted.Store(true)
 	go e.readLoop()
+	go e.echoLoop()
 	return nil
+}
+
+func (e *Endpoint) echoLoop() {
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+	for range ticker.C {
+		if !e.started.Load() || !e.ready.Load() {
+			return
+		}
+		packet, err := e.session.Echo()
+		if err != nil {
+			return
+		}
+		e.writeControl(packet)
+	}
 }
 
 func (e *Endpoint) readLoop() {
@@ -256,6 +274,18 @@ func (e *Endpoint) readLoop() {
 			}
 		case PTEchoReq:
 			e.writeControl(BuildEchoResponse(control, nil))
+		case PTIPFrag:
+			fragment, fragmentErr := ParseFrag(packet[:n])
+			if fragmentErr != nil {
+				continue
+			}
+			if payload, fragmentErr = e.frags.Add(fragment, time.Now().UnixNano()); fragmentErr == nil && len(payload) != 0 {
+				inbound := buf.NewSize(len(payload))
+				_, _ = inbound.Write(payload)
+				if fragmentErr = e.device.WriteInboundBuffers([]*buf.Buffer{inbound}); fragmentErr != nil {
+					inbound.Release()
+				}
+			}
 		case PTClose:
 			return
 		}
@@ -278,6 +308,18 @@ func (e *Endpoint) writeOutbound(packetBuffers []*buf.Buffer) error {
 	e.writeMu.Lock()
 	defer e.writeMu.Unlock()
 	for _, packetBuffer := range packetBuffers {
+		if packetBuffer.Len()+HeaderLen > int(e.options.MTU) {
+			fragments, fragmentErr := FragmentData(e.session.DataHeader(), packetBuffer.Bytes(), int(e.options.MTU), uint32(time.Now().UnixNano()))
+			if fragmentErr != nil {
+				return fragmentErr
+			}
+			for _, fragment := range fragments {
+				if _, err := e.conn.Write(fragment); err != nil {
+					return err
+				}
+			}
+			continue
+		}
 		packet, err := e.session.Data(packetBuffer.Bytes())
 		if err != nil {
 			return err
