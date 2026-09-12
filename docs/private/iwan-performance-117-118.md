@@ -49,3 +49,25 @@ UDP DNS requests. A Python SOCKS burst (100,000 x 800-byte packets, about
 385 Mbit/s offered) delivered 20,427 packets; a paced 34.2 Mbit/s run delivered
 all 20,000 packets. This is a functional datapath signal, not a maximum-speed
 benchmark, because the generator is not a native line-rate traffic tool.
+
+## Integrated sing-box endpoint smoke benchmark
+
+On 2026-09-13 a Linux `with_iwan,with_gvisor` binary from revision
+`089ae760` was run on VM117 (server) and VM118 (client). The client used a
+SOCKS bridge to an iperf3 target on the server, so these results are
+**non-qualifying smoke measurements** under the release gate above (they are
+not a direct tunnel-address test and cannot establish line-rate capability).
+
+| Client mode | TCP streams | Offered/result | Retransmits |
+| --- | ---: | ---: | ---: |
+| `system:false` (gVisor) | 4 | 216.0 Mbit/s sent, 198.9 Mbit/s received | 39 |
+| `system:true` (kernel TUN + gVisor fallback) | 4 | 226.6 Mbit/s sent, 203.6 Mbit/s received | 49 |
+
+The same SOCKS bridge at 100 Mbit/s UDP offered 62.9 Mbit/s received with
+approximately 7.4% sequence gaps. The Python receiver is not a line-rate
+instrument, but the loss is sufficient to reject the current compatibility
+path for the 1 Gbit/s zero-loss target. The batch workspace change in
+`089ae760` did not materially change this ceiling, confirming that the
+dominant cost is the userspace/gVisor L3 path rather than per-call slice
+allocation. Native Rust L3 dataplane work and a direct tunnel-address harness
+remain required before any production performance claim.
