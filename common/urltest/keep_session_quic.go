@@ -4,10 +4,10 @@ package urltest
 
 import (
 	"context"
-
-	"github.com/sagernet/sing-quic"
 )
 
 func contextWithQUICKeepSession(ctx context.Context) context.Context {
-	return qtls.ContextWithKeepSession(ctx)
+	// sing-quic 1.15 no longer exposes a keep-session context marker.  Keep the
+	// helper so callers remain version-neutral; the transport owns reuse.
+	return ctx
 }

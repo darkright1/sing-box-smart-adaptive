@@ -406,9 +406,11 @@ func recordFromMetadata(metadata trafficcontrol.TrackerMetadata) Record {
 	}
 	var process string
 	if processInfo := metadata.Metadata.ProcessInfo; processInfo != nil {
-		process = processInfo.ProcessPath
-		if process == "" && len(processInfo.AndroidPackageNames) > 0 {
-			process = processInfo.AndroidPackageNames[0]
+		if len(processInfo.ProcessPaths) > 0 {
+			process = processInfo.ProcessPaths[0]
+		}
+		if process == "" && len(processInfo.PackageNames) > 0 {
+			process = processInfo.PackageNames[0]
 		}
 	}
 	rule := "final"
