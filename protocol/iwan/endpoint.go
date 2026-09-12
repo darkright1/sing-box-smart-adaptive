@@ -163,6 +163,9 @@ func (e *Endpoint) Start(stage adapter.StartStage) error {
 		return err
 	}
 	e.conn = conn
+	if bufferErr := tunePacketSocket(conn); bufferErr != nil {
+		e.logger.Debug("iWAN socket buffer tuning unavailable: ", bufferErr)
+	}
 	open, err := e.session.Open()
 	if err != nil {
 		_ = conn.Close()

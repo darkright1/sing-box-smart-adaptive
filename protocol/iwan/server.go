@@ -61,6 +61,12 @@ func (s *serverRuntime) start() error {
 	if err != nil {
 		return err
 	}
+	if err = conn.SetReadBuffer(iwanSocketBufferSize); err != nil {
+		s.endpoint.logger.Debug("iWAN server receive buffer tuning unavailable: ", err)
+	}
+	if err = conn.SetWriteBuffer(iwanSocketBufferSize); err != nil {
+		s.endpoint.logger.Debug("iWAN server send buffer tuning unavailable: ", err)
+	}
 	s.conn = conn
 	pool := s.endpoint.options.PoolCIDR
 	if pool == "" {
