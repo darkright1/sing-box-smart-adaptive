@@ -223,12 +223,14 @@ func (s *serverRuntime) createPeer(h Header, fields OpenFields, remote *net.UDPA
 	peer := &serverPeer{remote: remote, header: Header{Type: PTData, Encrypt: boolByte(fields.Encrypt), SID: h.SID, Token: h.Token}, user: fields.User, password: fields.Password, key: xorCredentialKey(fields.User, fields.Password), encrypt: fields.Encrypt, links: append([]uint32(nil), fields.Links...), srPass: s.endpoint.options.SRPassword, address: address, frags: NewFragReassembler()}
 	device, err := transport.NewDevice(transport.DeviceOptions{Context: s.endpoint.ctx, Logger: s.endpoint.logger, System: s.endpoint.options.System, Handler: s.endpoint, UDPTimeout: C.UDPTimeout, Name: s.endpoint.options.Name, MTU: uint32(fields.MTU), Configuration: transport.Configuration{MTU: uint32(fields.MTU), Address: []netip.Prefix{netip.PrefixFrom(address, 32)}}})
 	if err != nil {
+		s.endpoint.logger.Error("iWAN peer device unavailable: ", err)
 		s.writeRaw(remote, BuildOpenReject(h, []byte("device unavailable")))
 		return
 	}
 	peer.device = device
 	device.SetPacketWriter(func(packets []*buf.Buffer) error { return s.writePeer(peer, packets) })
 	if err = device.Start(); err != nil {
+		s.endpoint.logger.Error("iWAN peer device start failed: ", err)
 		_ = device.Close()
 		s.writeRaw(remote, BuildOpenReject(h, []byte("device start failed")))
 		return
