@@ -298,7 +298,7 @@ func (e *Endpoint) readLoop() {
 				return
 			}
 		case PTEchoReq:
-			e.writeControl(BuildEchoResponse(control, nil))
+			e.writeControl(BuildEchoResponse(control, payload))
 		case PTIPFrag:
 			fragment, fragmentErr := ParseFrag(wire)
 			if fragmentErr != nil {

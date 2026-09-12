@@ -195,9 +195,11 @@ func (s *Session) Handle(packet []byte) (payload []byte, control Header, err err
 			return nil, control, errors.New("iWAN control session identity mismatch")
 		}
 		if control.Type == PTEchoReq || control.Type == PTEchoResp || control.Type == PTClose {
-			if _, _, verifyErr := VerifySigned(packet); verifyErr != nil {
+			_, payload, verifyErr := VerifySigned(packet)
+			if verifyErr != nil {
 				return nil, control, verifyErr
 			}
+			return payload, control, nil
 		}
 		return nil, control, nil
 	default:

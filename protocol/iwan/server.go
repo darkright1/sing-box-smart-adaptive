@@ -119,11 +119,12 @@ func (s *serverRuntime) handle(packet []byte, remote *net.UDPAddr) {
 		s.handleOpen(packet, remote, peer)
 	case PTEchoReq:
 		if peer != nil && h.SID == peer.header.SID && h.Token == peer.header.Token {
-			if _, _, verifyErr := VerifySigned(packet); verifyErr != nil {
+			_, payload, verifyErr := VerifySigned(packet)
+			if verifyErr != nil {
 				return
 			}
 			peer.lastSeen.Store(time.Now().UnixNano())
-			s.write(peer, BuildEchoResponse(h, nil))
+			s.write(peer, BuildEchoResponse(h, payload))
 		}
 	case PTEchoResp:
 		if peer != nil && h.SID == peer.header.SID && h.Token == peer.header.Token {
@@ -273,6 +274,12 @@ func (s *serverRuntime) write(peer *serverPeer, packet []byte) {
 
 func (s *serverRuntime) wrapPeer(peer *serverPeer, packet []byte) ([]byte, error) {
 	if len(peer.links) == 0 || peer.srPass == "" {
+		return packet, nil
+	}
+	// The reference client decrypts SEGRT-wrapped IPFRAG after reassembly;
+	// wrapping each fragment here would apply the transform at the wrong
+	// boundary. Keep fragments in the interoperable plain form.
+	if len(packet) > 0 && packet[0] == PTIPFrag {
 		return packet, nil
 	}
 	return WrapSR(packet, peer.links, peer.srPass, 1)
