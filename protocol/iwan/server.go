@@ -46,10 +46,10 @@ func newServerRuntime(endpoint *Endpoint) *serverRuntime {
 
 func (s *serverRuntime) start() error {
 	listenIP := net.IPv4zero
-	if s.endpoint.options.Listen.Listen != nil {
-		listenIP = net.ParseIP(s.endpoint.options.Listen.Listen.Build(netip.AddrFrom4([4]byte{})).String())
+	if s.endpoint.options.Listen != nil {
+		listenIP = net.ParseIP(s.endpoint.options.Listen.Build(netip.AddrFrom4([4]byte{})).String())
 	}
-	port := s.endpoint.options.Listen.ListenPort
+	port := s.endpoint.options.ListenPort
 	if port == 0 {
 		port = 8000
 	}
