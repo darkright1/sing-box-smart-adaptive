@@ -238,7 +238,7 @@ func buildDataWithKey(h Header, payload []byte, key [16]byte, encrypted bool) []
 // data plane. The caller owns the returned buffer until releaseWirePacket;
 // the public BuildData helper above intentionally keeps ordinary allocation
 // semantics for callers that do not participate in the pool lifecycle.
-func buildDataWithKeyPooled(h Header, payload []byte, key [16]byte, encrypted bool) ([]byte, bool) {
+func buildDataWithKeyPooled(h Header, payload []byte, key [16]byte, encrypted bool) ([]byte, *wirePacket) {
 	h.Type = PTData
 	h.Encrypt = boolByte(encrypted)
 	if encrypted {

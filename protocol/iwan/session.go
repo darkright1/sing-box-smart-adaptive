@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"net/netip"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -32,6 +33,16 @@ type Session struct {
 	ready     bool
 	address   netip.Addr
 	gateway   netip.Addr
+	// wire is immutable after OPENACK and is read for every data packet.  Keep
+	// the hot path lock-free; control frames still use mu because they mutate
+	// session state.
+	wire atomic.Pointer[sessionWireState]
+}
+
+type sessionWireState struct {
+	header    Header
+	key       [16]byte
+	encrypted bool
 }
 
 type SessionOptions struct {
@@ -163,6 +174,7 @@ func (s *Session) Handle(packet []byte) (payload []byte, control Header, err err
 		s.address = netip.AddrFrom4([4]byte{byte(ack.IP >> 24), byte(ack.IP >> 16), byte(ack.IP >> 8), byte(ack.IP)})
 		s.gateway = netip.AddrFrom4([4]byte{byte(ack.Gateway >> 24), byte(ack.Gateway >> 16), byte(ack.Gateway >> 8), byte(ack.Gateway)})
 		s.ready = true
+		s.wire.Store(&sessionWireState{header: s.header, key: s.key, encrypted: s.encrypt})
 		return nil, control, nil
 	case PTOpenRej:
 		if control.SID != s.header.SID || control.Token != s.header.Token {
@@ -176,7 +188,7 @@ func (s *Session) Handle(packet []byte) (payload []byte, control Header, err err
 		if control.SID != s.header.SID || control.Token != s.header.Token {
 			return nil, control, errors.New("iWAN session identity mismatch")
 		}
-		_, payload, err = ParseData(packet)
+		_, payload, err = parseDataView(packet)
 		if err != nil {
 			return nil, control, err
 		}
@@ -240,18 +252,27 @@ func (s *Session) Address() (netip.Addr, netip.Addr) {
 }
 
 func (s *Session) Data(payload []byte) ([]byte, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if !s.ready {
+	state := s.wire.Load()
+	if state == nil {
 		return nil, errors.New("iWAN session is not ready")
 	}
-	return BuildData(s.header, payload, s.user, s.password, s.encrypt), nil
+	return buildDataWithKey(state.header, payload, state.key, state.encrypted), nil
+}
+
+// DataPooled is the allocation-reducing variant used by the endpoint data
+// path. The returned frame is valid until releaseWirePacket is called after
+// the synchronous datagram write completes.
+func (s *Session) DataPooled(payload []byte) ([]byte, *wirePacket, error) {
+	state := s.wire.Load()
+	if state == nil {
+		return nil, nil, errors.New("iWAN session is not ready")
+	}
+	packet, pooled := buildDataWithKeyPooled(state.header, payload, state.key, state.encrypted)
+	return packet, pooled, nil
 }
 
 func (s *Session) Ready() bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.ready
+	return s.wire.Load() != nil
 }
 
 func (s *Session) DataHeader() Header {

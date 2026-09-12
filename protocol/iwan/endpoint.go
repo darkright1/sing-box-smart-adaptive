@@ -352,12 +352,14 @@ func (e *Endpoint) writeOutbound(packetBuffers []*buf.Buffer) error {
 			}
 			continue
 		}
-		packet, err := e.session.Data(packetBuffer.Bytes())
+		packet, pooled, err := e.session.DataPooled(packetBuffer.Bytes())
 		if err != nil {
 			return err
 		}
-		if _, err = e.conn.Write(packet); err != nil {
-			return err
+		_, writeErr := e.conn.Write(packet)
+		releaseWirePacket(packet, pooled)
+		if writeErr != nil {
+			return writeErr
 		}
 	}
 	return nil

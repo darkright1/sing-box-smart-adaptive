@@ -139,7 +139,7 @@ func (s *serverRuntime) handle(packet []byte, remote *net.UDPAddr) {
 			return
 		}
 		peer.lastSeen.Store(time.Now().UnixNano())
-		_, payload, err := ParseData(packet)
+		_, payload, err := parseDataView(packet)
 		if err != nil {
 			return
 		}
@@ -251,14 +251,17 @@ func (s *serverRuntime) writePeer(peer *serverPeer, packets []*buf.Buffer) error
 			}
 			continue
 		}
-		wire := BuildData(peer.header, packet.Bytes(), peer.user, peer.password, peer.encrypt)
+		frame, pooled := buildDataWithKeyPooled(peer.header, packet.Bytes(), peer.key, peer.encrypt)
 		var wrapErr error
-		wire, wrapErr = s.wrapPeer(peer, wire)
+		wire, wrapErr := s.wrapPeer(peer, frame)
 		if wrapErr != nil {
+			releaseWirePacket(frame, pooled)
 			return wrapErr
 		}
-		if _, err := s.conn.WriteToUDP(wire, peer.remote); err != nil {
-			return err
+		_, writeErr := s.conn.WriteToUDP(wire, peer.remote)
+		releaseWirePacket(frame, pooled)
+		if writeErr != nil {
+			return writeErr
 		}
 	}
 	return nil

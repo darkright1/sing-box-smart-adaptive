@@ -54,6 +54,23 @@ func TestAESRoundTrip(t *testing.T) {
 	}
 }
 
+func TestWirePacketPoolRoundTrip(t *testing.T) {
+	h := Header{SID: 7, Token: 11}
+	payload := []byte("pooled iwan data")
+	packet, pooled := buildDataWithKeyPooled(h, payload, xorCredentialKey("u", "p"), false)
+	if pooled == nil {
+		t.Fatal("MTU-sized packet was not pooled")
+	}
+	if _, got, err := ParseData(packet); err != nil || !bytes.Equal(got, payload) {
+		t.Fatalf("pooled packet round trip failed: %v", err)
+	}
+	classCap := cap(packet)
+	releaseWirePacket(packet, pooled)
+	if classCap < len(payload)+HeaderLen {
+		t.Fatalf("invalid pooled capacity %d", classCap)
+	}
+}
+
 func TestSRRoundTripAndKeyPadding(t *testing.T) {
 	inner := BuildData(Header{SID: 4, Token: 5}, []byte("payload that crosses one AES block"), "u", "p", false)
 	wrapped, err := WrapSR(inner, []uint32{7, 9}, "123456789012345678901234567890", 1)
