@@ -88,9 +88,10 @@ const (
 	// small so exploration does not displace a proven path during real traffic.
 	defaultSmartExploration = 0.02
 	defaultSmartMinSamples  = 3
-	// Passive bulk gating only consumes bytes observed on real connections.
-	// 512 KiB/s is deliberately conservative: it catches the measured
-	// YouTube/GCore stall without rejecting ordinary interactive traffic.
+	// Passive bulk quality is advisory only and consumes bytes observed on real
+	// connections. 512 KiB/s is a diagnostic floor, not a reachability gate:
+	// access links, response sizes and service congestion vary too widely for an
+	// absolute rate to make a node circuit-open.
 	defaultSmartPassiveThroughputFloorBPS = 512 * 1024
 	defaultSmartPassiveThroughputSamples  = 2
 	defaultSmartMaxAttempts               = 3
@@ -3950,26 +3951,17 @@ func (s *Smart) rankPooled(ctx context.Context, transport string, destination M.
 			}
 		}
 	}
-	// Apply the passive bulk gate only after the traffic profile is known. This
-	// changes eligibility for future dials; it never interrupts an existing
-	// stream and never schedules an active resource probe.
+	// Record the passive bulk signal only after the traffic profile is known.
+	// Throughput is deliberately a soft ranking signal: it must never make a
+	// reachable endpoint ineligible, otherwise a slow/short-lived sample can
+	// strand the entire group and prevent recovery traffic from ever arriving.
 	if profile == smartProfileBulk {
 		for index := range ranking.ranks {
 			if !passiveThroughputBelowFloor(ranking.ranks[index].estimate, s.passiveThroughputFloorBPS, s.passiveThroughputSamples) {
 				continue
 			}
-			ranking.ranks[index].estimate.State = "open"
-			ranking.ranks[index].status.State = "open"
-			ranking.ranks[index].eligible = false
-			ranking.ranks[index].status.Reason = "passive throughput below floor"
 			ranking.ranks[index].passiveThroughputLow = true
-			policyID := ranking.ranks[index].policyID
-			for policyIndex := range policyCandidates {
-				if policyCandidates[policyIndex].ID == policyID {
-					policyCandidates[policyIndex].State = smartPolicyState("open")
-					policyCandidates[policyIndex].Eligible = false
-				}
-			}
+			ranking.ranks[index].status.Reason = "passive throughput below advisory floor"
 		}
 	}
 	// Keep the exploration denominator identical to the Zig policy kernel: only

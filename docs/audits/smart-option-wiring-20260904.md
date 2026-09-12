@@ -10,7 +10,7 @@ configuration fields from becoming decorative API.
 | `max_attempts`, `attempt_timeout`, `established_stall_timeout` | bounded dial/hedge and passive stall watchdog | Go host |
 | `site_stickiness`, switch confirmation/cooldown/margin/min improvement | primary/backup FSM and Zig policy ABI | Go + Zig |
 | `selection_mode`, `exploration`, `min_samples` | stable affinity and confidence/exploration scoring | Zig ABI in packaged builds; Go host policy remains a development fallback |
-| throughput floor/samples | passive bulk eligibility gate | Go host |
+| throughput floor/samples | passive bulk signal, status and bulk score | Go host |
 | breaker, half-life, retention, max entries | portrait decay, circuit state and bounded in-memory pruning | Go host |
 | provider/catalog filters and node weights | candidate discovery and score normalization | Go host |
 | interrupt policy | selective connection interruption after a confirmed failover | Go host |

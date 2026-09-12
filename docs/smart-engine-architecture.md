@@ -66,15 +66,16 @@ kernel is called. Keeping them out of Zig avoids a second scheduler or a second
 health store. The host and Zig scoring paths use the same p95 latency order,
 half-open penalty, confidence prior, and exploration formula.
 
-## Passive bulk throughput gate
+## Passive bulk throughput signal
 
 Bulk candidates can be bypassed after the configured number of real-traffic
 throughput observations falls below `passive_throughput_floor_bps` (default
-512 KiB/s, two observations). This gate never fetches a probe resource and
-never interrupts an existing stream. It marks the candidate hard-open for the
-next new connection; the normal bounded candidate list then provides the
-failover opportunity. Service-local throughput takes precedence over global
-history, so a slow YouTube path cannot be hidden by unrelated traffic.
+512 KiB/s, two observations). This signal never fetches a probe resource,
+never interrupts an existing stream, and never makes a reachable endpoint
+ineligible. Bulk scoring and status reporting use it after the sample count;
+only connection or protocol failures can open a circuit. Service-local
+throughput takes precedence over global history, so a slow YouTube path cannot
+be hidden by unrelated traffic.
 
 ## Phased startup and stable selection
 

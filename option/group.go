@@ -80,10 +80,11 @@ type SmartOutboundOptions struct {
 	SwitchMinImprovement badoption.Duration `json:"switch_min_improvement,omitempty"`
 	Exploration          *float64           `json:"exploration,omitempty"`
 	MinSamples           int                `json:"min_samples,omitempty"`
-	// PassiveThroughputFloorBPS is a lower bound for real-traffic throughput
-	// observations in bulk profiles. It never performs a probe or fetches a
-	// resource; after PassiveThroughputSamples low observations the candidate
-	// is temporarily bypassed so the next real connection can try another line.
+	// PassiveThroughputFloorBPS is an advisory lower bound for real-traffic
+	// throughput observations in bulk profiles. It never performs a probe or
+	// fetches a resource, and never makes a reachable candidate ineligible;
+	// Bulk scoring and status reporting use the signal after the configured
+	// number of observations.
 	PassiveThroughputFloorBPS uint64                      `json:"passive_throughput_floor_bps,omitempty"`
 	PassiveThroughputSamples  int                         `json:"passive_throughput_samples,omitempty"`
 	BreakerFailures           int                         `json:"breaker_failures,omitempty"`

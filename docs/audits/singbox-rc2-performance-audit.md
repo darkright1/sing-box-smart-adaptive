@@ -201,7 +201,7 @@ Every stored field is now accounted for in one of three deliberate paths:
 | successes/failures | Bayesian reliability, confidence cost, health tier and breaker | persistence |
 | connect/first-byte EWMA and tail | score, absolute switch floor and Zig candidate snapshot | status API fallback |
 | connect/first-byte sample counts | EWMA update, freshness decay and evidence-presence gate | persistence |
-| throughput and sample count | bulk-profile detection, passive floor and bulk score | status/persistence |
+| throughput and sample count | bulk-profile detection, advisory passive floor and bulk score | status/persistence |
 | jitter | interactive/UDP score and Zig candidate snapshot | persistence |
 | retransmit ratio and sample count | bounded TCP score penalty; penalty ramps with 1/3/≥3 effective samples | status/persistence |
 | circuit and last-updated timestamps | eligibility, recovery, decay and pruning | persistence |

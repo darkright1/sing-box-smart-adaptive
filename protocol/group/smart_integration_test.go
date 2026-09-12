@@ -1609,6 +1609,33 @@ func TestSmartBulkSitePrefersSustainedThroughput(t *testing.T) {
 	}
 }
 
+func TestSmartBulkLowThroughputDoesNotStrandGroup(t *testing.T) {
+	first := newSmartFakeOutbound("bulk-low-first", nil)
+	second := newSmartFakeOutbound("bulk-low-second", nil)
+	smart := newTestSmart(first, second)
+	now := time.Now()
+	networkKey := smart.networkFingerprint()
+	destination := M.ParseSocksaddr("video.example:443")
+	_, siteKey := smartSiteIdentity(nil, destination)
+	for range 8 {
+		smart.store.observeDial(now, networkKey, siteKey, first.Tag(), N.NetworkTCP, true, 40*time.Millisecond)
+		smart.store.observeDial(now, networkKey, siteKey, second.Tag(), N.NetworkTCP, true, 60*time.Millisecond)
+	}
+	for range 3 {
+		smart.store.observeThroughput(now, networkKey, siteKey, first.Tag(), N.NetworkTCP, 64*1024, 2*time.Second)
+		smart.store.observeThroughput(now, networkKey, siteKey, second.Tag(), N.NetworkTCP, 96*1024, 2*time.Second)
+	}
+	ranks, _, _, _ := smart.rank(context.Background(), N.NetworkTCP, destination)
+	if len(ranks) != 2 || !hasEligibleSmartRank(ranks) {
+		t.Fatalf("low bulk throughput stranded the group: %+v", ranks)
+	}
+	for _, rank := range ranks {
+		if rank.status.State == "open" || !rank.eligible {
+			t.Fatalf("advisory throughput signal became a hard gate: %+v", rank.status)
+		}
+	}
+}
+
 func TestSmartProbeSuppressesCommonFailure(t *testing.T) {
 	first := newSmartFakeOutbound("first", errors.New("offline"))
 	second := newSmartFakeOutbound("second", errors.New("offline"))
