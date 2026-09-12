@@ -49,6 +49,7 @@ type Endpoint struct {
 	device      transport.Device
 	conn        net.Conn
 	session     *Session
+	server      *serverRuntime
 	closeOnce   sync.Once
 	started     atomic.Bool
 	ready       atomic.Bool
@@ -62,14 +63,16 @@ func NewEndpoint(ctx context.Context, router adapter.Router, logger log.ContextL
 	if options.Mode == "" {
 		options.Mode = "client"
 	}
-	if options.Mode != "client" {
-		return nil, E.New("iWAN server endpoint is not enabled in this client-only transport build")
+	if options.Mode != "client" && options.Mode != "server" {
+		return nil, E.New("invalid iWAN mode: ", options.Mode)
 	}
-	if options.Server == "" || options.Username == "" {
-		return nil, E.New("iWAN client requires server and username")
-	}
-	if options.ServerPort == 0 {
-		options.ServerPort = 8000
+	if options.Mode == "client" {
+		if options.Server == "" || options.Username == "" {
+			return nil, E.New("iWAN client requires server and username")
+		}
+		if options.ServerPort == 0 {
+			options.ServerPort = 8000
+		}
 	}
 	if options.MTU == 0 {
 		options.MTU = 1400
@@ -80,23 +83,28 @@ func NewEndpoint(ctx context.Context, router adapter.Router, logger log.ContextL
 	if !tun.WithGVisor && !options.System {
 		return nil, E.New("iWAN endpoint requires the with_gvisor build tag when system is false")
 	}
-	outboundDialer, err := dialer.NewWithOptions(dialer.Options{
-		Context:          ctx,
-		Options:          options.DialerOptions,
-		RemoteIsDomain:   !M.ParseAddr(options.Server).IsValid(),
-		ResolverOnDetour: true,
-		NewDialer:        true,
-	})
-	if err != nil {
-		return nil, err
-	}
-	session, err := NewSession(SessionOptions{
-		Client: true, Username: options.Username, Password: options.Password,
-		SRPassword: options.SRPassword, MTU: uint16(options.MTU), Encrypt: options.Encrypt,
-		PipeID: options.PipeID, PipeIndex: options.PipeIndex, Links: options.Links,
-	})
-	if err != nil {
-		return nil, err
+	var outboundDialer N.Dialer
+	var session *Session
+	var err error
+	if options.Mode == "client" {
+		outboundDialer, err = dialer.NewWithOptions(dialer.Options{
+			Context:          ctx,
+			Options:          options.DialerOptions,
+			RemoteIsDomain:   !M.ParseAddr(options.Server).IsValid(),
+			ResolverOnDetour: true,
+			NewDialer:        true,
+		})
+		if err != nil {
+			return nil, err
+		}
+		session, err = NewSession(SessionOptions{
+			Client: true, Username: options.Username, Password: options.Password,
+			SRPassword: options.SRPassword, MTU: uint16(options.MTU), Encrypt: options.Encrypt,
+			PipeID: options.PipeID, PipeIndex: options.PipeIndex, Links: options.Links,
+		})
+		if err != nil {
+			return nil, err
+		}
 	}
 	ep := &Endpoint{
 		Adapter:   endpoint.NewAdapterWithDialerOptions(C.TypeIWAN, tag, []string{N.NetworkTCP, N.NetworkUDP, N.NetworkICMP}, options.DialerOptions),
@@ -110,17 +118,21 @@ func NewEndpoint(ctx context.Context, router adapter.Router, logger log.ContextL
 		readDone:  make(chan struct{}),
 		readErr:   make(chan error, 1),
 	}
-	device, err := transport.NewDevice(transport.DeviceOptions{
-		Context: ctx, Logger: logger, System: options.System, Handler: ep,
-		InterfaceFinder: service.FromContext[adapter.NetworkManager](ctx).InterfaceFinder(),
-		Name:            options.Name, MTU: options.MTU,
-		Configuration: transport.Configuration{MTU: options.MTU, Address: options.Address},
-	})
-	if err != nil {
-		return nil, err
+	if options.Mode == "client" {
+		device, deviceErr := transport.NewDevice(transport.DeviceOptions{
+			Context: ctx, Logger: logger, System: options.System, Handler: ep,
+			InterfaceFinder: service.FromContext[adapter.NetworkManager](ctx).InterfaceFinder(),
+			Name:            options.Name, MTU: options.MTU,
+			Configuration: transport.Configuration{MTU: options.MTU, Address: options.Address},
+		})
+		if deviceErr != nil {
+			return nil, deviceErr
+		}
+		ep.device = device
+		device.SetPacketWriter(ep.writeOutbound)
+	} else {
+		ep.server = newServerRuntime(ep)
 	}
-	ep.device = device
-	device.SetPacketWriter(ep.writeOutbound)
 	return ep, nil
 }
 
@@ -129,6 +141,14 @@ func (e *Endpoint) Start(stage adapter.StartStage) error {
 		return nil
 	}
 	if e.started.Swap(true) {
+		return nil
+	}
+	if e.options.Mode == "server" {
+		if err := e.server.start(); err != nil {
+			e.started.Store(false)
+			return err
+		}
+		e.ready.Store(true)
 		return nil
 	}
 	remote := M.ParseSocksaddrHostPort(e.options.Server, e.options.ServerPort)
@@ -274,6 +294,12 @@ func (e *Endpoint) Close() error {
 	e.closeOnce.Do(func() {
 		e.started.Store(false)
 		e.ready.Store(false)
+		if e.options.Mode == "server" {
+			if e.server != nil {
+				err = e.server.close()
+			}
+			return
+		}
 		if e.conn != nil {
 			err = e.conn.Close()
 		}
@@ -293,11 +319,34 @@ func (e *Endpoint) PreMatchFlow(network string, destination netip.Addr) adapter.
 	return adapter.PreMatchFlow
 }
 
-func (e *Endpoint) PortAddresses() (netip.Addr, netip.Addr) { return e.device.PortAddresses() }
-func (e *Endpoint) PortMTU() uint32                         { return e.device.PortMTU() }
-func (e *Endpoint) AttachReturn(path tun.Return) error      { return e.device.AttachReturn(path) }
-func (e *Endpoint) DetachReturn(path tun.Return) error      { return e.device.DetachReturn(path) }
+func (e *Endpoint) PortAddresses() (netip.Addr, netip.Addr) {
+	if e.device == nil {
+		return netip.Addr{}, netip.Addr{}
+	}
+	return e.device.PortAddresses()
+}
+func (e *Endpoint) PortMTU() uint32 {
+	if e.device == nil {
+		return e.options.MTU
+	}
+	return e.device.PortMTU()
+}
+func (e *Endpoint) AttachReturn(path tun.Return) error {
+	if e.device == nil {
+		return E.New("iWAN server endpoint has no shared return path")
+	}
+	return e.device.AttachReturn(path)
+}
+func (e *Endpoint) DetachReturn(path tun.Return) error {
+	if e.device == nil {
+		return nil
+	}
+	return e.device.DetachReturn(path)
+}
 func (e *Endpoint) WritePackets(packets [][]byte) error {
+	if e.device == nil {
+		return E.New("iWAN server endpoint cannot write packets without a peer")
+	}
 	if !e.ready.Load() {
 		return E.New("iWAN endpoint is not ready")
 	}

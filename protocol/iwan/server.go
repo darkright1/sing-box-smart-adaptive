@@ -1,0 +1,273 @@
+//go:build with_iwan
+
+package iwan
+
+import (
+	"errors"
+	"fmt"
+	"net"
+	"net/netip"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	transport "github.com/sagernet/sing-box/transport/iwan"
+	"github.com/sagernet/sing/common/buf"
+)
+
+type serverRuntime struct {
+	endpoint *Endpoint
+	conn     *net.UDPConn
+	pool     netip.Prefix
+	next     atomic.Uint32
+	access   sync.Mutex
+	allocMu  sync.Mutex
+	peers    map[string]*serverPeer
+	done     chan struct{}
+}
+
+type serverPeer struct {
+	remote   *net.UDPAddr
+	header   Header
+	user     string
+	password string
+	key      [16]byte
+	encrypt  bool
+	device   transport.Device
+	address  netip.Addr
+	lastSeen atomic.Int64
+	writeMu  sync.Mutex
+}
+
+func newServerRuntime(endpoint *Endpoint) *serverRuntime {
+	return &serverRuntime{endpoint: endpoint, peers: make(map[string]*serverPeer), done: make(chan struct{})}
+}
+
+func (s *serverRuntime) start() error {
+	listenIP := net.IPv4zero
+	if s.endpoint.options.Listen.Listen != nil {
+		listenIP = net.ParseIP(s.endpoint.options.Listen.Listen.Build(netip.AddrFrom4([4]byte{})).String())
+	}
+	port := s.endpoint.options.Listen.ListenPort
+	if port == 0 {
+		port = 8000
+	}
+	conn, err := net.ListenUDP("udp", &net.UDPAddr{IP: listenIP, Port: int(port)})
+	if err != nil {
+		return err
+	}
+	s.conn = conn
+	pool := s.endpoint.options.PoolCIDR
+	if pool == "" {
+		pool = "10.255.0.0/24"
+	}
+	s.pool, err = netip.ParsePrefix(pool)
+	if err != nil || !s.pool.Addr().Is4() {
+		_ = conn.Close()
+		return fmt.Errorf("invalid iWAN pool %q", pool)
+	}
+	if s.pool.Bits() >= 31 {
+		_ = conn.Close()
+		return errors.New("iWAN pool must contain at least two IPv4 addresses")
+	}
+	go s.readLoop()
+	return nil
+}
+
+func (s *serverRuntime) readLoop() {
+	defer close(s.done)
+	var packet [64 * 1024]byte
+	for {
+		n, remote, err := s.conn.ReadFromUDP(packet[:])
+		if err != nil {
+			return
+		}
+		s.handle(packet[:n], remote)
+	}
+}
+
+func (s *serverRuntime) handle(packet []byte, remote *net.UDPAddr) {
+	h, err := ParseHeader(packet)
+	if err != nil {
+		return
+	}
+	key := remote.String()
+	s.access.Lock()
+	peer := s.peers[key]
+	s.access.Unlock()
+	switch h.Type {
+	case PTOpen:
+		s.handleOpen(packet, remote, peer)
+	case PTEchoReq:
+		if peer != nil {
+			peer.lastSeen.Store(time.Now().UnixNano())
+			s.write(peer, BuildEchoResponse(h, nil))
+		}
+	case PTData, PTDataEnc:
+		if peer == nil || h.SID != peer.header.SID || h.Token != peer.header.Token {
+			return
+		}
+		peer.lastSeen.Store(time.Now().UnixNano())
+		_, payload, err := ParseData(packet)
+		if err != nil {
+			return
+		}
+		if h.Type == PTDataEnc {
+			if !peer.encrypt {
+				return
+			}
+			xorInPlace(peer.key, payload, payload)
+		}
+		inbound := buf.NewSize(len(payload))
+		_, _ = inbound.Write(payload)
+		if err = peer.device.WriteInboundBuffers([]*buf.Buffer{inbound}); err != nil {
+			inbound.Release()
+		}
+	case PTClose:
+		s.remove(key)
+	}
+}
+
+func (s *serverRuntime) handleOpen(packet []byte, remote *net.UDPAddr, old *serverPeer) {
+	h, fields, err := ParseOpen(packet)
+	if err != nil {
+		return
+	}
+	for _, user := range s.endpoint.options.Users {
+		if user.Username != fields.User || user.Password != fields.Password {
+			continue
+		}
+		if old != nil {
+			ack, ackErr := BuildOpenAck(h, AckFields{MTU: fields.MTU, IP: addr4(old.address), Gateway: addr4(s.pool.Addr().Next()), Encrypt: fields.Encrypt})
+			if ackErr == nil {
+				s.write(old, ack)
+			}
+		}
+		if old == nil {
+			s.createPeer(h, fields, remote)
+		}
+		return
+	}
+	s.writeRaw(remote, BuildOpenReject(h, []byte("authentication failed")))
+}
+
+func (s *serverRuntime) createPeer(h Header, fields OpenFields, remote *net.UDPAddr) {
+	address, ok := s.allocate()
+	if !ok {
+		s.writeRaw(remote, BuildOpenReject(h, []byte("address pool exhausted")))
+		return
+	}
+	peer := &serverPeer{remote: remote, header: Header{Type: PTData, Encrypt: boolByte(fields.Encrypt), SID: h.SID, Token: h.Token}, user: fields.User, password: fields.Password, key: xorCredentialKey(fields.User, fields.Password), encrypt: fields.Encrypt, address: address}
+	device, err := transport.NewDevice(transport.DeviceOptions{Context: s.endpoint.ctx, Logger: s.endpoint.logger, System: s.endpoint.options.System, Handler: s.endpoint, Name: s.endpoint.options.Name, MTU: uint32(fields.MTU), Configuration: transport.Configuration{MTU: uint32(fields.MTU), Address: []netip.Prefix{netip.PrefixFrom(address, 32)}}})
+	if err != nil {
+		s.writeRaw(remote, BuildOpenReject(h, []byte("device unavailable")))
+		return
+	}
+	peer.device = device
+	device.SetPacketWriter(func(packets []*buf.Buffer) error { return s.writePeer(peer, packets) })
+	if err = device.Start(); err != nil {
+		_ = device.Close()
+		s.writeRaw(remote, BuildOpenReject(h, []byte("device start failed")))
+		return
+	}
+	s.access.Lock()
+	s.peers[remote.String()] = peer
+	s.access.Unlock()
+	peer.lastSeen.Store(time.Now().UnixNano())
+	ack, ackErr := BuildOpenAck(h, AckFields{MTU: fields.MTU, IP: addr4(address), Gateway: addr4(s.pool.Addr().Next()), Encrypt: fields.Encrypt})
+	if ackErr == nil {
+		s.write(peer, ack)
+	}
+}
+
+func (s *serverRuntime) writePeer(peer *serverPeer, packets []*buf.Buffer) error {
+	defer buf.ReleaseMulti(packets)
+	peer.writeMu.Lock()
+	defer peer.writeMu.Unlock()
+	for _, packet := range packets {
+		wire := BuildData(peer.header, packet.Bytes(), peer.user, peer.password, peer.encrypt)
+		if _, err := s.conn.WriteToUDP(wire, peer.remote); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *serverRuntime) write(peer *serverPeer, packet []byte) {
+	if peer == nil {
+		return
+	}
+	peer.writeMu.Lock()
+	defer peer.writeMu.Unlock()
+	_, _ = s.conn.WriteToUDP(packet, peer.remote)
+}
+
+func (s *serverRuntime) writeRaw(remote *net.UDPAddr, packet []byte) {
+	if s.conn != nil {
+		_, _ = s.conn.WriteToUDP(packet, remote)
+	}
+}
+
+func (s *serverRuntime) allocate() (netip.Addr, bool) {
+	s.allocMu.Lock()
+	defer s.allocMu.Unlock()
+	base := addr4(s.pool.Addr())
+	limit := uint32(1) << uint32(32-s.pool.Bits())
+	// Reserve the network address and the final broadcast address. The first
+	// usable host is also reserved as the tunnel gateway.
+	for i := uint32(0); i < limit-2; i++ {
+		idx := 2 + s.next.Add(1)%(limit-2)
+		candidate := base + idx
+		if candidate == 0 {
+			continue
+		}
+		address := netip.AddrFrom4([4]byte{byte(candidate >> 24), byte(candidate >> 16), byte(candidate >> 8), byte(candidate)})
+		used := false
+		s.access.Lock()
+		for _, peer := range s.peers {
+			if peer.address == address {
+				used = true
+				break
+			}
+		}
+		s.access.Unlock()
+		if !used {
+			return address, true
+		}
+	}
+	return netip.Addr{}, false
+}
+
+func (s *serverRuntime) remove(key string) {
+	s.access.Lock()
+	peer := s.peers[key]
+	delete(s.peers, key)
+	s.access.Unlock()
+	if peer != nil && peer.device != nil {
+		_ = peer.device.Close()
+	}
+}
+
+func (s *serverRuntime) close() error {
+	if s.conn == nil {
+		return nil
+	}
+	err := s.conn.Close()
+	<-s.done
+	s.access.Lock()
+	peers := make([]*serverPeer, 0, len(s.peers))
+	for key, peer := range s.peers {
+		delete(s.peers, key)
+		peers = append(peers, peer)
+	}
+	s.access.Unlock()
+	for _, peer := range peers {
+		_ = peer.device.Close()
+	}
+	return err
+}
+
+func addr4(address netip.Addr) uint32 {
+	b := address.As4()
+	return uint32(b[0])<<24 | uint32(b[1])<<16 | uint32(b[2])<<8 | uint32(b[3])
+}
