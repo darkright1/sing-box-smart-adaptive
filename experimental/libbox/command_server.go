@@ -40,7 +40,12 @@ type CommandServer struct {
 	grpcServer        *grpc.Server
 	listener          net.Listener
 	endPauseTimer     *time.Timer
+	sleepAt           time.Time
 }
+
+// iOS wakes the extension for every push and background task; in collected power reports
+// most sleeps last under two minutes and none exceeded ten.
+const closeIdleConnectionsAfterSleep = 2 * time.Minute
 
 type CommandServerHandler interface {
 	ServiceStop() error
@@ -253,6 +258,7 @@ func (s *CommandServer) NeedFindProcess() bool {
 }
 
 func (s *CommandServer) Pause() {
+	s.sleepAt = time.Now().Round(0)
 	recorder := s.powerManager.Recorder()
 	if recorder != nil {
 		recorder.RecordDeviceSleep()
@@ -277,13 +283,17 @@ func (s *CommandServer) Pause() {
 }
 
 func (s *CommandServer) Wake() {
+	wakeAt := time.Now().Round(0)
 	recorder := s.powerManager.Recorder()
 	if recorder != nil {
 		recorder.RecordDeviceWake()
 	}
 	instance := s.StartedService.Instance()
-	if instance == nil || instance.PauseManager() == nil {
+	if instance == nil || instance.Box() == nil || instance.PauseManager() == nil {
 		return
+	}
+	if !s.sleepAt.IsZero() && wakeAt.Sub(s.sleepAt) >= closeIdleConnectionsAfterSleep {
+		instance.Box().CloseIdleConnections()
 	}
 	if !C.IsIos {
 		instance.PauseManager().DeviceWake()
