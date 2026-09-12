@@ -273,8 +273,8 @@ func (e *Endpoint) echoLoop(session *Session, done chan struct{}) {
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
 	defer func() {
-		e.echoStarted.Store(false)
 		close(done)
+		e.echoStarted.Store(false)
 	}()
 	for range ticker.C {
 		if !e.started.Load() || !e.ready.Load() || e.suspended.Load() || e.closed.Load() {
@@ -311,8 +311,8 @@ func (e *Endpoint) echoLoop(session *Session, done chan struct{}) {
 func (e *Endpoint) readLoop() {
 	done := e.readDone
 	defer func() {
-		e.readStarted.Store(false)
 		close(done)
+		e.readStarted.Store(false)
 	}()
 	if e.readLoopBatch() {
 		return
