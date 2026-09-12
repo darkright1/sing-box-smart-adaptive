@@ -259,6 +259,13 @@ func (e *Endpoint) echoLoop() {
 }
 
 func (e *Endpoint) readLoop() {
+	if e.readLoopBatch() {
+		return
+	}
+	e.readLoopSingle()
+}
+
+func (e *Endpoint) readLoopSingle() {
 	defer close(e.readDone)
 	var packet [64 * 1024]byte
 	for e.started.Load() {
@@ -275,56 +282,65 @@ func (e *Endpoint) readLoop() {
 			}
 			return
 		}
-		e.lastRx.Store(time.Now().UnixNano())
-		wire, err := e.session.Unwrap(packet[:n])
-		if err != nil {
-			e.logger.Debug("iWAN source-routing packet rejected: ", err)
-			continue
-		}
-		payload, control, err := e.session.Handle(wire)
-		if err != nil {
-			e.logger.Debug("iWAN packet rejected: ", err)
-			continue
-		}
-		switch control.Type {
-		case PTData, PTDataEnc:
-			if len(payload) == 0 {
-				continue
-			}
-			inbound := buf.NewSize(len(payload))
-			_, _ = inbound.Write(payload)
-			if err = e.device.WriteInboundBuffers([]*buf.Buffer{inbound}); err != nil {
-				inbound.Release()
-				select {
-				case e.readErr <- err:
-				default:
-				}
-				return
-			}
-		case PTEchoReq:
-			e.writeControl(BuildEchoResponse(control, payload))
-		case PTIPFrag:
-			fragment, fragmentErr := ParseFrag(wire)
-			if fragmentErr != nil {
-				continue
-			}
-			if payload, fragmentErr = e.frags.Add(fragment, time.Now().UnixNano()); fragmentErr == nil && len(payload) != 0 {
-				inbound := buf.NewSize(len(payload))
-				_, _ = inbound.Write(payload)
-				if fragmentErr = e.device.WriteInboundBuffers([]*buf.Buffer{inbound}); fragmentErr != nil {
-					inbound.Release()
-				}
-			}
-		case PTClose:
-			e.ready.Store(false)
-			e.started.Store(false)
-			select {
-			case e.readErr <- errors.New("iWAN peer closed session"):
-			default:
-			}
+		if !e.processIncomingPacket(packet[:n]) {
 			return
 		}
 	}
+}
+
+// processIncomingPacket consumes one datagram synchronously. The caller must
+// not reuse the receive buffer until this function returns.
+func (e *Endpoint) processIncomingPacket(packet []byte) bool {
+	e.lastRx.Store(time.Now().UnixNano())
+	wire, err := e.session.Unwrap(packet)
+	if err != nil {
+		e.logger.Debug("iWAN source-routing packet rejected: ", err)
+		return true
+	}
+	payload, control, err := e.session.Handle(wire)
+	if err != nil {
+		e.logger.Debug("iWAN packet rejected: ", err)
+		return true
+	}
+	switch control.Type {
+	case PTData, PTDataEnc:
+		if len(payload) == 0 {
+			return true
+		}
+		inbound := buf.NewSize(len(payload))
+		_, _ = inbound.Write(payload)
+		if err = e.device.WriteInboundBuffers([]*buf.Buffer{inbound}); err != nil {
+			inbound.Release()
+			select {
+			case e.readErr <- err:
+			default:
+			}
+			return false
+		}
+	case PTEchoReq:
+		e.writeControl(BuildEchoResponse(control, payload))
+	case PTIPFrag:
+		fragment, fragmentErr := ParseFrag(wire)
+		if fragmentErr != nil {
+			return true
+		}
+		if payload, fragmentErr = e.frags.Add(fragment, time.Now().UnixNano()); fragmentErr == nil && len(payload) != 0 {
+			inbound := buf.NewSize(len(payload))
+			_, _ = inbound.Write(payload)
+			if fragmentErr = e.device.WriteInboundBuffers([]*buf.Buffer{inbound}); fragmentErr != nil {
+				inbound.Release()
+			}
+		}
+	case PTClose:
+		e.ready.Store(false)
+		e.started.Store(false)
+		select {
+		case e.readErr <- errors.New("iWAN peer closed session"):
+		default:
+		}
+		return false
+	}
+	return true
 }
 
 func (e *Endpoint) writeControl(packet []byte) {

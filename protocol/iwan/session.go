@@ -229,11 +229,11 @@ func (s *Session) Handle(packet []byte) (payload []byte, control Header, err err
 // packet.  The links/password are session-scoped so callers cannot
 // accidentally apply another peer's SR credentials.
 func (s *Session) Unwrap(packet []byte) ([]byte, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	if len(packet) == 0 || packet[0] != PTSegRT {
 		return packet, nil
 	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if len(s.links) == 0 || s.srPass == "" {
 		return nil, errors.New("iWAN source-routing packet without session credentials")
 	}
@@ -243,11 +243,11 @@ func (s *Session) Unwrap(packet []byte) ([]byte, error) {
 // Wrap applies the configured source-routing envelope to an inner control or
 // data packet.  It is a no-op when SR is not configured.
 func (s *Session) Wrap(packet []byte) ([]byte, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	if len(s.links) == 0 || s.srPass == "" {
 		return packet, nil
 	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	return WrapSR(packet, s.links, s.srPass, 1)
 }
 
