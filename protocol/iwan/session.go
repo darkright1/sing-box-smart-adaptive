@@ -85,6 +85,9 @@ func (s *Session) Open() ([]byte, error) {
 			return nil, err
 		}
 		s.header.SID = binary.BigEndian.Uint16(b[:2])
+		if s.header.SID == 0 {
+			s.header.SID = 1
+		}
 		s.header.Token = binary.BigEndian.Uint32(b[:])
 		if s.header.Token == 0 {
 			s.header.Token = 1

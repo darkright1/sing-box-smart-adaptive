@@ -188,14 +188,12 @@ func (s *serverRuntime) handleOpen(packet []byte, remote *net.UDPAddr, old *serv
 			continue
 		}
 		if old != nil {
-			ack, ackErr := BuildOpenAck(h, AckFields{MTU: fields.MTU, IP: addr4(old.address), Gateway: addr4(s.pool.Addr().Next()), Encrypt: fields.Encrypt})
-			if ackErr == nil {
-				s.write(old, ack)
-			}
+			// A repeated OPEN from the same source is a reconnect, not an
+			// ACK-only refresh. Replace the old SID/token and device so the
+			// next DATA frame cannot be rejected against stale peer state.
+			s.remove(remote.String())
 		}
-		if old == nil {
-			s.createPeer(h, fields, remote)
-		}
+		s.createPeer(h, fields, remote)
 		return
 	}
 	s.writeRaw(remote, BuildOpenReject(h, []byte("authentication failed")))
@@ -291,10 +289,14 @@ func (s *serverRuntime) allocate() (netip.Addr, bool) {
 	defer s.allocMu.Unlock()
 	base := addr4(s.pool.Addr())
 	limit := uint32(1) << uint32(32-s.pool.Bits())
-	// Reserve the network address and the final broadcast address. The first
-	// usable host is also reserved as the tunnel gateway.
-	for i := uint32(0); i < limit-2; i++ {
-		idx := 2 + s.next.Add(1)%(limit-2)
+	// Reserve the network address, gateway (first host), and final broadcast
+	// address. The remaining range is [2, limit-2] inclusive.
+	usable := limit - 3
+	if usable == 0 {
+		return netip.Addr{}, false
+	}
+	for i := uint32(0); i < usable; i++ {
+		idx := 2 + s.next.Add(1)%usable
 		candidate := base + idx
 		if candidate == 0 {
 			continue

@@ -21,7 +21,7 @@ health/lifecycle reporting.
 - `include/iwan.go`/`include/iwan_stub.go` provide private-build registration
   and a safe public-build rejection.
 
-## Remaining production gates
+## Implemented reliability gates
 
 The old iWAN daemon couples its TUN reader and UDP session loop directly to an
 OS TUN device. It cannot be called from an endpoint without bypassing
@@ -36,6 +36,13 @@ private adapter must provide:
 5. Linux client/server integration tests and a private artifact audit proving
    no iWAN symbols or configuration are present in public builds.
 
-The current private endpoint is client-capable with the gVisor stack. Server
-admission and multi-session routing remain a separate gate; do not deploy the
-server mode until those tests pass.
+The private endpoint now has a Router-backed gVisor/system client path and a
+multi-session UDP server path with bounded OPEN/ACK/ECHO/CLOSE ownership,
+session identity checks, idle-session reaping, reconnect replacement,
+two-piece IPFRAG handling, optional SR wrapping, and address-pool bounds that
+exclude network, gateway, and broadcast addresses.
+
+The endpoint remains behind `with_iwan` because Linux client/server
+interoperability and a private artifact audit are release gates. Performance
+reports must distinguish the raw 117/118 VM baseline from a private iWAN run
+using a Linux `with_iwan` binary and test configuration.
