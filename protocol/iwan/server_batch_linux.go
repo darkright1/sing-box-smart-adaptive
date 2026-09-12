@@ -5,14 +5,27 @@ package iwan
 import (
 	"fmt"
 	"net"
+	"sync"
 	"time"
 
 	"github.com/sagernet/sing/common/buf"
 	"golang.org/x/net/ipv4"
 )
 
-const iwanReadBatchSize = 16
-const iwanWriteBatchSize = 32
+const iwanReadBatchSize = 32
+const iwanWriteBatchSize = 64
+
+type iwanPeerWriteBatchWorkspace struct {
+	messages []ipv4.Message
+	pooled   []pooledWirePacket
+}
+
+var iwanPeerWriteBatchWorkspacePool = sync.Pool{New: func() any {
+	return &iwanPeerWriteBatchWorkspace{
+		messages: make([]ipv4.Message, 0, iwanWriteBatchSize),
+		pooled:   make([]pooledWirePacket, 0, iwanWriteBatchSize),
+	}
+}}
 
 // writePeerBatch amortizes server DATA egress.  The peer lock is owned by the
 // caller; this helper only owns frame lifetime until the kernel accepts the
@@ -22,8 +35,16 @@ func (s *serverRuntime) writePeerBatch(peer *serverPeer, packets []*buf.Buffer) 
 		return false, nil
 	}
 	packetConn := ipv4.NewPacketConn(s.conn)
-	messages := make([]ipv4.Message, 0, iwanWriteBatchSize)
-	pooled := make([]pooledWirePacket, 0, iwanWriteBatchSize)
+	workspace := iwanPeerWriteBatchWorkspacePool.Get().(*iwanPeerWriteBatchWorkspace)
+	messages := workspace.messages[:0]
+	pooled := workspace.pooled[:0]
+	defer func() {
+		clear(workspace.messages)
+		clear(workspace.pooled)
+		workspace.messages = messages[:0]
+		workspace.pooled = pooled[:0]
+		iwanPeerWriteBatchWorkspacePool.Put(workspace)
+	}()
 	flush := func() error {
 		for len(messages) > 0 {
 			n, err := packetConn.WriteBatch(messages, 0)

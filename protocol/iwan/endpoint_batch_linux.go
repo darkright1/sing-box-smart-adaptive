@@ -7,13 +7,26 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"sync"
 
 	"github.com/sagernet/sing/common/buf"
 	"golang.org/x/net/ipv4"
 )
 
-const iwanClientReadBatchSize = 16
-const iwanClientWriteBatchSize = 32
+const iwanClientReadBatchSize = 32
+const iwanClientWriteBatchSize = 64
+
+type iwanWriteBatchWorkspace struct {
+	messages []ipv4.Message
+	pooled   []pooledWirePacket
+}
+
+var iwanWriteBatchWorkspacePool = sync.Pool{New: func() any {
+	return &iwanWriteBatchWorkspace{
+		messages: make([]ipv4.Message, 0, iwanClientWriteBatchSize),
+		pooled:   make([]pooledWirePacket, 0, iwanClientWriteBatchSize),
+	}
+}}
 
 // writeOutboundBatch is the native IPv4 egress fast path.  Framing and
 // encryption still happen in Go, but the syscall boundary is amortized across
@@ -24,8 +37,16 @@ func (e *Endpoint) writeOutboundBatch(packetBuffers []*buf.Buffer) (bool, error)
 		return false, nil
 	}
 	packetConn := ipv4.NewPacketConn(conn)
-	messages := make([]ipv4.Message, 0, iwanClientWriteBatchSize)
-	pooled := make([]pooledWirePacket, 0, iwanClientWriteBatchSize)
+	workspace := iwanWriteBatchWorkspacePool.Get().(*iwanWriteBatchWorkspace)
+	messages := workspace.messages[:0]
+	pooled := workspace.pooled[:0]
+	defer func() {
+		clear(workspace.messages)
+		clear(workspace.pooled)
+		workspace.messages = messages[:0]
+		workspace.pooled = pooled[:0]
+		iwanWriteBatchWorkspacePool.Put(workspace)
+	}()
 	flush := func() error {
 		for len(messages) > 0 {
 			n, err := packetConn.WriteBatch(messages, 0)
