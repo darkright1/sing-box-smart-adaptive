@@ -118,12 +118,36 @@ func (s *Session) Open() ([]byte, error) {
 // returned without an additional copy; the caller owns the input buffer until
 // it is done with the returned slice.
 func (s *Session) Handle(packet []byte) (payload []byte, control Header, err error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	control, err = ParseHeader(packet)
 	if err != nil {
 		return nil, Header{}, err
 	}
+	// DATA is the high-volume path. Once OPENACK has installed the immutable
+	// wire snapshot, validation and decryption no longer need the control
+	// mutex. Control frames below still serialize state transitions.
+	if control.Type == PTData || control.Type == PTDataEnc {
+		state := s.wire.Load()
+		if state == nil {
+			return nil, control, errors.New("iWAN session is not ready")
+		}
+		if control.SID != state.header.SID || control.Token != state.header.Token {
+			return nil, control, errors.New("iWAN session identity mismatch")
+		}
+		_, payload, err = parseDataView(packet)
+		if err != nil {
+			return nil, control, err
+		}
+		if control.Type == PTDataEnc {
+			if !state.encrypted {
+				return nil, control, errors.New("unexpected encrypted iWAN data")
+			}
+			xorInPlace(state.key, payload, payload)
+		}
+		return payload, control, nil
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	switch control.Type {
 	case PTOpenAck:
 		if !s.client {
@@ -181,24 +205,6 @@ func (s *Session) Handle(packet []byte) (payload []byte, control Header, err err
 			return nil, control, errors.New("iWAN OPEN reject session identity mismatch")
 		}
 		return nil, control, fmt.Errorf("iWAN OPEN rejected")
-	case PTData, PTDataEnc:
-		if !s.ready {
-			return nil, control, errors.New("iWAN session is not ready")
-		}
-		if control.SID != s.header.SID || control.Token != s.header.Token {
-			return nil, control, errors.New("iWAN session identity mismatch")
-		}
-		_, payload, err = parseDataView(packet)
-		if err != nil {
-			return nil, control, err
-		}
-		if control.Type == PTDataEnc {
-			if !s.encrypt {
-				return nil, control, errors.New("unexpected encrypted iWAN data")
-			}
-			xorInPlace(s.key, payload, payload)
-		}
-		return payload, control, nil
 	case PTIPFrag, PTEchoReq, PTEchoResp, PTClose:
 		if !s.ready {
 			return nil, control, errors.New("iWAN session is not ready")
