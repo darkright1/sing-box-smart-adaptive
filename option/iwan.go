@@ -34,5 +34,8 @@ type IWANEndpointOptions struct {
 	Gateway    *badoption.Addr                `json:"gateway,omitempty"`
 	DNS        badoption.Listable[netip.Addr] `json:"dns,omitempty"`
 	Users      []auth.User                    `json:"users,omitempty"`
+	// OnDemand suspends an unused client session and resumes it on first use.
+	// The virtual device is retained so resuming does not recreate host routes.
+	OnDemand bool `json:"on_demand,omitempty"`
 	DialerOptions
 }

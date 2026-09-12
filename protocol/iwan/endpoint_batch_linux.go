@@ -26,18 +26,19 @@ func (e *Endpoint) readLoopBatch() bool {
 	if !isIPv4UDPConn(conn) {
 		return false
 	}
-	defer close(e.readDone)
 	packetConn := ipv4.NewPacketConn(conn)
 	messages := make([]ipv4.Message, iwanClientReadBatchSize)
 	for i := range messages {
 		messages[i].Buffers = [][]byte{make([]byte, 64*1024)}
 	}
-	for e.started.Load() {
+	for e.started.Load() && !e.suspended.Load() {
 		n, err := packetConn.ReadBatch(messages, 0)
 		if err != nil {
-			wasRunning := e.started.Load()
+			wasRunning := e.started.Load() && !e.suspended.Load() && !e.closed.Load()
 			e.ready.Store(false)
-			e.started.Store(false)
+			if !e.suspended.Load() && !e.closed.Load() && !e.onDemand() {
+				e.started.Store(false)
+			}
 			if wasRunning && !errors.Is(err, net.ErrClosed) && !errors.Is(err, io.EOF) {
 				select {
 				case e.readErr <- err:

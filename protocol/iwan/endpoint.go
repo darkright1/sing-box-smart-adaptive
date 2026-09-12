@@ -32,6 +32,7 @@ var (
 	_ adapter.Endpoint                    = (*Endpoint)(nil)
 	_ adapter.FlowOutbound                = (*Endpoint)(nil)
 	_ adapter.OutboundWithPreferredRoutes = (*Endpoint)(nil)
+	_ adapter.OnDemandEndpoint            = (*Endpoint)(nil)
 )
 
 func RegisterEndpoint(registry *endpoint.Registry) {
@@ -56,6 +57,11 @@ type Endpoint struct {
 	readDone    chan struct{}
 	readErr     chan error
 	readStarted atomic.Bool
+	echoStarted atomic.Bool
+	echoDone    chan struct{}
+	closed      atomic.Bool
+	suspended   atomic.Bool
+	lifecycleMu sync.Mutex
 	lastRx      atomic.Int64
 	fragID      atomic.Uint32
 	writeMu     sync.Mutex
@@ -148,6 +154,7 @@ func (e *Endpoint) Start(stage adapter.StartStage) error {
 	if e.started.Swap(true) {
 		return nil
 	}
+	e.closed.Store(false)
 	if e.options.Mode == "server" {
 		if err := e.server.start(); err != nil {
 			e.started.Store(false)
@@ -156,8 +163,23 @@ func (e *Endpoint) Start(stage adapter.StartStage) error {
 		e.ready.Store(true)
 		return nil
 	}
+	e.lifecycleMu.Lock()
+	defer e.lifecycleMu.Unlock()
+	return e.startClientLocked(e.ctx, true)
+}
+
+// startClientLocked establishes a fresh authenticated session. The virtual
+// device is created once and retained across on-demand suspends; only the
+// network session and its reader goroutines are replaced.
+func (e *Endpoint) startClientLocked(ctx context.Context, initial bool) error {
+	if e.closed.Load() {
+		return net.ErrClosed
+	}
+	if !initial {
+		e.started.Store(true)
+	}
 	remote := M.ParseSocksaddrHostPort(e.options.Server, e.options.ServerPort)
-	conn, err := e.dialer.DialContext(e.ctx, N.NetworkUDP, remote)
+	conn, err := e.dialer.DialContext(ctx, N.NetworkUDP, remote)
 	if err != nil {
 		e.started.Store(false)
 		return err
@@ -166,7 +188,18 @@ func (e *Endpoint) Start(stage adapter.StartStage) error {
 	if bufferErr := tunePacketSocket(conn); bufferErr != nil {
 		e.logger.Debug("iWAN socket buffer tuning unavailable: ", bufferErr)
 	}
-	open, err := e.session.Open()
+	session, err := NewSession(SessionOptions{
+		Client: true, Username: e.options.Username, Password: e.options.Password,
+		SRPassword: e.options.SRPassword, MTU: uint16(e.options.MTU), Encrypt: e.options.Encrypt,
+		PipeID: e.options.PipeID, PipeIndex: e.options.PipeIndex, Links: e.options.Links,
+	})
+	if err != nil {
+		_ = conn.Close()
+		e.started.Store(false)
+		return err
+	}
+	e.session = session
+	open, err := session.Open()
 	if err != nil {
 		_ = conn.Close()
 		e.started.Store(false)
@@ -190,7 +223,7 @@ func (e *Endpoint) Start(stage adapter.StartStage) error {
 			e.started.Store(false)
 			return E.Cause(readErr, "iWAN OPEN")
 		}
-		_, control, handleErr := e.session.Handle(packet[:n])
+		_, control, handleErr := session.Handle(packet[:n])
 		if handleErr != nil {
 			if control.Type == PTOpenRej {
 				_ = conn.Close()
@@ -199,12 +232,12 @@ func (e *Endpoint) Start(stage adapter.StartStage) error {
 			}
 			continue
 		}
-		if control.Type == PTOpenAck && e.session.Ready() {
+		if control.Type == PTOpenAck && session.Ready() {
 			break
 		}
 	}
 	_ = conn.SetReadDeadline(time.Time{})
-	address, _ := e.session.Address()
+	address, _ := session.Address()
 	if !address.IsValid() {
 		_ = conn.Close()
 		e.started.Store(false)
@@ -217,27 +250,37 @@ func (e *Endpoint) Start(stage adapter.StartStage) error {
 			return err
 		}
 	}
-	if err = e.device.Start(); err != nil {
-		_ = conn.Close()
-		e.started.Store(false)
-		return err
+	if initial {
+		if err = e.device.Start(); err != nil {
+			_ = conn.Close()
+			e.started.Store(false)
+			return err
+		}
 	}
 	e.ready.Store(true)
+	e.suspended.Store(false)
 	e.lastRx.Store(time.Now().UnixNano())
+	e.readDone = make(chan struct{})
 	e.readStarted.Store(true)
+	e.echoDone = make(chan struct{})
+	e.echoStarted.Store(true)
 	go e.readLoop()
-	go e.echoLoop()
+	go e.echoLoop(session, e.echoDone)
 	return nil
 }
 
-func (e *Endpoint) echoLoop() {
+func (e *Endpoint) echoLoop(session *Session, done chan struct{}) {
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
+	defer func() {
+		e.echoStarted.Store(false)
+		close(done)
+	}()
 	for range ticker.C {
-		if !e.started.Load() || !e.ready.Load() {
+		if !e.started.Load() || !e.ready.Load() || e.suspended.Load() || e.closed.Load() {
 			return
 		}
-		packet, err := e.session.Echo()
+		packet, err := session.Echo()
 		if err != nil {
 			return
 		}
@@ -245,13 +288,20 @@ func (e *Endpoint) echoLoop() {
 			// A missing ECHO response means the UDP session is no longer
 			// usable. Closing the socket wakes readLoop and lets the normal
 			// endpoint lifecycle report the failure to its owner.
-			e.started.Store(false)
+			e.lifecycleMu.Lock()
 			e.ready.Store(false)
+			if !e.onDemand() {
+				e.started.Store(false)
+			}
+			conn := e.conn
+			e.lifecycleMu.Unlock()
 			select {
 			case e.readErr <- errors.New("iWAN echo timeout"):
 			default:
 			}
-			_ = e.conn.Close()
+			if conn != nil {
+				_ = conn.Close()
+			}
 			return
 		}
 		e.writeControl(packet)
@@ -259,6 +309,11 @@ func (e *Endpoint) echoLoop() {
 }
 
 func (e *Endpoint) readLoop() {
+	done := e.readDone
+	defer func() {
+		e.readStarted.Store(false)
+		close(done)
+	}()
 	if e.readLoopBatch() {
 		return
 	}
@@ -266,14 +321,16 @@ func (e *Endpoint) readLoop() {
 }
 
 func (e *Endpoint) readLoopSingle() {
-	defer close(e.readDone)
 	var packet [64 * 1024]byte
-	for e.started.Load() {
-		n, err := e.conn.Read(packet[:])
+	conn := e.conn
+	for e.started.Load() && !e.suspended.Load() {
+		n, err := conn.Read(packet[:])
 		if err != nil {
-			wasRunning := e.started.Load()
+			wasRunning := e.started.Load() && !e.suspended.Load() && !e.closed.Load()
 			e.ready.Store(false)
-			e.started.Store(false)
+			if !e.suspended.Load() && !e.closed.Load() && !e.onDemand() {
+				e.started.Store(false)
+			}
 			if wasRunning && !errors.Is(err, net.ErrClosed) && !errors.Is(err, io.EOF) {
 				select {
 				case e.readErr <- err:
@@ -344,6 +401,8 @@ func (e *Endpoint) processIncomingPacket(packet []byte) bool {
 }
 
 func (e *Endpoint) writeControl(packet []byte) {
+	e.lifecycleMu.Lock()
+	defer e.lifecycleMu.Unlock()
 	e.writeMu.Lock()
 	defer e.writeMu.Unlock()
 	if e.conn != nil {
@@ -351,9 +410,96 @@ func (e *Endpoint) writeControl(packet []byte) {
 	}
 }
 
+func (e *Endpoint) onDemand() bool {
+	return e.options.OnDemand && e.options.Mode == "client"
+}
+
+func (e *Endpoint) OnDemand() bool { return e.onDemand() }
+
+func (e *Endpoint) SetKeepIdleConnections(keep bool) {
+	if keep || !e.onDemand() {
+		return
+	}
+	e.suspend()
+}
+
+// suspend closes only the authenticated UDP session. The virtual device is
+// retained, so resuming does not recreate host routes or the gVisor stack.
+func (e *Endpoint) suspend() {
+	e.lifecycleMu.Lock()
+	if e.closed.Load() || e.options.Mode != "client" || e.suspended.Load() || e.conn == nil {
+		e.lifecycleMu.Unlock()
+		return
+	}
+	e.suspended.Store(true)
+	e.ready.Store(false)
+	conn := e.conn
+	e.conn = nil
+	done := e.readDone
+	echoDone := e.echoDone
+	_ = conn.Close()
+	e.lifecycleMu.Unlock()
+	if done != nil {
+		<-done
+	}
+	if echoDone != nil {
+		<-echoDone
+	}
+}
+
+// ensureReady resumes an on-demand client after the reference manager has
+// suspended it. Waiting for the previous reader avoids overlapping sessions
+// and makes the reconnect boundary explicit to the endpoint owner.
+func (e *Endpoint) ensureReady(ctx context.Context) error {
+	if e.options.Mode != "client" {
+		if !e.ready.Load() {
+			return E.New("iWAN endpoint is not ready")
+		}
+		return nil
+	}
+	if e.ready.Load() && !e.suspended.Load() {
+		return nil
+	}
+	if !e.onDemand() {
+		return E.New("iWAN endpoint is not ready")
+	}
+	for {
+		e.lifecycleMu.Lock()
+		if e.ready.Load() && !e.suspended.Load() {
+			e.lifecycleMu.Unlock()
+			return nil
+		}
+		if e.closed.Load() {
+			e.lifecycleMu.Unlock()
+			return net.ErrClosed
+		}
+		if e.readStarted.Load() || e.echoStarted.Load() {
+			done := e.readDone
+			echoDone := e.echoDone
+			e.lifecycleMu.Unlock()
+			if done != nil {
+				<-done
+			}
+			if echoDone != nil {
+				<-echoDone
+			}
+			continue
+		}
+		e.suspended.Store(false)
+		err := e.startClientLocked(ctx, false)
+		e.lifecycleMu.Unlock()
+		return err
+	}
+}
+
 func (e *Endpoint) writeOutbound(packetBuffers []*buf.Buffer) error {
 	defer buf.ReleaseMulti(packetBuffers)
-	if !e.ready.Load() {
+	if err := e.ensureReady(e.ctx); err != nil {
+		return err
+	}
+	e.lifecycleMu.Lock()
+	defer e.lifecycleMu.Unlock()
+	if !e.ready.Load() || e.conn == nil || e.session == nil {
 		return E.New("iWAN endpoint is not ready")
 	}
 	e.writeMu.Lock()
@@ -387,20 +533,27 @@ func (e *Endpoint) writeOutbound(packetBuffers []*buf.Buffer) error {
 func (e *Endpoint) Close() error {
 	var err error
 	e.closeOnce.Do(func() {
+		e.lifecycleMu.Lock()
+		e.closed.Store(true)
+		e.suspended.Store(false)
 		e.started.Store(false)
 		e.ready.Store(false)
 		if e.options.Mode == "server" {
 			if e.server != nil {
 				err = e.server.close()
 			}
+			e.lifecycleMu.Unlock()
 			return
 		}
 		if e.conn != nil {
 			if e.session != nil && e.session.Ready() {
-				e.writeControl(BuildClose(e.session.DataHeader(), nil))
+				e.writeMu.Lock()
+				_, _ = e.conn.Write(BuildClose(e.session.DataHeader(), nil))
+				e.writeMu.Unlock()
 			}
 			err = e.conn.Close()
 		}
+		e.lifecycleMu.Unlock()
 		if e.device != nil {
 			if deviceErr := e.device.Close(); err == nil {
 				err = deviceErr
@@ -408,6 +561,9 @@ func (e *Endpoint) Close() error {
 		}
 		if e.readStarted.Load() {
 			<-e.readDone
+		}
+		if e.echoStarted.Load() && e.echoDone != nil {
+			<-e.echoDone
 		}
 	})
 	return err
@@ -448,9 +604,6 @@ func (e *Endpoint) WritePackets(packets [][]byte) error {
 	if e.device == nil {
 		return E.New("iWAN server endpoint cannot write packets without a peer")
 	}
-	if !e.ready.Load() {
-		return E.New("iWAN endpoint is not ready")
-	}
 	packetBuffers := make([]*buf.Buffer, 0, len(packets))
 	for _, packet := range packets {
 		packetBuffer := buf.NewSize(len(packet))
@@ -490,8 +643,8 @@ func (e *Endpoint) DialContext(ctx context.Context, network string, destination 
 	if e.options.Mode != "client" {
 		return nil, E.New("iWAN server endpoint cannot dial outbound connections")
 	}
-	if !e.ready.Load() {
-		return nil, E.New("iWAN endpoint is not ready")
+	if err := e.ensureReady(ctx); err != nil {
+		return nil, err
 	}
 	if destination.IsDomain() {
 		addresses, err := e.dnsRouter.Lookup(ctx, destination.Fqdn, adapter.DNSQueryOptions{})
@@ -510,8 +663,8 @@ func (e *Endpoint) ListenPacketWithDestination(ctx context.Context, destination 
 	if e.options.Mode != "client" {
 		return nil, netip.Addr{}, E.New("iWAN server endpoint cannot listen outbound packets")
 	}
-	if !e.ready.Load() {
-		return nil, netip.Addr{}, E.New("iWAN endpoint is not ready")
+	if err := e.ensureReady(ctx); err != nil {
+		return nil, netip.Addr{}, err
 	}
 	if destination.IsDomain() {
 		addresses, err := e.dnsRouter.Lookup(ctx, destination.Fqdn, adapter.DNSQueryOptions{})
