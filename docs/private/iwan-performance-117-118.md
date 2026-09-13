@@ -132,3 +132,19 @@ errors during the run. The larger socket queue therefore removes a wrapper
 configuration gap but does not close the packet-rate/TUN-reader bottleneck;
 the 1 Gbit/s loss-free gate remains unmet. The temporary sysctl changes and
 lab processes were stopped and the original 4 MiB kernel limits restored.
+
+## 2026-09-13 client dispatch hot-path pass
+
+The client-side native path now retains the IPv4 batch-socket wrapper for the
+authenticated UDP session instead of constructing one for every TUN batch.
+The Linux multi-queue dispatcher also uses a fixed stack batch and pre-sized
+per-queue write buckets; its flow hash is an inline FNV-1a implementation with
+no `hash.Hash` or temporary one-byte slices. These changes reduce allocator and
+lock pressure without changing packet ordering, queue sharding, MTU handling,
+or the bounded backpressure behavior.
+
+The change was validated on Linux with `go test -race` and `go vet` for the
+iWAN protocol and device packages, plus a full tagged build. A fresh line-rate
+throughput run for this exact revision is still required; the last verified
+integrated smoke result remains 389 Mbit/s at a 400 Mbit/s offer (2.8% loss)
+and 454 Mbit/s at a 1 Gbit/s offer (54% loss).
