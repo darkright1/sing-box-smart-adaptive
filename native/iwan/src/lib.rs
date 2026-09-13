@@ -123,6 +123,13 @@ mod tests {
     use std::ptr;
 
     #[test]
+    fn c_abi_layout_is_stable() {
+        assert_eq!(std::mem::size_of::<IwanHeader>(), 8);
+        assert_eq!(std::mem::align_of::<IwanHeader>(), 4);
+        assert_eq!(std::mem::size_of::<IwanPacketDesc>(), 48);
+    }
+
+    #[test]
     fn builds_plain_and_encrypted_frames() {
         let header = IwanHeader { kind: 0x14, encrypt: 0, sid_be: 7u16.to_be(), token_be: 11u32.to_be() };
         let payload = b"native iwan";
