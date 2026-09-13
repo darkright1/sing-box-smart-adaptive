@@ -53,21 +53,20 @@ benchmark, because the generator is not a native line-rate traffic tool.
 ## Integrated sing-box endpoint smoke benchmark
 
 On 2026-09-13 a Linux `with_iwan,with_gvisor` binary from revision
-`089ae760` was run on VM117 (server) and VM118 (client). The client used a
-SOCKS bridge to an iperf3 target on the server, so these results are
-**non-qualifying smoke measurements** under the release gate above (they are
-not a direct tunnel-address test and cannot establish line-rate capability).
+`e7e6fc46` was run on VM117 (server) and VM118 (client). The client used a
+direct tunnel-address route to an iperf3 target bound to the server's shared
+native TUN. These are still **non-qualifying smoke measurements** under the
+release gate above: the guests have two vCPUs and a single virtio interface,
+and the run was not the required five 60-second trials.
 
 | Client mode | TCP streams | Offered/result | Retransmits |
 | --- | ---: | ---: | ---: |
-| `system:false` (gVisor) | 4 | 216.0 Mbit/s sent, 198.9 Mbit/s received | 39 |
-| `system:true` (kernel TUN + gVisor fallback) | 4 | 226.6 Mbit/s sent, 203.6 Mbit/s received | 49 |
+| `system:true` (shared kernel TUN) | 1 | 182.8 Mbit/s sent, 181.5 Mbit/s received | 50 |
+| `system:true` (shared kernel TUN, reverse) | 1 | 146.3 Mbit/s received | 140 |
 
-The same SOCKS bridge at 100 Mbit/s UDP offered 62.9 Mbit/s received with
-approximately 7.4% sequence gaps. The Python receiver is not a line-rate
-instrument, but the loss is sufficient to reject the current compatibility
-path for the 1 Gbit/s zero-loss target. The batch workspace change in
-`089ae760` did not materially change this ceiling, confirming that the
-dominant cost is the userspace/gVisor L3 path rather than per-call slice
-allocation. Native Rust L3 dataplane work and a direct tunnel-address harness
-remain required before any production performance claim.
+At a 1 Gbit/s UDP offer over the direct tunnel address, the receiver measured
+353 Mbit/s and 64.4% loss. This is a valid functional-path result, but it
+rejects the current Go/native-TUN path for the 1 Gbit/s zero-loss target. The
+remaining bottleneck is packet-rate processing and framing in the Go endpoint;
+the native Rust dataplane and multiqueue harness described above remain
+required before any production performance claim.
