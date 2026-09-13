@@ -3,7 +3,6 @@
 package iwan
 
 import (
-	"hash/fnv"
 	"sync"
 
 	"github.com/sagernet/sing-tun"
@@ -153,23 +152,26 @@ func (d *systemDevicePacketDispatcher) Close() {
 func (d *systemDevicePacketDispatcher) worker(shard <-chan *buf.Buffer) {
 	defer d.workers.Done()
 	for packet := range shard {
-		batch := []*buf.Buffer{packet}
-		for len(batch) < systemDeviceWriteBatchSize {
+		var batch [systemDeviceWriteBatchSize]*buf.Buffer
+		batch[0] = packet
+		batchLen := 1
+		for batchLen < len(batch) {
 			select {
 			case next := <-shard:
 				if next == nil {
 					goto flush
 				}
-				batch = append(batch, next)
+				batch[batchLen] = next
+				batchLen++
 			default:
 				goto flush
 			}
 		}
 	flush:
-		if err := d.device.writeOutbound(batch); err != nil {
+		if err := d.device.writeOutbound(batch[:batchLen]); err != nil {
 			d.device.options.Logger.Error(E.Cause(err, "write multi-queue packet batch"))
 		}
-		for _, item := range batch {
+		for _, item := range batch[:batchLen] {
 			item.DecRef()
 			d.recycle(item)
 		}
@@ -177,7 +179,12 @@ func (d *systemDevicePacketDispatcher) worker(shard <-chan *buf.Buffer) {
 }
 
 func systemPacketFlowHash(packet []byte) uint32 {
-	hash := fnv.New32a()
+	// Inline FNV-1a avoids constructing a hash.Hash and temporary one-byte
+	// slices for every packet dispatched from the TUN queues.
+	const offset32 = uint32(2166136261)
+	const prime32 = uint32(16777619)
+	hashByte := func(hash uint32, value byte) uint32 { return (hash ^ uint32(value)) * prime32 }
+	hash := offset32
 	if len(packet) == 0 {
 		return 0
 	}
@@ -187,23 +194,33 @@ func systemPacketFlowHash(packet []byte) uint32 {
 		if headerLength < 20 || headerLength > len(packet) {
 			headerLength = 20
 		}
-		_, _ = hash.Write(packet[12:20])
-		protocol := packet[9]
-		_, _ = hash.Write([]byte{protocol})
-		if (protocol == 6 || protocol == 17) && len(packet) >= headerLength+4 {
-			_, _ = hash.Write(packet[headerLength : headerLength+4])
+		for _, value := range packet[12:20] {
+			hash = hashByte(hash, value)
 		}
-		return hash.Sum32()
+		protocol := packet[9]
+		hash = hashByte(hash, protocol)
+		if (protocol == 6 || protocol == 17) && len(packet) >= headerLength+4 {
+			for _, value := range packet[headerLength : headerLength+4] {
+				hash = hashByte(hash, value)
+			}
+		}
+		return hash
 	}
 	if version == header.IPv6Version && len(packet) >= 40 {
-		_, _ = hash.Write(packet[8:40])
-		protocol := packet[6]
-		_, _ = hash.Write([]byte{protocol})
-		if (protocol == 6 || protocol == 17) && len(packet) >= 44 {
-			_, _ = hash.Write(packet[40:44])
+		for _, value := range packet[8:40] {
+			hash = hashByte(hash, value)
 		}
-		return hash.Sum32()
+		protocol := packet[6]
+		hash = hashByte(hash, protocol)
+		if (protocol == 6 || protocol == 17) && len(packet) >= 44 {
+			for _, value := range packet[40:44] {
+				hash = hashByte(hash, value)
+			}
+		}
+		return hash
 	}
-	_, _ = hash.Write(packet)
-	return hash.Sum32()
+	for _, value := range packet {
+		hash = hashByte(hash, value)
+	}
+	return hash
 }

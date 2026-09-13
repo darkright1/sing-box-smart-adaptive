@@ -26,6 +26,7 @@ import (
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
 	"github.com/sagernet/sing/service"
+	"golang.org/x/net/ipv4"
 )
 
 var (
@@ -41,14 +42,18 @@ func RegisterEndpoint(registry *endpoint.Registry) {
 
 type Endpoint struct {
 	endpoint.Adapter
-	ctx         context.Context
-	router      adapter.Router
-	dnsRouter   adapter.DNSRouter
-	logger      log.ContextLogger
-	options     option.IWANEndpointOptions
-	dialer      N.Dialer
-	device      transport.Device
-	conn        net.Conn
+	ctx       context.Context
+	router    adapter.Router
+	dnsRouter adapter.DNSRouter
+	logger    log.ContextLogger
+	options   option.IWANEndpointOptions
+	dialer    N.Dialer
+	device    transport.Device
+	conn      net.Conn
+	// packetConn is the immutable IPv4 batch wrapper for conn.  Keeping it
+	// with the authenticated session avoids constructing an x/net wrapper for
+	// every TUN batch while still replacing it atomically at reconnect time.
+	packetConn  *ipv4.PacketConn
 	session     *Session
 	server      *serverRuntime
 	closeOnce   sync.Once
@@ -186,6 +191,10 @@ func (e *Endpoint) startClientLocked(ctx context.Context, initial bool) error {
 		return err
 	}
 	e.conn = conn
+	e.packetConn = nil
+	if udpConn, ok := conn.(*net.UDPConn); ok && isIPv4UDPConn(udpConn) {
+		e.packetConn = ipv4.NewPacketConn(udpConn)
+	}
 	if bufferErr := tunePacketSocket(conn); bufferErr != nil {
 		e.logger.Debug("iWAN socket buffer tuning unavailable: ", bufferErr)
 	}
@@ -475,6 +484,7 @@ func (e *Endpoint) suspend() {
 	e.ready.Store(false)
 	conn := e.conn
 	e.conn = nil
+	e.packetConn = nil
 	done := e.readDone
 	echoDone := e.echoDone
 	_ = conn.Close()
@@ -543,6 +553,7 @@ func (e *Endpoint) writeOutbound(packetBuffers []*buf.Buffer) error {
 		return E.New("iWAN endpoint is not ready")
 	}
 	conn := e.conn
+	packetConn := e.packetConn
 	session := e.session
 	mtu := e.options.MTU
 	e.lifecycleMu.Unlock()
@@ -550,7 +561,7 @@ func (e *Endpoint) writeOutbound(packetBuffers []*buf.Buffer) error {
 	// establishment and net.Conn permits concurrent method calls, so keep the
 	// lifecycle lock out of the framing and syscall hot path. Control frames
 	// continue to use writeMu below.
-	if handled, err := e.writeOutboundBatch(conn, session, mtu, packetBuffers); handled {
+	if handled, err := e.writeOutboundBatch(conn, packetConn, session, mtu, packetBuffers); handled {
 		return err
 	}
 	for _, packetBuffer := range packetBuffers {
@@ -601,6 +612,7 @@ func (e *Endpoint) Close() error {
 				e.writeMu.Unlock()
 			}
 			err = e.conn.Close()
+			e.packetConn = nil
 		}
 		e.lifecycleMu.Unlock()
 		if e.device != nil {

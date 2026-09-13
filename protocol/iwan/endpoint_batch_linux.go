@@ -34,12 +34,14 @@ var iwanWriteBatchWorkspacePool = sync.Pool{New: func() any {
 // writeOutboundBatch is the native IPv4 egress fast path.  Framing and
 // encryption still happen in Go, but the syscall boundary is amortized across
 // a batch and all pooled frames remain owned until WriteBatch returns.
-func (e *Endpoint) writeOutboundBatch(conn net.Conn, session *Session, mtu uint32, packetBuffers []*buf.Buffer) (bool, error) {
+func (e *Endpoint) writeOutboundBatch(conn net.Conn, packetConn *ipv4.PacketConn, session *Session, mtu uint32, packetBuffers []*buf.Buffer) (bool, error) {
 	udpConn, ok := conn.(*net.UDPConn)
 	if !ok || !isIPv4UDPConn(udpConn) {
 		return false, nil
 	}
-	packetConn := ipv4.NewPacketConn(udpConn)
+	if packetConn == nil {
+		packetConn = ipv4.NewPacketConn(udpConn)
+	}
 	workspace := iwanWriteBatchWorkspacePool.Get().(*iwanWriteBatchWorkspace)
 	messages := workspace.messages[:0]
 	pooled := workspace.pooled[:0]
