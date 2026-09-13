@@ -11,6 +11,12 @@ The production target is the Linux native L3 path. The current `system: false`
 gVisor/Router path remains a compatibility mode for per-flow sing-box routing,
 but it is not eligible for the line-rate performance claim.
 
+Current implementation status: the Go Linux path has bounded multi-queue TUN
+dispatch, batched IPv4 UDP I/O, pooled DATA/IPFRAG frames, borrowed fragment
+views, and bounded reassembly state. The private Rust native dataplane,
+GSO/GRO conversion, and native-L3 server path are not implemented in this
+branch and must not be implied by a Go build or by the microbenchmarks below.
+
 The release gate is deliberately strict:
 
 - TCP receive throughput must be at least 90% of the same-host direct baseline
@@ -29,12 +35,12 @@ already reaches it.
 
 The current integrated endpoint has several packet-rate ceilings:
 
-1. `writeOutbound` and `writePeer` call `UDPConn.Write`/`WriteToUDP` once per
-   packet under shared locks; receive batching therefore loses most of its
-   benefit on egress.
-2. MTU fragmentation still creates temporary payload copies and slices unless
-   it uses the pooled two-piece builder; this is a high-PPS allocation spike
-   on reduced-MTU links.
+1. Non-native/IPv6 and wrapped transports still call `UDPConn.Write`/
+   `WriteToUDP` once per packet under shared locks; the Linux native IPv4 path
+   uses batched I/O, but the compatibility fallbacks do not.
+2. MTU fragmentation is pooled on the Linux packet writers; the remaining
+   allocation cost is in source-routing wrapping and gVisor handoff, not the
+   two-piece IPFRAG builder itself.
 3. Client and server data packets are copied into new `buf.Buffer` objects,
    followed by another gVisor buffer copy. Packet ownership is not carried
    across the whole receive-decode-forward-write transaction.
