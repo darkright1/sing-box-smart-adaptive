@@ -71,6 +71,33 @@ func TestWirePacketPoolRoundTrip(t *testing.T) {
 	}
 }
 
+func TestFragmentDataPooledMatchesWireFormat(t *testing.T) {
+	h := Header{Type: PTData, Encrypt: 1, SID: 7, Token: 11}
+	payload := make([]byte, 1500)
+	for i := range payload {
+		payload[i] = byte(i)
+	}
+	want, err := FragmentData(h, payload, 700, 19)
+	if err != nil || len(want) != 2 {
+		t.Fatalf("plain fragmentation: %v", err)
+	}
+	first, firstPool, second, secondPool, err := FragmentDataPooled(h, payload, 700, 19)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer releaseWirePacket(first, firstPool)
+	defer releaseWirePacket(second, secondPool)
+	if !bytes.Equal(first, want[0]) || !bytes.Equal(second, want[1]) {
+		t.Fatal("pooled fragmentation changed the wire format")
+	}
+	if got, err := ParseFrag(first); err != nil || got.Offset != 0 || got.EOP {
+		t.Fatalf("first fragment parse: %v", err)
+	}
+	if got, err := ParseFrag(second); err != nil || !got.EOP || int(got.Offset)+len(got.Payload) != len(payload) {
+		t.Fatalf("last fragment parse: %v", err)
+	}
+}
+
 func TestSRRoundTripAndKeyPadding(t *testing.T) {
 	inner := BuildData(Header{SID: 4, Token: 5}, []byte("payload that crosses one AES block"), "u", "p", false)
 	wrapped, err := WrapSR(inner, []uint32{7, 9}, "123456789012345678901234567890", 1)

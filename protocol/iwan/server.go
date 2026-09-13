@@ -546,19 +546,32 @@ func (s *serverRuntime) writePeer(peer *serverPeer, packets []*buf.Buffer) error
 	}
 	for _, packet := range packets {
 		if packet.Len()+HeaderLen > int(peer.device.PortMTU()) {
-			fragments, fragmentErr := FragmentData(peer.header, packet.Bytes(), int(peer.device.PortMTU()), s.fragID.Add(1))
+			first, firstPool, second, secondPool, fragmentErr := FragmentDataPooled(peer.header, packet.Bytes(), int(peer.device.PortMTU()), s.fragID.Add(1))
 			if fragmentErr != nil {
 				return fragmentErr
 			}
-			for _, fragment := range fragments {
-				wire, wrapErr := s.wrapPeer(peer, fragment)
-				if wrapErr != nil {
-					return wrapErr
-				}
-				if _, err := s.conn.WriteToUDP(wire, peer.remote); err != nil {
-					return err
-				}
+			wire, wrapErr := s.wrapPeer(peer, first)
+			if wrapErr != nil {
+				releaseWirePacket(first, firstPool)
+				releaseWirePacket(second, secondPool)
+				return wrapErr
 			}
+			if _, err := s.conn.WriteToUDP(wire, peer.remote); err != nil {
+				releaseWirePacket(first, firstPool)
+				releaseWirePacket(second, secondPool)
+				return err
+			}
+			releaseWirePacket(first, firstPool)
+			wire, wrapErr = s.wrapPeer(peer, second)
+			if wrapErr != nil {
+				releaseWirePacket(second, secondPool)
+				return wrapErr
+			}
+			if _, err := s.conn.WriteToUDP(wire, peer.remote); err != nil {
+				releaseWirePacket(second, secondPool)
+				return err
+			}
+			releaseWirePacket(second, secondPool)
 			continue
 		}
 		frame, pooled := buildDataWithKeyPooled(peer.header, packet.Bytes(), peer.key, peer.encrypt)

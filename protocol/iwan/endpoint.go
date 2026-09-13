@@ -74,6 +74,20 @@ type Endpoint struct {
 	frags       *FragReassembler
 }
 
+// isIPv4UDPConn is shared by the portable lifecycle path and the Linux batch
+// implementation. A concrete UDPConn may be IPv6, in which case the batch
+// IPv4 socket operations are not compatible and the caller must use the
+// single-packet fallback.
+func isIPv4UDPConn(conn *net.UDPConn) bool {
+	if addr, ok := conn.RemoteAddr().(*net.UDPAddr); ok && addr.IP != nil {
+		return addr.IP.To4() != nil
+	}
+	if addr, ok := conn.LocalAddr().(*net.UDPAddr); ok && addr.IP != nil {
+		return addr.IP.To4() != nil
+	}
+	return false
+}
+
 func NewEndpoint(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.IWANEndpointOptions) (adapter.Endpoint, error) {
 	if options.Mode == "" {
 		options.Mode = "client"
@@ -566,15 +580,21 @@ func (e *Endpoint) writeOutbound(packetBuffers []*buf.Buffer) error {
 	}
 	for _, packetBuffer := range packetBuffers {
 		if packetBuffer.Len()+HeaderLen > int(mtu) {
-			fragments, fragmentErr := FragmentData(session.DataHeader(), packetBuffer.Bytes(), int(mtu), e.fragID.Add(1))
+			first, firstPool, second, secondPool, fragmentErr := FragmentDataPooled(session.DataHeader(), packetBuffer.Bytes(), int(mtu), e.fragID.Add(1))
 			if fragmentErr != nil {
 				return fragmentErr
 			}
-			for _, fragment := range fragments {
-				if _, err := conn.Write(fragment); err != nil {
-					return err
-				}
+			if _, err := conn.Write(first); err != nil {
+				releaseWirePacket(first, firstPool)
+				releaseWirePacket(second, secondPool)
+				return err
 			}
+			releaseWirePacket(first, firstPool)
+			if _, err := conn.Write(second); err != nil {
+				releaseWirePacket(second, secondPool)
+				return err
+			}
+			releaseWirePacket(second, secondPool)
 			continue
 		}
 		packet, pooled, err := session.DataPooled(packetBuffer.Bytes())

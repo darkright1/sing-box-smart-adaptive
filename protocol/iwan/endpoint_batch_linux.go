@@ -96,14 +96,16 @@ func (e *Endpoint) writeOutboundBatch(conn net.Conn, packetConn *ipv4.PacketConn
 	}
 	for _, packetBuffer := range packetBuffers {
 		if packetBuffer.Len()+HeaderLen > int(mtu) {
-			fragments, err := FragmentData(session.DataHeader(), packetBuffer.Bytes(), int(mtu), e.fragID.Add(1))
+			first, firstPool, second, secondPool, err := FragmentDataPooled(session.DataHeader(), packetBuffer.Bytes(), int(mtu), e.fragID.Add(1))
 			if err != nil {
 				return true, err
 			}
-			for _, fragment := range fragments {
-				if err = appendMessage(fragment, nil, nil); err != nil {
-					return true, err
-				}
+			if err = appendMessage(first, first, firstPool); err != nil {
+				releaseWirePacket(second, secondPool)
+				return true, err
+			}
+			if err = appendMessage(second, second, secondPool); err != nil {
+				return true, err
 			}
 			continue
 		}
@@ -196,14 +198,4 @@ func (e *Endpoint) readLoopBatch() bool {
 		}
 	}
 	return true
-}
-
-func isIPv4UDPConn(conn *net.UDPConn) bool {
-	if addr, ok := conn.RemoteAddr().(*net.UDPAddr); ok && addr.IP != nil {
-		return addr.IP.To4() != nil
-	}
-	if addr, ok := conn.LocalAddr().(*net.UDPAddr); ok && addr.IP != nil {
-		return addr.IP.To4() != nil
-	}
-	return false
 }

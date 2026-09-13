@@ -285,18 +285,15 @@ func ParseData(b []byte) (Header, []byte, error) {
 // FragmentData emits the two-piece IPFRAG form accepted by the reference
 // client. It intentionally refuses more than two pieces.
 func FragmentData(h Header, payload []byte, mtu int, id uint32) ([][]byte, error) {
-	if mtu <= HeaderLen+16 || len(payload) <= mtu-HeaderLen {
+	max, rest, err := fragmentPlan(len(payload), mtu)
+	if err != nil {
+		return nil, err
+	}
+	if max == 0 || rest == 0 {
 		return nil, errors.New("fragmentation not needed or mtu too small")
 	}
-	max := mtu - 16
-	if max > IWAN_FRAG_MAXPAY {
-		max = IWAN_FRAG_MAXPAY
-	}
-	if len(payload)-max > IWAN_FRAG_MAXPAY || len(payload) > IWAN_FRAG_REASM_MAX {
-		return nil, errors.New("payload exceeds two-piece reassembly limit")
-	}
 	a := Frag{Header: Header{Type: PTIPFrag, Encrypt: h.Encrypt, SID: h.SID, Token: h.Token}, ID: id, Offset: 0, Payload: append([]byte(nil), payload[:max]...), Length: uint16(max)}
-	b := Frag{Header: a.Header, ID: id, EOP: true, Offset: uint16(max), Payload: append([]byte(nil), payload[max:]...), Length: uint16(len(payload) - max)}
+	b := Frag{Header: a.Header, ID: id, EOP: true, Offset: uint16(max), Payload: append([]byte(nil), payload[max:]...), Length: uint16(rest)}
 	x, err := a.Marshal()
 	if err != nil {
 		return nil, err
@@ -306,6 +303,46 @@ func FragmentData(h Header, payload []byte, mtu int, id uint32) ([][]byte, error
 		return nil, err
 	}
 	return [][]byte{x, y}, nil
+}
+
+// fragmentPlan validates the fixed two-piece wire format without allocating.
+// The reference protocol intentionally caps reassembly at 4096 bytes.
+func fragmentPlan(payloadLen, mtu int) (first, second int, err error) {
+	if mtu <= HeaderLen+16 || payloadLen <= mtu-HeaderLen {
+		return 0, 0, errors.New("fragmentation not needed or mtu too small")
+	}
+	first = mtu - 16
+	if first > IWAN_FRAG_MAXPAY {
+		first = IWAN_FRAG_MAXPAY
+	}
+	second = payloadLen - first
+	if second > IWAN_FRAG_MAXPAY || payloadLen > IWAN_FRAG_REASM_MAX {
+		return 0, 0, errors.New("payload exceeds two-piece reassembly limit")
+	}
+	return first, second, nil
+}
+
+// FragmentDataPooled is the allocation-free fragment builder used by the
+// Linux packet writers. Each returned frame is owned by its corresponding
+// wirePacket and must be released after the synchronous socket write.
+func FragmentDataPooled(h Header, payload []byte, mtu int, id uint32) (first []byte, firstPool *wirePacket, second []byte, secondPool *wirePacket, err error) {
+	max, rest, err := fragmentPlan(len(payload), mtu)
+	if err != nil {
+		return nil, nil, nil, nil, err
+	}
+	frameHeader := Header{Type: PTIPFrag, Encrypt: h.Encrypt, SID: h.SID, Token: h.Token}
+	first, firstPool = acquireWirePacket(16 + max)
+	if err = marshalFragInto(first, Frag{Header: frameHeader, ID: id, Offset: 0, Payload: payload[:max], Length: uint16(max)}); err != nil {
+		releaseWirePacket(first, firstPool)
+		return nil, nil, nil, nil, err
+	}
+	second, secondPool = acquireWirePacket(16 + rest)
+	if err = marshalFragInto(second, Frag{Header: frameHeader, ID: id, EOP: true, Offset: uint16(max), Payload: payload[max:], Length: uint16(rest)}); err != nil {
+		releaseWirePacket(first, firstPool)
+		releaseWirePacket(second, secondPool)
+		return nil, nil, nil, nil, err
+	}
+	return first, firstPool, second, secondPool, nil
 }
 
 type FragReassembler struct {
@@ -495,16 +532,31 @@ func (f Frag) Marshal() ([]byte, error) {
 	if int(f.Length) != len(f.Payload) || f.Length > 2047 || f.Offset > 8191 {
 		return nil, errors.New("invalid fragment")
 	}
+	b := make([]byte, 16+len(f.Payload))
+	if err := marshalFragInto(b, f); err != nil {
+		return nil, err
+	}
+	return b, nil
+}
+
+func marshalFragInto(b []byte, f Frag) error {
+	if len(b) != 16+len(f.Payload) || int(f.Length) != len(f.Payload) || f.Length > 2047 || f.Offset > 8191 {
+		return errors.New("invalid fragment")
+	}
+	b[0] = f.Header.Type
+	b[1] = f.Header.Encrypt
+	binary.BigEndian.PutUint16(b[2:], f.Header.SID)
+	binary.BigEndian.PutUint32(b[4:], f.Header.Token)
+	// Unlike TLV integers, sdwan_ethpkt is copied from the packed C struct;
+	// the reference client reads these fields directly on little-endian Linux.
+	binary.LittleEndian.PutUint32(b[8:], f.ID)
 	v := uint32(f.Offset)<<2 | uint32(f.Length)<<15
 	if f.EOP {
 		v |= 1
 	}
-	b := append(f.Header.Marshal(), make([]byte, 8)...)
-	// Unlike TLV integers, sdwan_ethpkt is copied from the packed C struct;
-	// the reference client reads these fields directly on little-endian Linux.
-	binary.LittleEndian.PutUint32(b[8:], f.ID)
 	binary.LittleEndian.PutUint32(b[12:], v)
-	return append(b, f.Payload...), nil
+	copy(b[16:], f.Payload)
+	return nil
 }
 func ParseFrag(b []byte) (Frag, error) {
 	if len(b) < 16 {

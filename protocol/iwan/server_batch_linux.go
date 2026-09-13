@@ -102,18 +102,26 @@ func (s *serverRuntime) writePeerBatch(peer *serverPeer, packets []*buf.Buffer) 
 	}
 	for _, packet := range packets {
 		if packet.Len()+HeaderLen > int(peer.device.PortMTU()) {
-			fragments, err := FragmentData(peer.header, packet.Bytes(), int(peer.device.PortMTU()), s.fragID.Add(1))
+			first, firstPool, second, secondPool, err := FragmentDataPooled(peer.header, packet.Bytes(), int(peer.device.PortMTU()), s.fragID.Add(1))
 			if err != nil {
 				return true, err
 			}
-			for _, fragment := range fragments {
-				wire, err := s.wrapPeer(peer, fragment)
-				if err != nil {
-					return true, err
-				}
-				if err = appendMessage(wire, nil, nil); err != nil {
-					return true, err
-				}
+			wire, err := s.wrapPeer(peer, first)
+			if err != nil {
+				releaseWirePacket(first, firstPool)
+				releaseWirePacket(second, secondPool)
+				return true, err
+			}
+			if err = appendMessage(wire, first, firstPool); err != nil {
+				releaseWirePacket(second, secondPool)
+				return true, err
+			}
+			wire, err = s.wrapPeer(peer, second)
+			if err != nil {
+				return true, err
+			}
+			if err = appendMessage(wire, second, secondPool); err != nil {
+				return true, err
 			}
 			continue
 		}
