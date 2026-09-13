@@ -135,10 +135,50 @@ pub extern "C" fn iwan_native_abi_version() -> u32 {
 // Linux ioctl values are stable across the supported architectures. The
 // probe is deliberately read-only: it never enables an offload or changes a
 // socket, so a failed probe is safe to treat as a compatibility fallback.
-#[cfg(target_os = "linux")]
+#[cfg(all(
+    target_os = "linux",
+    any(
+        target_arch = "mips",
+        target_arch = "mips64",
+        target_arch = "powerpc",
+        target_arch = "powerpc64",
+        target_arch = "sparc64"
+    )
+))]
+const TUNGETIFF: LibcUlong = 0x4004_54d2;
+#[cfg(all(
+    target_os = "linux",
+    not(any(
+        target_arch = "mips",
+        target_arch = "mips64",
+        target_arch = "powerpc",
+        target_arch = "powerpc64",
+        target_arch = "sparc64"
+    ))
+))]
 const TUNGETIFF: LibcUlong = 0x8004_54d2;
-#[cfg(target_os = "linux")]
+#[cfg(all(
+    target_os = "linux",
+    any(
+        target_arch = "mips",
+        target_arch = "mips64",
+        target_arch = "powerpc",
+        target_arch = "powerpc64",
+        target_arch = "sparc64"
+    )
+))]
 const TUNGETVNETHDRSZ: LibcUlong = 0x4004_54d7;
+#[cfg(all(
+    target_os = "linux",
+    not(any(
+        target_arch = "mips",
+        target_arch = "mips64",
+        target_arch = "powerpc",
+        target_arch = "powerpc64",
+        target_arch = "sparc64"
+    ))
+))]
+const TUNGETVNETHDRSZ: LibcUlong = 0x8004_54d7;
 #[cfg(target_os = "linux")]
 const IFF_MULTI_QUEUE: u16 = 0x0100;
 #[cfg(target_os = "linux")]
