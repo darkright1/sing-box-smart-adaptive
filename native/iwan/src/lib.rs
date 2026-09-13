@@ -35,18 +35,18 @@ fn write_header(dst: &mut [u8], header: IwanHeader) {
 }
 
 #[inline]
-fn xor_payload(dst: &mut [u8], src: &[u8], key: &[u8]) {
+fn xor_payload_in_place(dst: &mut [u8], key: &[u8]) {
     debug_assert!(key.len() >= 8);
     let key = &key[..8];
     let mut offset = 0;
-    while offset + 8 <= src.len() {
+    while offset + 8 <= dst.len() {
         for i in 0..8 {
-            dst[offset + i] = src[offset + i] ^ key[i];
+            dst[offset + i] ^= key[i];
         }
         offset += 8;
     }
-    while offset < src.len() {
-        dst[offset] = src[offset] ^ key[offset & 7];
+    while offset < dst.len() {
+        dst[offset] ^= key[offset & 7];
         offset += 1;
     }
 }
@@ -76,21 +76,31 @@ pub unsafe extern "C" fn iwan_native_build_data(
         return -3;
     }
     let header = unsafe { *header };
-    // A zero-length C buffer may be represented by a null pointer. Rust still
-    // requires a non-null, aligned pointer for `from_raw_parts`, even when the
-    // length is zero, so use a canonical empty slice in that case.
-    let payload = if payload_len == 0 {
-        &[]
+    // Copy the key before touching output. Apart from avoiding an aliasing
+    // hazard, this lets callers keep key material in the same slab as input.
+    let key_copy = if header.encrypt != 0 {
+        let mut key_copy = [0u8; 8];
+        unsafe { std::ptr::copy_nonoverlapping(key, key_copy.as_mut_ptr(), key_copy.len()) };
+        Some(key_copy)
     } else {
-        unsafe { std::slice::from_raw_parts(payload, payload_len) }
+        None
     };
     let output = unsafe { std::slice::from_raw_parts_mut(output, required) };
+    // Use memmove semantics so an embedding caller may reuse one slab for
+    // input and output. Move the payload before writing the header: the
+    // destination header can otherwise overwrite an overlapping source.
+    if payload_len != 0 {
+        unsafe {
+            std::ptr::copy(
+                payload,
+                output.as_mut_ptr().add(IWAN_HEADER_LEN),
+                payload_len,
+            );
+        }
+    }
     write_header(&mut output[..IWAN_HEADER_LEN], header);
-    if header.encrypt != 0 {
-        let key = unsafe { std::slice::from_raw_parts(key, 8) };
-        xor_payload(&mut output[IWAN_HEADER_LEN..], payload, key);
-    } else {
-        output[IWAN_HEADER_LEN..].copy_from_slice(payload);
+    if let Some(key) = key_copy {
+        xor_payload_in_place(&mut output[IWAN_HEADER_LEN..], &key);
     }
     required as isize
 }
@@ -328,6 +338,31 @@ mod tests {
         };
         assert_eq!(written, IWAN_HEADER_LEN as isize);
         assert_eq!(unsafe { iwan_native_build_batch(ptr::null(), 0) }, 0);
+    }
+
+    #[test]
+    fn overlapping_payload_and_output_use_memmove_semantics() {
+        let header = IwanHeader {
+            kind: 0x14,
+            encrypt: 0,
+            sid_be: 3,
+            token_be: 5,
+        };
+        let payload = b"overlap-safe";
+        let mut slab = [0u8; 64];
+        slab[4..4 + payload.len()].copy_from_slice(payload);
+        let written = unsafe {
+            iwan_native_build_data(
+                &header,
+                slab.as_ptr().add(4),
+                payload.len(),
+                ptr::null(),
+                slab.as_mut_ptr(),
+                slab.len(),
+            )
+        };
+        assert_eq!(written as usize, IWAN_HEADER_LEN + payload.len());
+        assert_eq!(&slab[IWAN_HEADER_LEN..written as usize], payload);
     }
 
     #[test]
