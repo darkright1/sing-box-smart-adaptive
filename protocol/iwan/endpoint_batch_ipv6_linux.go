@@ -12,40 +12,33 @@ import (
 
 	transport "github.com/sagernet/sing-box/transport/iwan"
 	"github.com/sagernet/sing/common/buf"
-	"golang.org/x/net/ipv4"
+	"golang.org/x/net/ipv6"
 )
 
-// Larger fixed batches amortize recvmmsg/sendmmsg syscall and scheduler cost
-// at high packet rates. ReadBatch still returns as soon as the kernel has
-// data, so this does not add an intentional wait for low-volume traffic.
-const iwanClientReadBatchSize = 64
-const iwanClientWriteBatchSize = 128
-
-type iwanWriteBatchWorkspace struct {
-	messages []ipv4.Message
+// Keep the IPv6 path symmetrical with the IPv4 path. The protocol/session
+// framing and ownership rules are shared; only x/net's message type differs.
+type iwanWriteBatch6Workspace struct {
+	messages []ipv6.Message
 	pooled   []pooledWirePacket
 	buffers  [iwanClientWriteBatchSize][1][]byte
 }
 
-var iwanWriteBatchWorkspacePool = sync.Pool{New: func() any {
-	return &iwanWriteBatchWorkspace{
-		messages: make([]ipv4.Message, 0, iwanClientWriteBatchSize),
+var iwanWriteBatch6WorkspacePool = sync.Pool{New: func() any {
+	return &iwanWriteBatch6Workspace{
+		messages: make([]ipv6.Message, 0, iwanClientWriteBatchSize),
 		pooled:   make([]pooledWirePacket, 0, iwanClientWriteBatchSize),
 	}
 }}
 
-// writeOutboundBatch is the native IPv4 egress fast path.  Framing and
-// encryption still happen in Go, but the syscall boundary is amortized across
-// a batch and all pooled frames remain owned until WriteBatch returns.
-func (e *Endpoint) writeOutboundBatch(conn net.Conn, packetConn *ipv4.PacketConn, session *Session, mtu uint32, packetBuffers []*buf.Buffer) (bool, error) {
+func (e *Endpoint) writeOutboundBatch6(conn net.Conn, packetConn *ipv6.PacketConn, session *Session, mtu uint32, packetBuffers []*buf.Buffer) (bool, error) {
 	udpConn, ok := conn.(*net.UDPConn)
-	if !ok || !isIPv4UDPConn(udpConn) {
+	if !ok || !isIPv6UDPConn(udpConn) {
 		return false, nil
 	}
 	if packetConn == nil {
-		packetConn = ipv4.NewPacketConn(udpConn)
+		packetConn = ipv6.NewPacketConn(udpConn)
 	}
-	workspace := iwanWriteBatchWorkspacePool.Get().(*iwanWriteBatchWorkspace)
+	workspace := iwanWriteBatch6WorkspacePool.Get().(*iwanWriteBatch6Workspace)
 	messages := workspace.messages[:0]
 	pooled := workspace.pooled[:0]
 	defer func() {
@@ -56,7 +49,7 @@ func (e *Endpoint) writeOutboundBatch(conn net.Conn, packetConn *ipv4.PacketConn
 		}
 		workspace.messages = messages[:0]
 		workspace.pooled = pooled[:0]
-		iwanWriteBatchWorkspacePool.Put(workspace)
+		iwanWriteBatch6WorkspacePool.Put(workspace)
 	}()
 	flush := func() error {
 		for len(messages) > 0 {
@@ -68,7 +61,7 @@ func (e *Endpoint) writeOutboundBatch(conn net.Conn, packetConn *ipv4.PacketConn
 				return err
 			}
 			if n == 0 {
-				return fmt.Errorf("iWAN batch write made no progress")
+				return fmt.Errorf("iWAN IPv6 batch write made no progress")
 			}
 		}
 		return nil
@@ -83,7 +76,7 @@ func (e *Endpoint) writeOutboundBatch(conn net.Conn, packetConn *ipv4.PacketConn
 	appendMessage := func(packet []byte, releasePacket []byte, pool *wirePacket) error {
 		slot := len(messages)
 		workspace.buffers[slot][0] = packet
-		messages = append(messages, ipv4.Message{Buffers: workspace.buffers[slot][:]})
+		messages = append(messages, ipv6.Message{Buffers: workspace.buffers[slot][:]})
 		pooled = append(pooled, pooledWirePacket{packet: releasePacket, pool: pool})
 		if len(messages) == cap(messages) {
 			if err := flush(); err != nil {
@@ -123,27 +116,16 @@ func (e *Endpoint) writeOutboundBatch(conn net.Conn, packetConn *ipv4.PacketConn
 	return true, nil
 }
 
-type pooledWirePacket struct {
-	packet []byte
-	pool   *wirePacket
-}
-
-// readLoopBatch uses recvmmsg when the dialer exposes a native UDP socket.
-// Dialers that wrap the socket continue through readLoopSingle, preserving
-// compatibility with proxy/tunnel transports.
-func (e *Endpoint) readLoopBatch() bool {
+func (e *Endpoint) readLoopBatch6() bool {
 	conn, ok := e.conn.(*net.UDPConn)
-	if !ok {
+	if !ok || !isIPv6UDPConn(conn) {
 		return false
 	}
-	// x/net/ipv4 uses the IPv4 packet socket operations.  Do not select it
-	// solely from the concrete type: a UDPConn can also be connected to an
-	// IPv6 peer, for which the portable reader is the compatible path.
-	if !isIPv4UDPConn(conn) {
-		return e.readLoopBatch6()
+	packetConn := e.packetConn6
+	if packetConn == nil {
+		packetConn = ipv6.NewPacketConn(conn)
 	}
-	packetConn := ipv4.NewPacketConn(conn)
-	messages := make([]ipv4.Message, iwanClientReadBatchSize)
+	messages := make([]ipv6.Message, iwanClientReadBatchSize)
 	backings := make([][]byte, iwanClientReadBatchSize)
 	for i := range messages {
 		backings[i] = make([]byte, transport.PacketHeadroom+64*1024)

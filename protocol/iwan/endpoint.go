@@ -27,6 +27,7 @@ import (
 	N "github.com/sagernet/sing/common/network"
 	"github.com/sagernet/sing/service"
 	"golang.org/x/net/ipv4"
+	"golang.org/x/net/ipv6"
 )
 
 var (
@@ -54,6 +55,7 @@ type Endpoint struct {
 	// with the authenticated session avoids constructing an x/net wrapper for
 	// every TUN batch while still replacing it atomically at reconnect time.
 	packetConn  *ipv4.PacketConn
+	packetConn6 *ipv6.PacketConn
 	session     *Session
 	server      *serverRuntime
 	closeOnce   sync.Once
@@ -84,6 +86,16 @@ func isIPv4UDPConn(conn *net.UDPConn) bool {
 	}
 	if addr, ok := conn.LocalAddr().(*net.UDPAddr); ok && addr.IP != nil {
 		return addr.IP.To4() != nil
+	}
+	return false
+}
+
+func isIPv6UDPConn(conn *net.UDPConn) bool {
+	if addr, ok := conn.RemoteAddr().(*net.UDPAddr); ok && addr.IP != nil {
+		return addr.IP.To4() == nil
+	}
+	if addr, ok := conn.LocalAddr().(*net.UDPAddr); ok && addr.IP != nil {
+		return addr.IP.To4() == nil
 	}
 	return false
 }
@@ -206,8 +218,13 @@ func (e *Endpoint) startClientLocked(ctx context.Context, initial bool) error {
 	}
 	e.conn = conn
 	e.packetConn = nil
-	if udpConn, ok := conn.(*net.UDPConn); ok && isIPv4UDPConn(udpConn) {
-		e.packetConn = ipv4.NewPacketConn(udpConn)
+	e.packetConn6 = nil
+	if udpConn, ok := conn.(*net.UDPConn); ok {
+		if isIPv4UDPConn(udpConn) {
+			e.packetConn = ipv4.NewPacketConn(udpConn)
+		} else if isIPv6UDPConn(udpConn) {
+			e.packetConn6 = ipv6.NewPacketConn(udpConn)
+		}
 	}
 	if bufferErr := tunePacketSocket(conn); bufferErr != nil {
 		e.logger.Debug("iWAN socket buffer tuning unavailable: ", bufferErr)
@@ -499,6 +516,7 @@ func (e *Endpoint) suspend() {
 	conn := e.conn
 	e.conn = nil
 	e.packetConn = nil
+	e.packetConn6 = nil
 	done := e.readDone
 	echoDone := e.echoDone
 	_ = conn.Close()
@@ -568,6 +586,7 @@ func (e *Endpoint) writeOutbound(packetBuffers []*buf.Buffer) error {
 	}
 	conn := e.conn
 	packetConn := e.packetConn
+	packetConn6 := e.packetConn6
 	session := e.session
 	mtu := e.options.MTU
 	e.lifecycleMu.Unlock()
@@ -576,6 +595,9 @@ func (e *Endpoint) writeOutbound(packetBuffers []*buf.Buffer) error {
 	// lifecycle lock out of the framing and syscall hot path. Control frames
 	// continue to use writeMu below.
 	if handled, err := e.writeOutboundBatch(conn, packetConn, session, mtu, packetBuffers); handled {
+		return err
+	}
+	if handled, err := e.writeOutboundBatch6(conn, packetConn6, session, mtu, packetBuffers); handled {
 		return err
 	}
 	for _, packetBuffer := range packetBuffers {
@@ -633,6 +655,7 @@ func (e *Endpoint) Close() error {
 			}
 			err = e.conn.Close()
 			e.packetConn = nil
+			e.packetConn6 = nil
 		}
 		e.lifecycleMu.Unlock()
 		if e.device != nil {
