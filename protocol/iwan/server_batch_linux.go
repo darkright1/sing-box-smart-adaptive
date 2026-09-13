@@ -22,6 +22,7 @@ const iwanWriteBatchSize = 128
 type iwanPeerWriteBatchWorkspace struct {
 	messages []ipv4.Message
 	pooled   []pooledWirePacket
+	payloads [iwanWriteBatchSize][]byte
 	buffers  [iwanWriteBatchSize][1][]byte
 }
 
@@ -57,6 +58,7 @@ func (s *serverRuntime) writePeerBatch(peer *serverPeer, packets []*buf.Buffer) 
 	defer func() {
 		clear(workspace.messages[:cap(workspace.messages)])
 		clear(workspace.pooled[:cap(workspace.pooled)])
+		clear(workspace.payloads[:])
 		for i := range workspace.buffers {
 			workspace.buffers[i][0] = nil
 		}
@@ -99,6 +101,36 @@ func (s *serverRuntime) writePeerBatch(peer *serverPeer, packets []*buf.Buffer) 
 			releasePooled()
 		}
 		return nil
+	}
+	// A peer with source-routing links must wrap the complete inner frame, so
+	// keep that path in Go. Plain DATA batches can use the same private Rust
+	// ABI as the client without changing the wire format.
+	canNative := nativeIwanEnabled() && len(peer.links) == 0
+	if canNative {
+		for i, packet := range packets {
+			if packet.Len()+HeaderLen > int(peer.device.PortMTU()) {
+				canNative = false
+				break
+			}
+			workspace.payloads[i] = packet.Bytes()
+		}
+	}
+	if canNative {
+		frames, pools, used, err := nativeBuildDataBatch(peer.header, peer.key, peer.encrypt, workspace.payloads[:len(packets)])
+		if err != nil {
+			return true, err
+		}
+		if used {
+			for i, frame := range frames {
+				if err = appendMessage(frame, frame, pools[i]); err != nil {
+					return true, err
+				}
+			}
+			if err = flush(); err != nil {
+				return true, err
+			}
+			return true, nil
+		}
 	}
 	for _, packet := range packets {
 		if packet.Len()+HeaderLen > int(peer.device.PortMTU()) {

@@ -160,6 +160,9 @@ func NewEndpoint(ctx context.Context, router adapter.Router, logger log.ContextL
 		readErr:   make(chan error, 1),
 		frags:     NewFragReassembler(),
 	}
+	if nativeIwanEnabled() {
+		logger.Info("iWAN Rust batch DATA framing enabled (ABI ", nativeIwanABIVersion(), ")")
+	}
 	if options.Mode == "client" {
 		device, deviceErr := transport.NewDevice(transport.DeviceOptions{
 			Context: ctx, Logger: logger, System: options.System, Handler: ep,

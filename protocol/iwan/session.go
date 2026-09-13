@@ -277,6 +277,24 @@ func (s *Session) DataPooled(payload []byte) ([]byte, *wirePacket, error) {
 	return packet, pooled, nil
 }
 
+// DataPooledBatch uses the private Rust batch ABI when it is present. Source
+// routing is intentionally excluded: SR wraps the complete inner frame and
+// therefore remains on the byte-for-byte compatible Go path. A false return
+// means the caller should use the existing Go builder.
+func (s *Session) DataPooledBatch(payloads [][]byte) (frames [][]byte, pools []*wirePacket, used bool, err error) {
+	state := s.wire.Load()
+	if state == nil {
+		return nil, nil, false, errors.New("iWAN session is not ready")
+	}
+	// A cgo transition plus one bounded C descriptor allocation is only a win
+	// once a worker has a small batch. Keep single/short writes on the direct
+	// Go builder so latency-sensitive traffic does not pay that fixed cost.
+	if len(payloads) < 4 || len(s.links) != 0 || !nativeIwanEnabled() {
+		return nil, nil, false, nil
+	}
+	return nativeBuildDataBatch(state.header, state.key, state.encrypted, payloads)
+}
+
 func (s *Session) Ready() bool {
 	return s.wire.Load() != nil
 }

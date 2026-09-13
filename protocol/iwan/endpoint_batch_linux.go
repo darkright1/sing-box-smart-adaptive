@@ -24,6 +24,7 @@ const iwanClientWriteBatchSize = 128
 type iwanWriteBatchWorkspace struct {
 	messages []ipv4.Message
 	pooled   []pooledWirePacket
+	payloads [iwanClientWriteBatchSize][]byte
 	buffers  [iwanClientWriteBatchSize][1][]byte
 }
 
@@ -51,6 +52,7 @@ func (e *Endpoint) writeOutboundBatch(conn net.Conn, packetConn *ipv4.PacketConn
 	defer func() {
 		clear(workspace.messages[:cap(workspace.messages)])
 		clear(workspace.pooled[:cap(workspace.pooled)])
+		clear(workspace.payloads[:])
 		for i := range workspace.buffers {
 			workspace.buffers[i][0] = nil
 		}
@@ -93,6 +95,35 @@ func (e *Endpoint) writeOutboundBatch(conn net.Conn, packetConn *ipv4.PacketConn
 			releasePooled()
 		}
 		return nil
+	}
+	// Rust framing is used only for a complete, unwrapped DATA batch. Mixed
+	// fragmentation and source-routing batches stay on the proven Go path.
+	canNative := nativeIwanEnabled() && len(session.links) == 0
+	if canNative {
+		for i, packetBuffer := range packetBuffers {
+			if packetBuffer.Len()+HeaderLen > int(mtu) {
+				canNative = false
+				break
+			}
+			workspace.payloads[i] = packetBuffer.Bytes()
+		}
+	}
+	if canNative {
+		frames, pools, used, err := session.DataPooledBatch(workspace.payloads[:len(packetBuffers)])
+		if err != nil {
+			return true, err
+		}
+		if used {
+			for i, frame := range frames {
+				if err = appendMessage(frame, frame, pools[i]); err != nil {
+					return true, err
+				}
+			}
+			if err = flush(); err != nil {
+				return true, err
+			}
+			return true, nil
+		}
 	}
 	for _, packetBuffer := range packetBuffers {
 		if packetBuffer.Len()+HeaderLen > int(mtu) {

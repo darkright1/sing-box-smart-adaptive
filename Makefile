@@ -14,12 +14,23 @@ MAIN = ./cmd/sing-box
 PREFIX ?= $(shell go env GOPATH)
 SING_FFI ?= sing-ffi
 LIBBOX_FFI_CONFIG ?= ./experimental/libbox/ffi.json
+IWAN_NATIVE_TARGET ?= x86_64-unknown-linux-gnu
 
-.PHONY: test release docs build schema
+.PHONY: test release docs build schema native_iwan build_iwan_native
 
 build:
 	export GOTOOLCHAIN=local && \
 	go build $(MAIN_PARAMS) $(MAIN)
+
+# Private Linux build: compile the Rust DATA framing library first, then link
+# it into a batch-only Go integration. Public/default builds deliberately do
+# not include with_iwan or the private Rust artifact.
+native_iwan:
+	$(MAKE) -C native/iwan build TARGET=$(IWAN_NATIVE_TARGET)
+
+build_iwan_native: native_iwan
+	export GOTOOLCHAIN=local CGO_ENABLED=1 && \
+	go build $(PARAMS) -tags "$(TAGS),with_iwan,with_iwan_native,with_gvisor" $(MAIN)
 
 race:
 	export GOTOOLCHAIN=local && \

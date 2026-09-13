@@ -20,6 +20,7 @@ import (
 type iwanWriteBatch6Workspace struct {
 	messages []ipv6.Message
 	pooled   []pooledWirePacket
+	payloads [iwanClientWriteBatchSize][]byte
 	buffers  [iwanClientWriteBatchSize][1][]byte
 }
 
@@ -44,6 +45,7 @@ func (e *Endpoint) writeOutboundBatch6(conn net.Conn, packetConn *ipv6.PacketCon
 	defer func() {
 		clear(workspace.messages[:cap(workspace.messages)])
 		clear(workspace.pooled[:cap(workspace.pooled)])
+		clear(workspace.payloads[:])
 		for i := range workspace.buffers {
 			workspace.buffers[i][0] = nil
 		}
@@ -86,6 +88,33 @@ func (e *Endpoint) writeOutboundBatch6(conn net.Conn, packetConn *ipv6.PacketCon
 			releasePooled()
 		}
 		return nil
+	}
+	canNative := nativeIwanEnabled() && len(session.links) == 0
+	if canNative {
+		for i, packetBuffer := range packetBuffers {
+			if packetBuffer.Len()+HeaderLen > int(mtu) {
+				canNative = false
+				break
+			}
+			workspace.payloads[i] = packetBuffer.Bytes()
+		}
+	}
+	if canNative {
+		frames, pools, used, err := session.DataPooledBatch(workspace.payloads[:len(packetBuffers)])
+		if err != nil {
+			return true, err
+		}
+		if used {
+			for i, frame := range frames {
+				if err = appendMessage(frame, frame, pools[i]); err != nil {
+					return true, err
+				}
+			}
+			if err = flush(); err != nil {
+				return true, err
+			}
+			return true, nil
+		}
 	}
 	for _, packetBuffer := range packetBuffers {
 		if packetBuffer.Len()+HeaderLen > int(mtu) {
