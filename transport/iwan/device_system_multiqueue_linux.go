@@ -109,6 +109,9 @@ func (t *multiQueueLinuxTun) BatchWrite(buffers [][]byte, offset int) (int, erro
 		workspace.buffers = workspace.buffers[:len(t.queues)]
 	}
 	for index := range workspace.buffers {
+		if cap(workspace.buffers[index]) < len(buffers) {
+			workspace.buffers[index] = make([][]byte, 0, len(buffers))
+		}
 		workspace.buffers[index] = workspace.buffers[index][:0]
 	}
 	defer func() {
@@ -227,11 +230,19 @@ func newMultiQueueLinuxTun(options tun.Options, queueCount int) (*multiQueueLinu
 		}
 		return nil, err
 	}
+	batchSize := queues[0].BatchSize()
+	if batchSize < 1 {
+		batchSize = 1
+	}
 	return &multiQueueLinuxTun{
 		queues: queues,
 		name:   actualName,
 		writePool: sync.Pool{New: func() any {
-			return &multiQueueWriteWorkspace{buffers: make([][][]byte, queueCount)}
+			buffers := make([][][]byte, queueCount)
+			for index := range buffers {
+				buffers[index] = make([][]byte, 0, batchSize)
+			}
+			return &multiQueueWriteWorkspace{buffers: buffers}
 		}},
 	}, nil
 }
