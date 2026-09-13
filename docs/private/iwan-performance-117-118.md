@@ -153,3 +153,10 @@ iWAN protocol and device packages, plus a full tagged build. A fresh line-rate
 throughput run for this exact revision is still required; the last verified
 integrated smoke result remains 389 Mbit/s at a 400 Mbit/s offer (2.8% loss)
 and 454 Mbit/s at a 1 Gbit/s offer (54% loss).
+
+The subsequent Linux pass raised the fixed client/server batch limits to 64
+receives and 128 sends, and increased the bounded per-shard backlog to 1024
+packets. Queue-full and shutdown drops are now counted and emitted when the
+dispatcher closes, so a failed run can distinguish burst admission loss from
+socket/TUN loss. These changes have passed the same Linux race/vet/build gates;
+they do not by themselves constitute a new line-rate measurement.
