@@ -1,0 +1,13 @@
+[package]
+name = "iwan-native"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[lib]
+crate-type = ["staticlib"]
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+panic = "abort"
