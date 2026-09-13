@@ -34,12 +34,12 @@ var iwanWriteBatchWorkspacePool = sync.Pool{New: func() any {
 // writeOutboundBatch is the native IPv4 egress fast path.  Framing and
 // encryption still happen in Go, but the syscall boundary is amortized across
 // a batch and all pooled frames remain owned until WriteBatch returns.
-func (e *Endpoint) writeOutboundBatch(packetBuffers []*buf.Buffer) (bool, error) {
-	conn, ok := e.conn.(*net.UDPConn)
-	if !ok || !isIPv4UDPConn(conn) {
+func (e *Endpoint) writeOutboundBatch(conn net.Conn, session *Session, mtu uint32, packetBuffers []*buf.Buffer) (bool, error) {
+	udpConn, ok := conn.(*net.UDPConn)
+	if !ok || !isIPv4UDPConn(udpConn) {
 		return false, nil
 	}
-	packetConn := ipv4.NewPacketConn(conn)
+	packetConn := ipv4.NewPacketConn(udpConn)
 	workspace := iwanWriteBatchWorkspacePool.Get().(*iwanWriteBatchWorkspace)
 	messages := workspace.messages[:0]
 	pooled := workspace.pooled[:0]
@@ -90,8 +90,8 @@ func (e *Endpoint) writeOutboundBatch(packetBuffers []*buf.Buffer) (bool, error)
 		return nil
 	}
 	for _, packetBuffer := range packetBuffers {
-		if packetBuffer.Len()+HeaderLen > int(e.options.MTU) {
-			fragments, err := FragmentData(e.session.DataHeader(), packetBuffer.Bytes(), int(e.options.MTU), e.fragID.Add(1))
+		if packetBuffer.Len()+HeaderLen > int(mtu) {
+			fragments, err := FragmentData(session.DataHeader(), packetBuffer.Bytes(), int(mtu), e.fragID.Add(1))
 			if err != nil {
 				return true, err
 			}
@@ -102,7 +102,7 @@ func (e *Endpoint) writeOutboundBatch(packetBuffers []*buf.Buffer) (bool, error)
 			}
 			continue
 		}
-		wire, pool, err := e.session.DataPooled(packetBuffer.Bytes())
+		wire, pool, err := session.DataPooled(packetBuffer.Bytes())
 		if err != nil {
 			return true, err
 		}

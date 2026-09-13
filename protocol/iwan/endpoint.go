@@ -538,33 +538,39 @@ func (e *Endpoint) writeOutbound(packetBuffers []*buf.Buffer) error {
 		return err
 	}
 	e.lifecycleMu.Lock()
-	defer e.lifecycleMu.Unlock()
 	if !e.ready.Load() || e.conn == nil || e.session == nil {
+		e.lifecycleMu.Unlock()
 		return E.New("iWAN endpoint is not ready")
 	}
-	e.writeMu.Lock()
-	defer e.writeMu.Unlock()
-	if handled, err := e.writeOutboundBatch(packetBuffers); handled {
+	conn := e.conn
+	session := e.session
+	mtu := e.options.MTU
+	e.lifecycleMu.Unlock()
+	// Data frames are independent datagrams. The session is immutable after
+	// establishment and net.Conn permits concurrent method calls, so keep the
+	// lifecycle lock out of the framing and syscall hot path. Control frames
+	// continue to use writeMu below.
+	if handled, err := e.writeOutboundBatch(conn, session, mtu, packetBuffers); handled {
 		return err
 	}
 	for _, packetBuffer := range packetBuffers {
-		if packetBuffer.Len()+HeaderLen > int(e.options.MTU) {
-			fragments, fragmentErr := FragmentData(e.session.DataHeader(), packetBuffer.Bytes(), int(e.options.MTU), e.fragID.Add(1))
+		if packetBuffer.Len()+HeaderLen > int(mtu) {
+			fragments, fragmentErr := FragmentData(session.DataHeader(), packetBuffer.Bytes(), int(mtu), e.fragID.Add(1))
 			if fragmentErr != nil {
 				return fragmentErr
 			}
 			for _, fragment := range fragments {
-				if _, err := e.conn.Write(fragment); err != nil {
+				if _, err := conn.Write(fragment); err != nil {
 					return err
 				}
 			}
 			continue
 		}
-		packet, pooled, err := e.session.DataPooled(packetBuffer.Bytes())
+		packet, pooled, err := session.DataPooled(packetBuffer.Bytes())
 		if err != nil {
 			return err
 		}
-		_, writeErr := e.conn.Write(packet)
+		_, writeErr := conn.Write(packet)
 		releaseWirePacket(packet, pooled)
 		if writeErr != nil {
 			return writeErr

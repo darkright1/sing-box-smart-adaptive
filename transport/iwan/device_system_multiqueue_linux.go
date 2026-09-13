@@ -33,6 +33,7 @@ type multiQueueLinuxTun struct {
 	queues    []tun.LinuxTUN
 	name      string
 	closeOnce sync.Once
+	writePool sync.Pool
 }
 
 var _ linuxTUNQueues = (*multiQueueLinuxTun)(nil)
@@ -83,7 +84,7 @@ func (t *multiQueueLinuxTun) Write(p []byte) (int, error) {
 	if len(t.queues) == 0 {
 		return 0, os.ErrClosed
 	}
-	return t.queues[0].Write(p)
+	return t.queues[int(systemPacketFlowHash(p)%uint32(len(t.queues)))].Write(p)
 }
 
 func (t *multiQueueLinuxTun) FrontHeadroom() int { return t.queues[0].FrontHeadroom() }
@@ -95,7 +96,52 @@ func (t *multiQueueLinuxTun) BatchRead(buffers [][]byte, offset int, readN []int
 	return t.queues[0].BatchRead(buffers, offset, readN)
 }
 func (t *multiQueueLinuxTun) BatchWrite(buffers [][]byte, offset int) (int, error) {
-	return t.queues[0].BatchWrite(buffers, offset)
+	if len(t.queues) == 0 {
+		return 0, os.ErrClosed
+	}
+	if len(t.queues) == 1 {
+		return t.queues[0].BatchWrite(buffers, offset)
+	}
+	workspace := t.writePool.Get().(*multiQueueWriteWorkspace)
+	if cap(workspace.buffers) < len(t.queues) {
+		workspace.buffers = make([][][]byte, len(t.queues))
+	} else {
+		workspace.buffers = workspace.buffers[:len(t.queues)]
+	}
+	for index := range workspace.buffers {
+		workspace.buffers[index] = workspace.buffers[index][:0]
+	}
+	defer func() {
+		for index := range workspace.buffers {
+			clear(workspace.buffers[index])
+			workspace.buffers[index] = workspace.buffers[index][:0]
+		}
+		t.writePool.Put(workspace)
+	}()
+	for _, packet := range buffers {
+		payload := packet
+		if offset > 0 && offset < len(packet) {
+			payload = packet[offset:]
+		}
+		index := int(systemPacketFlowHash(payload) % uint32(len(t.queues)))
+		workspace.buffers[index] = append(workspace.buffers[index], packet)
+	}
+	total := 0
+	for index, queueBuffers := range workspace.buffers {
+		if len(queueBuffers) == 0 {
+			continue
+		}
+		written, err := t.queues[index].BatchWrite(queueBuffers, offset)
+		total += written
+		if err != nil {
+			return total, err
+		}
+	}
+	return total, nil
+}
+
+type multiQueueWriteWorkspace struct {
+	buffers [][][]byte
 }
 
 func desiredSystemTunQueues() int {
@@ -181,7 +227,13 @@ func newMultiQueueLinuxTun(options tun.Options, queueCount int) (*multiQueueLinu
 		}
 		return nil, err
 	}
-	return &multiQueueLinuxTun{queues: queues, name: actualName}, nil
+	return &multiQueueLinuxTun{
+		queues: queues,
+		name:   actualName,
+		writePool: sync.Pool{New: func() any {
+			return &multiQueueWriteWorkspace{buffers: make([][][]byte, queueCount)}
+		}},
+	}, nil
 }
 
 func openMultiQueueFD(path, name string, flags uint16) (int, string, error) {
