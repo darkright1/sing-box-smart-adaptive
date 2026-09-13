@@ -89,7 +89,7 @@ func (d *systemDevice) startLocked() error {
 		return nil
 	}
 	tunOptions := d.buildTunOptions()
-	tunInterface, err := tun.New(tunOptions)
+	tunInterface, queueCount, err := newSystemTun(tunOptions)
 	if err != nil {
 		return err
 	}
@@ -102,7 +102,7 @@ func (d *systemDevice) startLocked() error {
 		d.options.Logger.Debug("iWAN TUN queue tuning unavailable: ", queueErr)
 	}
 	d.device = tunInterface
-	d.options.Logger.Info("started at ", d.options.Name)
+	d.options.Logger.Info("started at ", d.options.Name, " (tun queues: ", queueCount, ")")
 	go d.readLoop(tunInterface, int(d.options.MTU))
 	return nil
 }
@@ -136,6 +136,10 @@ func (d *systemDevice) buildTunOptions() tun.Options {
 }
 
 func (d *systemDevice) readLoop(tunInterface tun.Tun, mtu int) {
+	if queues, ok := tunInterface.(linuxTUNQueues); ok && queues.QueueCount() > 1 {
+		d.readLoopLinuxQueues(queues, mtu)
+		return
+	}
 	linuxTUN, isLinuxTUN := tunInterface.(tun.LinuxTUN)
 	if isLinuxTUN && linuxTUN.BatchSize() > 1 {
 		d.readLoopLinux(linuxTUN, linuxTUN.BatchSize(), mtu)
