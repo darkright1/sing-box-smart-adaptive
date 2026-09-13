@@ -5,6 +5,7 @@
 ## 已复用的设计
 
 - **批量 I/O**：集成版保留 `recvmmsg`/`sendmmsg`，并复用有界 workspace，避免每包建立 `ipv4.Message` 和临时切片。
+- **SID 快路径**：服务端按 standalone 的 authenticated SID table 建立不可变快照；正常 DATA 只做无锁 SID + token + remote tuple 校验，SID 冲突回退到受锁 remote map，兼容性优先。
 - **队列隔离**：服务端可按 endpoint 配置 `server_socket_readers`，Linux 使用 `SO_REUSEPORT` 为每个 socket 建立一个 ingress reader；控制包不会被单个 reader 的数据处理锁住。默认值为 1，旧内核或不支持 reuse-port 时自动回退。
 - **TUN 多队列**：现有 `SINGBOX_IWAN_TUN_QUEUES` 继续按五元组分片，保证同流有序、不同流并行。
 - **内存边界**：reader、TUN 和回收路径使用已有的批量缓冲与池，不引入无界 channel 或 per-packet goroutine。
