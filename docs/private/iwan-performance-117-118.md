@@ -91,3 +91,15 @@ On the same two-vCPU guests, post-change smoke results were:
 The zero-copy and queue changes reduce the earlier 64% UDP loss, but the
 native Go endpoint still does not meet the 1 Gbit/s loss-free gate. These are
 lab measurements only; no production VM was changed.
+
+## 2026-09-13 hot-path allocation pass
+
+The server peer table now uses a normalized `netip.AddrPort` key instead of
+`UDPAddr.String()`, removing one string allocation and a formatting pass from
+every received packet. Shared native-TUN egress uses an immutable,
+copy-on-update address snapshot loaded atomically, so packet forwarding no
+longer takes the server `RWMutex`. Linux TUN batch writes also reuse their
+`[][]byte` and temporary-buffer workspace through a bounded pool. Control-plane
+peer create/remove remains serialized and publishes a fresh snapshot only on
+membership changes. Unit and race tests pass; a new Linux throughput result is
+still required before changing the 1 Gbit/s acceptance status.

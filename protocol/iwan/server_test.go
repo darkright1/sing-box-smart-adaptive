@@ -4,7 +4,7 @@ package iwan
 
 import (
 	"bytes"
-	"fmt"
+	"net"
 	"net/netip"
 	"testing"
 
@@ -46,15 +46,29 @@ func TestInboundPacketView(t *testing.T) {
 }
 
 func TestServerPoolAllocatesDistinctUsableAddresses(t *testing.T) {
-	runtime := &serverRuntime{pool: netip.MustParsePrefix("10.10.0.0/29"), peers: make(map[string]*serverPeer)}
+	runtime := &serverRuntime{pool: netip.MustParsePrefix("10.10.0.0/29"), peers: make(map[netip.AddrPort]*serverPeer)}
 	for i := 0; i < 5; i++ {
 		address, ok := runtime.allocate()
 		if !ok || address == netip.MustParseAddr("10.10.0.0") || address == netip.MustParseAddr("10.10.0.1") || address == netip.MustParseAddr("10.10.0.7") {
 			t.Fatalf("unexpected allocation: %v", address)
 		}
-		runtime.peers[fmt.Sprintf("peer-%d", i)] = &serverPeer{address: address}
+		runtime.peers[netip.AddrPortFrom(netip.MustParseAddr("192.0.2.1"), uint16(10000+i))] = &serverPeer{address: address}
 	}
 	if address, ok := runtime.allocate(); ok || address.IsValid() {
 		t.Fatalf("expected exhausted pool, got %v", address)
+	}
+}
+
+func TestServerPeerKeyNormalizesIPv4(t *testing.T) {
+	key4, ok := serverPeerKey(&net.UDPAddr{IP: net.IPv4(192, 0, 2, 10), Port: 1234})
+	if !ok {
+		t.Fatal("IPv4 peer key rejected")
+	}
+	keyBytes, ok := serverPeerKey(&net.UDPAddr{IP: net.ParseIP("192.0.2.10"), Port: 1234})
+	if !ok || key4 != keyBytes {
+		t.Fatalf("IPv4 key was not stable: %v != %v", key4, keyBytes)
+	}
+	if _, ok := serverPeerKey(nil); ok {
+		t.Fatal("nil peer address accepted")
 	}
 }

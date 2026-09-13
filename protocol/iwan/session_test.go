@@ -83,7 +83,7 @@ func TestSessionSourceRoutingRoundTrip(t *testing.T) {
 func TestServerReapsIdlePeer(t *testing.T) {
 	peer := &serverPeer{}
 	peer.lastSeen.Store(time.Now().Add(-time.Minute).UnixNano())
-	runtime := &serverRuntime{peers: map[string]*serverPeer{"idle": peer}, pool: netip.MustParsePrefix("10.10.0.0/29")}
+	runtime := &serverRuntime{peers: map[netip.AddrPort]*serverPeer{netip.AddrPortFrom(netip.MustParseAddr("192.0.2.1"), 10000): peer}, pool: netip.MustParsePrefix("10.10.0.0/29")}
 	runtime.reap(time.Now())
 	if len(runtime.peers) != 0 {
 		t.Fatal("idle peer was not reaped")

@@ -25,7 +25,20 @@ var _ Device = (*systemDevice)(nil)
 const (
 	systemDeviceReadBufferSize  = 65535 + tun.PacketOffset
 	systemDevicePacketRearSpace = 64
+	systemDeviceWriteBatchSize  = 64
 )
+
+type systemDeviceWriteWorkspace struct {
+	packets   [][]byte
+	temporary []*buf.Buffer
+}
+
+var systemDeviceWriteWorkspacePool = sync.Pool{New: func() any {
+	return &systemDeviceWriteWorkspace{
+		packets:   make([][]byte, 0, systemDeviceWriteBatchSize),
+		temporary: make([]*buf.Buffer, 0, systemDeviceWriteBatchSize),
+	}
+}}
 
 type systemDevice struct {
 	baseDevice
@@ -289,8 +302,20 @@ func (d *systemDevice) writeBuffers(packetBuffers []*buf.Buffer) error {
 	linuxTUN, isLinuxTUN := tunInterface.(tun.LinuxTUN)
 	if isLinuxTUN {
 		headroom := linuxTUN.FrontHeadroom()
-		packets := make([][]byte, len(packetBuffers))
-		var temporaryBuffers []*buf.Buffer
+		workspace := systemDeviceWriteWorkspacePool.Get().(*systemDeviceWriteWorkspace)
+		packets := workspace.packets[:0]
+		temporaryBuffers := workspace.temporary[:0]
+		defer func() {
+			clear(workspace.packets)
+			clear(workspace.temporary)
+			workspace.packets = workspace.packets[:0]
+			workspace.temporary = workspace.temporary[:0]
+			systemDeviceWriteWorkspacePool.Put(workspace)
+		}()
+		if cap(packets) < len(packetBuffers) {
+			packets = make([][]byte, 0, len(packetBuffers))
+		}
+		packets = packets[:len(packetBuffers)]
 		for i, packetBuffer := range packetBuffers {
 			if packetBuffer.Start() >= headroom {
 				packetBuffer.ExtendHeader(headroom)

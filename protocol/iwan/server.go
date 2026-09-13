@@ -29,10 +29,18 @@ type serverRuntime struct {
 	next    atomic.Uint32
 	access  sync.RWMutex
 	allocMu sync.Mutex
-	peers   map[string]*serverPeer
+	peers   map[netip.AddrPort]*serverPeer
 	byAddr  map[netip.Addr]*serverPeer
-	done    chan struct{}
-	fragID  atomic.Uint32
+	// byAddrSnapshot is immutable after publication. The TUN egress path is
+	// packet-rate and only needs a lock-free read; peer create/remove publish a
+	// cloned table, which is rare compared with packet forwarding.
+	byAddrSnapshot atomic.Pointer[serverPeerAddressTable]
+	done           chan struct{}
+	fragID         atomic.Uint32
+}
+
+type serverPeerAddressTable struct {
+	peers map[netip.Addr]*serverPeer
 }
 
 type serverPeer struct {
@@ -72,7 +80,9 @@ var sharedWriteWorkspacePool = sync.Pool{New: func() any {
 }}
 
 func newServerRuntime(endpoint *Endpoint) *serverRuntime {
-	return &serverRuntime{endpoint: endpoint, peers: make(map[string]*serverPeer), byAddr: make(map[netip.Addr]*serverPeer), done: make(chan struct{})}
+	runtime := &serverRuntime{endpoint: endpoint, peers: make(map[netip.AddrPort]*serverPeer), byAddr: make(map[netip.Addr]*serverPeer), done: make(chan struct{})}
+	runtime.publishAddressSnapshotLocked()
+	return runtime
 }
 
 func (s *serverRuntime) start() error {
@@ -175,7 +185,10 @@ func (s *serverRuntime) handle(packet []byte, remote *net.UDPAddr) (*serverPeer,
 
 func (s *serverRuntime) handleWithBacking(packet []byte, remote *net.UDPAddr, backing []byte) (*serverPeer, *buf.Buffer) {
 	viewBacking := backing
-	key := remote.String()
+	key, ok := serverPeerKey(remote)
+	if !ok {
+		return nil, nil
+	}
 	s.access.RLock()
 	peer := s.peers[key]
 	s.access.RUnlock()
@@ -263,6 +276,10 @@ func (s *serverRuntime) handleOpen(packet []byte, remote *net.UDPAddr, old *serv
 	if err != nil {
 		return
 	}
+	key, keyOK := serverPeerKey(remote)
+	if !keyOK {
+		return
+	}
 	for _, user := range s.endpoint.options.Users {
 		if user.Username != fields.User || user.Password != fields.Password {
 			continue
@@ -271,7 +288,7 @@ func (s *serverRuntime) handleOpen(packet []byte, remote *net.UDPAddr, old *serv
 			// A repeated OPEN from the same source is a reconnect, not an
 			// ACK-only refresh. Replace the old SID/token and device so the
 			// next DATA frame cannot be rejected against stale peer state.
-			s.remove(remote.String())
+			s.remove(key)
 		}
 		s.createPeer(h, fields, remote)
 		return
@@ -306,9 +323,17 @@ func (s *serverRuntime) createPeer(h Header, fields OpenFields, remote *net.UDPA
 			return
 		}
 	}
+	key, keyOK := serverPeerKey(remote)
+	if !keyOK {
+		if s.device == nil {
+			_ = peer.device.Close()
+		}
+		return
+	}
 	s.access.Lock()
-	s.peers[remote.String()] = peer
+	s.peers[key] = peer
 	s.byAddr[address] = peer
+	s.publishAddressSnapshotLocked()
 	s.access.Unlock()
 	peer.lastSeen.Store(time.Now().UnixNano())
 	ack, ackErr := BuildOpenAck(h, AckFields{MTU: fields.MTU, IP: addr4(address), Gateway: addr4(s.pool.Addr().Next()), Encrypt: fields.Encrypt})
@@ -349,9 +374,11 @@ func (s *serverRuntime) writeSharedDevice(packets []*buf.Buffer) error {
 			}
 			continue
 		}
-		s.access.RLock()
-		peer := s.byAddr[address]
-		s.access.RUnlock()
+		table := s.byAddrSnapshot.Load()
+		var peer *serverPeer
+		if table != nil {
+			peer = table.peers[address]
+		}
 		if peer == nil {
 			// No peer owns this destination anymore (for example after a
 			// timeout). Drop it instead of sending it to an unrelated session.
@@ -526,12 +553,13 @@ func (s *serverRuntime) allocate() (netip.Addr, bool) {
 	return netip.Addr{}, false
 }
 
-func (s *serverRuntime) remove(key string) {
+func (s *serverRuntime) remove(key netip.AddrPort) {
 	s.access.Lock()
 	peer := s.peers[key]
 	delete(s.peers, key)
 	if peer != nil {
 		delete(s.byAddr, peer.address)
+		s.publishAddressSnapshotLocked()
 	}
 	s.access.Unlock()
 	if peer != nil && peer.device != nil && s.device == nil {
@@ -540,7 +568,7 @@ func (s *serverRuntime) remove(key string) {
 }
 
 func (s *serverRuntime) reap(now time.Time) {
-	var expired []string
+	var expired []netip.AddrPort
 	s.access.RLock()
 	for key, peer := range s.peers {
 		last := peer.lastSeen.Load()
@@ -552,6 +580,32 @@ func (s *serverRuntime) reap(now time.Time) {
 	for _, key := range expired {
 		s.remove(key)
 	}
+}
+
+func (s *serverRuntime) publishAddressSnapshotLocked() {
+	peers := make(map[netip.Addr]*serverPeer, len(s.byAddr))
+	for address, peer := range s.byAddr {
+		peers[address] = peer
+	}
+	s.byAddrSnapshot.Store(&serverPeerAddressTable{peers: peers})
+}
+
+func serverPeerKey(remote *net.UDPAddr) (netip.AddrPort, bool) {
+	if remote == nil || remote.Port < 0 || remote.Port > 65535 {
+		return netip.AddrPort{}, false
+	}
+	ip := remote.IP
+	if v4 := ip.To4(); v4 != nil {
+		ip = v4
+	}
+	address, ok := netip.AddrFromSlice(ip)
+	if !ok {
+		return netip.AddrPort{}, false
+	}
+	if remote.Zone != "" {
+		address = address.WithZone(remote.Zone)
+	}
+	return netip.AddrPortFrom(address, uint16(remote.Port)), true
 }
 
 func (s *serverRuntime) close() error {
@@ -569,6 +623,8 @@ func (s *serverRuntime) close() error {
 		delete(s.peers, key)
 		peers = append(peers, peer)
 	}
+	clear(s.byAddr)
+	s.publishAddressSnapshotLocked()
 	s.access.Unlock()
 	for _, peer := range peers {
 		if s.device == nil {
