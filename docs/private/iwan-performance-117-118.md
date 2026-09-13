@@ -122,3 +122,13 @@ failure.
 The tuning walk now follows bounded `Upstream()` wrappers (connection-manager
 and accounting layers) before giving up. This closes the common case where a
 wrapped native UDP connection otherwise retained the host default buffer.
+
+With the lab kernel queue limits temporarily raised to 64 MiB, the wrapped
+client socket reported `rb33554432` (the expected kernel-doubled 16 MiB
+request). A repeat measured 389 Mbit/s at a 400 Mbit/s offer with 2.8% loss,
+and 454 Mbit/s at a 1 Gbit/s offer with 54% loss. The client TUN still counted
+457,810 TX drops and the server UDP counters rose by 52,296 receive-buffer
+errors during the run. The larger socket queue therefore removes a wrapper
+configuration gap but does not close the packet-rate/TUN-reader bottleneck;
+the 1 Gbit/s loss-free gate remains unmet. The temporary sysctl changes and
+lab processes were stopped and the original 4 MiB kernel limits restored.
