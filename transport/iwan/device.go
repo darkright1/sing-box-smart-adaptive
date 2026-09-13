@@ -3,6 +3,7 @@ package iwan
 import (
 	"context"
 	"net/netip"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -98,6 +99,49 @@ type baseDevice struct {
 	returnState  atomic.Pointer[returnPathState]
 }
 
+const maxInboundWorkspaceItems = 256
+
+type inboundWorkspace struct {
+	packets [][]byte
+	buffers []*buf.Buffer
+}
+
+var inboundWorkspacePool = sync.Pool{New: func() any {
+	return &inboundWorkspace{
+		packets: make([][]byte, 0, 32),
+		buffers: make([]*buf.Buffer, 0, 32),
+	}
+}}
+
+func acquireInboundWorkspace(size int) *inboundWorkspace {
+	workspace := inboundWorkspacePool.Get().(*inboundWorkspace)
+	if cap(workspace.packets) < size {
+		workspace.packets = make([][]byte, size)
+	} else {
+		workspace.packets = workspace.packets[:size]
+	}
+	if cap(workspace.buffers) < size {
+		workspace.buffers = make([]*buf.Buffer, size)
+	} else {
+		workspace.buffers = workspace.buffers[:size]
+	}
+	return workspace
+}
+
+func releaseInboundWorkspace(workspace *inboundWorkspace) {
+	if workspace == nil {
+		return
+	}
+	clear(workspace.packets[:cap(workspace.packets)])
+	clear(workspace.buffers[:cap(workspace.buffers)])
+	if cap(workspace.packets) > maxInboundWorkspaceItems || cap(workspace.buffers) > maxInboundWorkspaceItems {
+		return
+	}
+	workspace.packets = workspace.packets[:0]
+	workspace.buffers = workspace.buffers[:0]
+	inboundWorkspacePool.Put(workspace)
+}
+
 func (d *baseDevice) SetPacketWriter(writer PacketWriter) {
 	d.packetWriter = writer
 }
@@ -118,7 +162,9 @@ func (d *baseDevice) processInboundBuffers(packetBuffers []*buf.Buffer, writeBuf
 	if state == nil {
 		return writeBuffers(packetBuffers)
 	}
-	packets := make([][]byte, len(packetBuffers))
+	workspace := acquireInboundWorkspace(len(packetBuffers))
+	defer releaseInboundWorkspace(workspace)
+	packets := workspace.packets
 	for i, packetBuffer := range packetBuffers {
 		packetBuffer.ExtendHeader(state.headroom)
 		packets[i] = packetBuffer.Bytes()
@@ -127,7 +173,15 @@ func (d *baseDevice) processInboundBuffers(packetBuffers []*buf.Buffer, writeBuf
 	if len(unconsumed) == 0 {
 		return nil
 	}
-	unconsumedBuffers := make([]*buf.Buffer, len(unconsumed))
+	if len(unconsumed) > len(workspace.buffers) {
+		// A return implementation should normally return a subset of the input,
+		// so the common path stays allocation-free. Still handle a malformed
+		// implementation safely instead of indexing past the scratch slice.
+		workspace.buffers = make([]*buf.Buffer, len(unconsumed))
+	} else {
+		workspace.buffers = workspace.buffers[:len(unconsumed)]
+	}
+	unconsumedBuffers := workspace.buffers
 	for i, packet := range unconsumed {
 		packetBuffer := buf.As(packet)
 		packetBuffer.Advance(state.headroom)

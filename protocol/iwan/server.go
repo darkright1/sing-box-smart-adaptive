@@ -438,10 +438,14 @@ func (s *serverRuntime) writeSharedDevice(packets []*buf.Buffer) error {
 	validPeers := workspace.validPeers[:0]
 	groups := workspace.groups[:0]
 	defer func() {
-		clear(valid)
-		clear(validPeers)
-		for i := range groups {
-			clear(groups[i].packets)
+		// These slices are taken from [:0]. Clear their full backing arrays,
+		// not just the current lengths, so pooled workspaces do not retain peer
+		// or packet references from an earlier mixed-destination batch.
+		clear(valid[:cap(valid)])
+		clear(validPeers[:cap(validPeers)])
+		for i := range groups[:cap(groups)] {
+			clear(groups[i].packets[:cap(groups[i].packets)])
+			groups[i] = sharedPeerBatch{}
 		}
 		workspace.valid = valid[:0]
 		workspace.validPeers = validPeers[:0]

@@ -310,10 +310,13 @@ func (d *systemDevice) writeBuffers(packetBuffers []*buf.Buffer) error {
 		packets := workspace.packets[:0]
 		temporaryBuffers := workspace.temporary[:0]
 		defer func() {
-			clear(workspace.packets)
-			clear(workspace.temporary)
-			workspace.packets = workspace.packets[:0]
-			workspace.temporary = workspace.temporary[:0]
+			// packets/temporaryBuffers are grown from [:0], so clearing the
+			// workspace slices themselves (whose length is still zero) would
+			// leave stale buffer references in the pooled backing arrays.
+			clear(packets[:cap(packets)])
+			clear(temporaryBuffers[:cap(temporaryBuffers)])
+			workspace.packets = packets[:0]
+			workspace.temporary = temporaryBuffers[:0]
 			systemDeviceWriteWorkspacePool.Put(workspace)
 		}()
 		if cap(packets) < len(packetBuffers) {
