@@ -143,6 +143,11 @@ no `hash.Hash` or temporary one-byte slices. These changes reduce allocator and
 lock pressure without changing packet ordering, queue sharding, MTU handling,
 or the bounded backpressure behavior.
 
+The per-shard burst backlog is bounded at 1024 packets (roughly 2 MiB at the
+default MTU), up from 256. This spends a small, fixed amount of memory to
+absorb scheduler bursts while retaining a hard ceiling; sustained overload is
+still back-pressured and counted rather than allowed to grow the heap.
+
 The change was validated on Linux with `go test -race` and `go vet` for the
 iWAN protocol and device packages, plus a full tagged build. A fresh line-rate
 throughput run for this exact revision is still required; the last verified
