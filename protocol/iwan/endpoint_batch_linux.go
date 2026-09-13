@@ -15,8 +15,11 @@ import (
 	"golang.org/x/net/ipv4"
 )
 
-const iwanClientReadBatchSize = 32
-const iwanClientWriteBatchSize = 64
+// Larger fixed batches amortize recvmmsg/sendmmsg syscall and scheduler cost
+// at high packet rates. ReadBatch still returns as soon as the kernel has
+// data, so this does not add an intentional wait for low-volume traffic.
+const iwanClientReadBatchSize = 64
+const iwanClientWriteBatchSize = 128
 
 type iwanWriteBatchWorkspace struct {
 	messages []ipv4.Message

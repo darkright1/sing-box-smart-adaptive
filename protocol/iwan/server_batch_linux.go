@@ -13,8 +13,11 @@ import (
 	"golang.org/x/net/ipv4"
 )
 
-const iwanReadBatchSize = 32
-const iwanWriteBatchSize = 64
+// Keep server batching symmetric with the client. The arrays are fixed and
+// pooled, so the larger batch trades a bounded amount of memory for fewer
+// kernel crossings without introducing per-packet allocations.
+const iwanReadBatchSize = 64
+const iwanWriteBatchSize = 128
 
 type iwanPeerWriteBatchWorkspace struct {
 	messages []ipv4.Message
