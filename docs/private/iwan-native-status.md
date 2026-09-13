@@ -8,6 +8,12 @@ negative validation errors. It also exposes read-only Linux capability probes
 for TUN VNET/multi-queue and UDP GRO/SEGMENT state; probes never enable or
 mutate an offload.
 
+The ABI preflights an entire batch before writing any output, accepts
+overlapping input/output slabs with memmove semantics, and uses
+architecture-correct Linux TUN ioctl values. `make test` also compiles C
+static assertions against the header so Rust `repr(C)` and C consumers cannot
+drift silently.
+
 This is a foundation layer, not yet the production native dataplane. The Go
 path remains authoritative until the following are integrated and verified on
 Linux: TUN queue ownership, UDP socket I/O, VNET/GSO/GRO conversion, native-L3
