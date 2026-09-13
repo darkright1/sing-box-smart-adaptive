@@ -4,6 +4,7 @@ package iwan
 
 import (
 	"sync"
+	"sync/atomic"
 
 	"github.com/sagernet/sing-tun"
 	"github.com/sagernet/sing-tun/gtcpip/header"
@@ -90,11 +91,13 @@ func (d *systemDevice) readLoopLinuxQueue(tunInterface tun.LinuxTUN, mtu int, di
 }
 
 type systemDevicePacketDispatcher struct {
-	device     *systemDevice
-	shards     []chan *buf.Buffer
-	bufferPool sync.Pool
-	workers    sync.WaitGroup
-	closed     chan struct{}
+	device        *systemDevice
+	shards        []chan *buf.Buffer
+	bufferPool    sync.Pool
+	workers       sync.WaitGroup
+	closed        chan struct{}
+	queueDrops    atomic.Uint64
+	shutdownDrops atomic.Uint64
 }
 
 func newSystemDevicePacketDispatcher(device *systemDevice, shardCount, mtu int) *systemDevicePacketDispatcher {
@@ -133,8 +136,10 @@ func (d *systemDevicePacketDispatcher) Submit(packet *buf.Buffer) bool {
 	case d.shards[index] <- packet:
 		return true
 	case <-d.closed:
+		d.shutdownDrops.Add(1)
 		return false
 	default:
+		d.queueDrops.Add(1)
 		return false
 	}
 }
@@ -150,6 +155,9 @@ func (d *systemDevicePacketDispatcher) Close() {
 		close(shard)
 	}
 	d.workers.Wait()
+	if queueDrops, shutdownDrops := d.queueDrops.Load(), d.shutdownDrops.Load(); queueDrops != 0 || shutdownDrops != 0 {
+		d.device.options.Logger.Debug("iWAN TUN dispatcher drops: queue_full=", queueDrops, " shutdown=", shutdownDrops)
+	}
 }
 
 func (d *systemDevicePacketDispatcher) worker(shard <-chan *buf.Buffer) {
