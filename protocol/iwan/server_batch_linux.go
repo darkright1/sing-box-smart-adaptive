@@ -118,6 +118,7 @@ func (s *serverRuntime) writePeerBatch(peer *serverPeer, packets []*buf.Buffer) 
 			}
 			wire, err = s.wrapPeer(peer, second)
 			if err != nil {
+				releaseWirePacket(second, secondPool)
 				return true, err
 			}
 			if err = appendMessage(wire, second, secondPool); err != nil {
