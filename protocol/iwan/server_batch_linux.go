@@ -130,9 +130,8 @@ func (s *serverRuntime) writePeerBatch(peer *serverPeer, packets []*buf.Buffer) 
 // readLoopBatch uses recvmmsg through x/net/ipv4 on Linux. The packet
 // buffers live for the lifetime of the loop and are handed to handle only
 // synchronously, so the next receive can safely reuse them.
-func (s *serverRuntime) readLoopBatch() bool {
-	defer close(s.done)
-	packetConn := ipv4.NewPacketConn(s.conn)
+func (s *serverRuntime) readLoopBatch(conn *net.UDPConn, reapEnabled bool) bool {
+	packetConn := ipv4.NewPacketConn(conn)
 	messages := make([]ipv4.Message, iwanReadBatchSize)
 	backings := make([][]byte, iwanReadBatchSize)
 	for i := range messages {
@@ -140,11 +139,13 @@ func (s *serverRuntime) readLoopBatch() bool {
 		messages[i].Buffers = [][]byte{backings[i][transport.PacketHeadroom:]}
 	}
 	for {
-		_ = s.conn.SetReadDeadline(time.Now().Add(time.Second))
+		_ = conn.SetReadDeadline(time.Now().Add(time.Second))
 		n, err := packetConn.ReadBatch(messages, 0)
 		if err != nil {
 			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-				s.reap(time.Now())
+				if reapEnabled {
+					s.reap(time.Now())
+				}
 				continue
 			}
 			return true

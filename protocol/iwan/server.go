@@ -20,6 +20,11 @@ import (
 type serverRuntime struct {
 	endpoint *Endpoint
 	conn     *net.UDPConn
+	// conns contains the SO_REUSEPORT reader set. conn remains the primary
+	// writer socket so control/data egress keeps one stable source endpoint.
+	// The reader set is intentionally optional: one socket is the portable
+	// default, while Linux can opt into one recvmmsg owner per socket.
+	conns []*net.UDPConn
 	// systemDevice is one shared native TUN for the whole server endpoint.
 	// A per-peer TUN cannot provide a stable kernel route once more than one
 	// peer is online; responses are demultiplexed by the assigned destination
@@ -94,28 +99,35 @@ func (s *serverRuntime) start() error {
 	if port == 0 {
 		port = 8000
 	}
-	conn, err := net.ListenUDP("udp", &net.UDPAddr{IP: listenIP, Port: int(port)})
+	listenAddr := &net.UDPAddr{IP: listenIP, Port: int(port)}
+	conns, err := listenIWANServerSockets(listenAddr, int(s.endpoint.options.ServerSocketReaders))
 	if err != nil {
 		return err
 	}
-	if err = conn.SetReadBuffer(iwanSocketBufferSize); err != nil {
-		s.endpoint.logger.Debug("iWAN server receive buffer tuning unavailable: ", err)
+	for _, conn := range conns {
+		if err = conn.SetReadBuffer(iwanSocketBufferSize); err != nil {
+			s.endpoint.logger.Debug("iWAN server receive buffer tuning unavailable: ", err)
+		}
+		if err = conn.SetWriteBuffer(iwanSocketBufferSize); err != nil {
+			s.endpoint.logger.Debug("iWAN server send buffer tuning unavailable: ", err)
+		}
 	}
-	if err = conn.SetWriteBuffer(iwanSocketBufferSize); err != nil {
-		s.endpoint.logger.Debug("iWAN server send buffer tuning unavailable: ", err)
+	s.conn = conns[0]
+	s.conns = conns
+	if len(conns) > 1 {
+		s.endpoint.logger.Info("iWAN server UDP ingress readers: ", len(conns))
 	}
-	s.conn = conn
 	pool := s.endpoint.options.PoolCIDR
 	if pool == "" {
 		pool = "10.255.0.0/24"
 	}
 	s.pool, err = netip.ParsePrefix(pool)
 	if err != nil || !s.pool.Addr().Is4() {
-		_ = conn.Close()
+		closeIWANServerSockets(conns)
 		return fmt.Errorf("invalid iWAN pool %q", pool)
 	}
 	if s.pool.Bits() >= 31 {
-		_ = conn.Close()
+		closeIWANServerSockets(conns)
 		return errors.New("iWAN pool must contain at least two IPv4 addresses")
 	}
 	if s.endpoint.options.System {
@@ -135,13 +147,13 @@ func (s *serverRuntime) start() error {
 			},
 		})
 		if deviceErr != nil {
-			_ = conn.Close()
+			closeIWANServerSockets(conns)
 			return E.Cause(deviceErr, "iWAN shared native device")
 		}
 		device.SetPacketWriter(s.writeSharedDevice)
 		if deviceErr = device.Start(); deviceErr != nil {
 			_ = device.Close()
-			_ = conn.Close()
+			closeIWANServerSockets(conns)
 			return E.Cause(deviceErr, "iWAN shared native device start")
 		}
 		s.device = device
@@ -151,21 +163,45 @@ func (s *serverRuntime) start() error {
 }
 
 func (s *serverRuntime) readLoop() {
-	if s.readLoopBatch() {
+	// The standalone iWAN dataplane uses one ingress owner per SO_REUSEPORT
+	// socket. Keep the same structure here, but retain a single-reader default
+	// for compatibility with kernels and transports without reuse-port.
+	if len(s.conns) <= 1 {
+		s.readLoopConn(s.conn, true)
+		close(s.done)
 		return
 	}
-	s.readLoopSingle()
+	var readers sync.WaitGroup
+	readers.Add(len(s.conns))
+	for index, conn := range s.conns {
+		go func(index int, conn *net.UDPConn) {
+			defer readers.Done()
+			// Only one reader owns idle-peer reaping; duplicate reapers would
+			// be safe under the map lock but needlessly scan the same table.
+			s.readLoopConn(conn, index == 0)
+		}(index, conn)
+	}
+	readers.Wait()
+	close(s.done)
 }
 
-func (s *serverRuntime) readLoopSingle() {
-	defer close(s.done)
+func (s *serverRuntime) readLoopConn(conn *net.UDPConn, reapEnabled bool) {
+	if s.readLoopBatch(conn, reapEnabled) {
+		return
+	}
+	s.readLoopSingle(conn, reapEnabled)
+}
+
+func (s *serverRuntime) readLoopSingle(conn *net.UDPConn, reapEnabled bool) {
 	var packet [64 * 1024]byte
 	for {
-		_ = s.conn.SetReadDeadline(time.Now().Add(time.Second))
-		n, remote, err := s.conn.ReadFromUDP(packet[:])
+		_ = conn.SetReadDeadline(time.Now().Add(time.Second))
+		n, remote, err := conn.ReadFromUDP(packet[:])
 		if err != nil {
 			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-				s.reap(time.Now())
+				if reapEnabled {
+					s.reap(time.Now())
+				}
 				continue
 			}
 			return
@@ -609,10 +645,15 @@ func serverPeerKey(remote *net.UDPAddr) (netip.AddrPort, bool) {
 }
 
 func (s *serverRuntime) close() error {
-	if s.conn == nil {
+	if len(s.conns) == 0 && s.conn == nil {
 		return nil
 	}
-	err := s.conn.Close()
+	var err error
+	if len(s.conns) != 0 {
+		closeIWANServerSockets(s.conns)
+	} else {
+		err = s.conn.Close()
+	}
 	if s.device != nil {
 		_ = s.device.Close()
 	}
