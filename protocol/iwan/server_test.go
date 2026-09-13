@@ -72,3 +72,16 @@ func TestServerPeerKeyNormalizesIPv4(t *testing.T) {
 		t.Fatal("nil peer address accepted")
 	}
 }
+
+func TestServerFastPeerRequiresRemoteTuple(t *testing.T) {
+	remote := netip.AddrPortFrom(netip.MustParseAddr("192.0.2.10"), 1234)
+	peer := &serverPeer{remoteKey: remote, header: Header{SID: 7, Token: 11}}
+	runtime := &serverRuntime{peers: map[netip.AddrPort]*serverPeer{remote: peer}}
+	runtime.publishSIDSnapshotLocked()
+	if runtime.fastPeer(7, remote) != peer {
+		t.Fatal("matching SID and remote tuple did not use fast table")
+	}
+	if runtime.fastPeer(7, netip.AddrPortFrom(netip.MustParseAddr("192.0.2.11"), 1234)) != nil {
+		t.Fatal("fast table accepted a different remote tuple")
+	}
+}

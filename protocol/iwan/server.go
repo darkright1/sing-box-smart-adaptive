@@ -40,29 +40,39 @@ type serverRuntime struct {
 	// packet-rate and only needs a lock-free read; peer create/remove publish a
 	// cloned table, which is rare compared with packet forwarding.
 	byAddrSnapshot atomic.Pointer[serverPeerAddressTable]
-	done           chan struct{}
-	fragID         atomic.Uint32
+	// bySIDSnapshot is the standalone iWAN SID fast path.  Established DATA
+	// packets are authenticated by SID+token+remote tuple and therefore do not
+	// need to take the server peer-map read lock on every packet.  Control and
+	// reconnect packets continue to use the remote-key map below.
+	bySIDSnapshot atomic.Pointer[serverPeerSIDTable]
+	done          chan struct{}
+	fragID        atomic.Uint32
 }
 
 type serverPeerAddressTable struct {
 	peers map[netip.Addr]*serverPeer
 }
 
+type serverPeerSIDTable struct {
+	peers map[uint16]*serverPeer
+}
+
 type serverPeer struct {
-	remote   *net.UDPAddr
-	header   Header
-	user     string
-	password string
-	key      [16]byte
-	encrypt  bool
-	links    []uint32
-	srPass   string
-	device   transport.Device
-	address  netip.Addr
-	lastSeen atomic.Int64
-	writeMu  sync.Mutex
-	fragMu   sync.Mutex
-	frags    *FragReassembler
+	remote    *net.UDPAddr
+	remoteKey netip.AddrPort
+	header    Header
+	user      string
+	password  string
+	key       [16]byte
+	encrypt   bool
+	links     []uint32
+	srPass    string
+	device    transport.Device
+	address   netip.Addr
+	lastSeen  atomic.Int64
+	writeMu   sync.Mutex
+	fragMu    sync.Mutex
+	frags     *FragReassembler
 }
 
 type sharedPeerBatch struct {
@@ -87,6 +97,7 @@ var sharedWriteWorkspacePool = sync.Pool{New: func() any {
 func newServerRuntime(endpoint *Endpoint) *serverRuntime {
 	runtime := &serverRuntime{endpoint: endpoint, peers: make(map[netip.AddrPort]*serverPeer), byAddr: make(map[netip.Addr]*serverPeer), done: make(chan struct{})}
 	runtime.publishAddressSnapshotLocked()
+	runtime.publishSIDSnapshotLocked()
 	return runtime
 }
 
@@ -225,6 +236,26 @@ func (s *serverRuntime) handleWithBacking(packet []byte, remote *net.UDPAddr, ba
 	if !ok {
 		return nil, nil
 	}
+	// Established plain DATA is the dominant server ingress path.  Mirror the
+	// standalone daemon's SID table so this path is lock-free after the
+	// authenticated snapshot lookup. A remote tuple check prevents a stale or
+	// colliding SID from being accepted from another source.
+	if len(packet) >= HeaderLen && (packet[0] == PTData || packet[0] == PTDataEnc) {
+		if h, parseErr := ParseHeader(packet); parseErr == nil {
+			if peer := s.fastPeer(h.SID, key); peer != nil {
+				return s.handleData(peer, h, packet, viewBacking)
+			}
+			// A SID collision or a control-plane snapshot published just
+			// before this reader observed it must not turn a valid remote-key
+			// session into a drop. The old locked map is the rare fallback;
+			// established traffic remains lock-free in the normal case.
+			s.access.RLock()
+			peer := s.peers[key]
+			s.access.RUnlock()
+			return s.handleData(peer, h, packet, viewBacking)
+		}
+		return nil, nil
+	}
 	s.access.RLock()
 	peer := s.peers[key]
 	s.access.RUnlock()
@@ -265,23 +296,7 @@ func (s *serverRuntime) handleWithBacking(packet []byte, remote *net.UDPAddr, ba
 			peer.lastSeen.Store(time.Now().UnixNano())
 		}
 	case PTData, PTDataEnc:
-		if peer == nil || h.SID != peer.header.SID || h.Token != peer.header.Token {
-			return nil, nil
-		}
-		if len(packet) == HeaderLen {
-			return nil, nil
-		}
-		payload := packet[HeaderLen:]
-		if h.Type == PTDataEnc {
-			if !peer.encrypt {
-				return nil, nil
-			}
-			xorInPlace(peer.key, payload, payload)
-		}
-		if viewBacking != nil {
-			return peer, newInboundPacketView(viewBacking, HeaderLen, len(payload))
-		}
-		return peer, newInboundPacketBuffer(payload)
+		return s.handleData(peer, h, packet, viewBacking)
 	case PTIPFrag:
 		if peer == nil || h.SID != peer.header.SID || h.Token != peer.header.Token {
 			return nil, nil
@@ -305,6 +320,35 @@ func (s *serverRuntime) handleWithBacking(packet []byte, remote *net.UDPAddr, ba
 		}
 	}
 	return nil, nil
+}
+
+func (s *serverRuntime) fastPeer(sid uint16, key netip.AddrPort) *serverPeer {
+	table := s.bySIDSnapshot.Load()
+	if table == nil {
+		return nil
+	}
+	peer := table.peers[sid]
+	if peer == nil || peer.remoteKey != key || peer.header.SID != sid {
+		return nil
+	}
+	return peer
+}
+
+func (s *serverRuntime) handleData(peer *serverPeer, h Header, packet, backing []byte) (*serverPeer, *buf.Buffer) {
+	if peer == nil || h.SID != peer.header.SID || h.Token != peer.header.Token || len(packet) == HeaderLen {
+		return nil, nil
+	}
+	payload := packet[HeaderLen:]
+	if h.Type == PTDataEnc {
+		if !peer.encrypt {
+			return nil, nil
+		}
+		xorInPlace(peer.key, payload, payload)
+	}
+	if backing != nil {
+		return peer, newInboundPacketView(backing, HeaderLen, len(payload))
+	}
+	return peer, newInboundPacketBuffer(payload)
 }
 
 func (s *serverRuntime) handleOpen(packet []byte, remote *net.UDPAddr, old *serverPeer) {
@@ -338,7 +382,12 @@ func (s *serverRuntime) createPeer(h Header, fields OpenFields, remote *net.UDPA
 		s.writeRaw(remote, BuildOpenReject(h, []byte("address pool exhausted")))
 		return
 	}
-	peer := &serverPeer{remote: remote, header: Header{Type: PTData, Encrypt: boolByte(fields.Encrypt), SID: h.SID, Token: h.Token}, user: fields.User, password: fields.Password, key: xorCredentialKey(fields.User, fields.Password), encrypt: fields.Encrypt, links: append([]uint32(nil), fields.Links...), srPass: s.endpoint.options.SRPassword, address: address, frags: NewFragReassembler()}
+	remoteKey, keyOK := serverPeerKey(remote)
+	if !keyOK {
+		return
+	}
+	key := remoteKey
+	peer := &serverPeer{remote: remote, remoteKey: remoteKey, header: Header{Type: PTData, Encrypt: boolByte(fields.Encrypt), SID: h.SID, Token: h.Token}, user: fields.User, password: fields.Password, key: xorCredentialKey(fields.User, fields.Password), encrypt: fields.Encrypt, links: append([]uint32(nil), fields.Links...), srPass: s.endpoint.options.SRPassword, address: address, frags: NewFragReassembler()}
 	if s.device != nil {
 		// Native system mode uses one shared TUN.  The server-level writer
 		// demultiplexes packets by their destination address.
@@ -359,17 +408,11 @@ func (s *serverRuntime) createPeer(h Header, fields OpenFields, remote *net.UDPA
 			return
 		}
 	}
-	key, keyOK := serverPeerKey(remote)
-	if !keyOK {
-		if s.device == nil {
-			_ = peer.device.Close()
-		}
-		return
-	}
 	s.access.Lock()
 	s.peers[key] = peer
 	s.byAddr[address] = peer
 	s.publishAddressSnapshotLocked()
+	s.publishSIDSnapshotLocked()
 	s.access.Unlock()
 	peer.lastSeen.Store(time.Now().UnixNano())
 	ack, ackErr := BuildOpenAck(h, AckFields{MTU: fields.MTU, IP: addr4(address), Gateway: addr4(s.pool.Addr().Next()), Encrypt: fields.Encrypt})
@@ -596,6 +639,7 @@ func (s *serverRuntime) remove(key netip.AddrPort) {
 	if peer != nil {
 		delete(s.byAddr, peer.address)
 		s.publishAddressSnapshotLocked()
+		s.publishSIDSnapshotLocked()
 	}
 	s.access.Unlock()
 	if peer != nil && peer.device != nil && s.device == nil {
@@ -624,6 +668,16 @@ func (s *serverRuntime) publishAddressSnapshotLocked() {
 		peers[address] = peer
 	}
 	s.byAddrSnapshot.Store(&serverPeerAddressTable{peers: peers})
+}
+
+func (s *serverRuntime) publishSIDSnapshotLocked() {
+	peers := make(map[uint16]*serverPeer, len(s.peers))
+	for _, peer := range s.peers {
+		if peer != nil {
+			peers[peer.header.SID] = peer
+		}
+	}
+	s.bySIDSnapshot.Store(&serverPeerSIDTable{peers: peers})
 }
 
 func serverPeerKey(remote *net.UDPAddr) (netip.AddrPort, bool) {
@@ -666,6 +720,7 @@ func (s *serverRuntime) close() error {
 	}
 	clear(s.byAddr)
 	s.publishAddressSnapshotLocked()
+	s.publishSIDSnapshotLocked()
 	s.access.Unlock()
 	for _, peer := range peers {
 		if s.device == nil {
