@@ -11,7 +11,10 @@ import (
 	E "github.com/sagernet/sing/common/exceptions"
 )
 
-const systemDeviceMultiQueueShardCapacity = 256
+// A bounded per-shard backlog absorbs short scheduler and socket bursts.  At
+// the default MTU this is about 2 MiB per shard, which is deliberately large
+// enough for burst tolerance but still finite under sustained overload.
+const systemDeviceMultiQueueShardCapacity = 1024
 
 // readLoopLinuxQueues gives every TUN queue its own reader.  Packets are then
 // sharded by their 5-tuple into bounded workers.  A shard is the ordering
