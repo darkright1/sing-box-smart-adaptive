@@ -15,11 +15,17 @@ import (
 	transport "github.com/sagernet/sing-box/transport/iwan"
 	"github.com/sagernet/sing/common/buf"
 	E "github.com/sagernet/sing/common/exceptions"
+	"golang.org/x/net/ipv4"
 )
 
 type serverRuntime struct {
 	endpoint *Endpoint
 	conn     *net.UDPConn
+	// packetConn wraps the stable primary writer socket once. The standalone
+	// dataplane keeps its batch socket wrapper alive for the worker lifetime;
+	// recreating x/net/ipv4.PacketConn for every peer batch adds avoidable heap
+	// churn on the server egress path.
+	packetConn *ipv4.PacketConn
 	// conns contains the SO_REUSEPORT reader set. conn remains the primary
 	// writer socket so control/data egress keeps one stable source endpoint.
 	// The reader set is intentionally optional: one socket is the portable
@@ -125,6 +131,7 @@ func (s *serverRuntime) start() error {
 	}
 	s.conn = conns[0]
 	s.conns = conns
+	s.packetConn = ipv4.NewPacketConn(s.conn)
 	if len(conns) > 1 {
 		s.endpoint.logger.Info("iWAN server UDP ingress readers: ", len(conns))
 	}

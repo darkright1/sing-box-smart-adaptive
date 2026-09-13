@@ -44,7 +44,10 @@ func (s *serverRuntime) writePeerBatch(peer *serverPeer, packets []*buf.Buffer) 
 	if s.conn == nil || peer == nil || peer.remote == nil || peer.remote.IP.To4() == nil {
 		return false, nil
 	}
-	packetConn := ipv4.NewPacketConn(s.conn)
+	packetConn := s.packetConn
+	if packetConn == nil {
+		packetConn = ipv4.NewPacketConn(s.conn)
+	}
 	workspace := iwanPeerWriteBatchWorkspacePool.Get().(*iwanPeerWriteBatchWorkspace)
 	messages := workspace.messages[:0]
 	pooled := workspace.pooled[:0]
