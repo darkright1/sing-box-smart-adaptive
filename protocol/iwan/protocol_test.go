@@ -128,6 +128,19 @@ func TestFragReassemblerConcurrentAccess(t *testing.T) {
 	wg.Wait()
 }
 
+func TestFragReassemblerBoundsPendingState(t *testing.T) {
+	r := NewFragReassembler()
+	for id := uint32(0); id < IWAN_FRAG_PENDING_MAX+32; id++ {
+		_, err := r.Add(Frag{Header: Header{Type: PTIPFrag}, ID: id, Offset: 0, Length: 1, Payload: []byte{byte(id)}}, int64(id+1))
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := len(r.pending); got > IWAN_FRAG_PENDING_MAX {
+		t.Fatalf("pending fragment state exceeded bound: %d", got)
+	}
+}
+
 func FuzzPacketParsersNeverPanic(f *testing.F) {
 	f.Add([]byte{0x13, 0, 0, 0, 0, 0, 0, 0})
 	f.Add([]byte{0x25, 0, 0, 0, 0, 0, 0, 0, 1, 2, 3})

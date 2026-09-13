@@ -29,6 +29,10 @@ const (
 	IWAN_FRAG_MAXPAY    = 2047
 	IWAN_FRAG_REASM_MAX = 4096
 	IWAN_FRAG_TIMEOUT   = 10
+	// A peer may have many packets in flight, but an unbounded number of
+	// incomplete IDs would turn the reassembler into a memory sink. Keep this
+	// bounded independently of the payload-size limit.
+	IWAN_FRAG_PENDING_MAX = 1024
 )
 
 // Header layout is sdwan_pkthdr_t [DWARF sdwan.h:43]. Wire integers are BE.
@@ -385,6 +389,19 @@ func (r *FragReassembler) Add(f Frag, now int64) ([]byte, error) {
 	}
 	if f.Offset != 0 {
 		return nil, errors.New("unsupported nonzero first fragment")
+	}
+	if _, exists := r.pending[f.ID]; !exists && len(r.pending) >= IWAN_FRAG_PENDING_MAX {
+		var oldestID uint32
+		var oldestAt int64
+		first := true
+		for id, p := range r.pending {
+			if first || p.At < oldestAt {
+				oldestID, oldestAt, first = id, p.At, false
+			}
+		}
+		if !first {
+			delete(r.pending, oldestID)
+		}
 	}
 	r.pending[f.ID] = FragPiece{append([]byte(nil), f.Payload...), now}
 	return nil, nil
