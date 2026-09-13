@@ -112,3 +112,9 @@ The Linux IPv4 batch writers now reuse one fixed one-buffer slot per message
 instead of allocating `[][]byte{packet}` for each datagram. The slots are
 cleared when the workspace returns to the pool, and partial `WriteBatch`
 progress still drains before slots are reused.
+
+Socket tuning now requests 16 MiB and falls back through `syscall.Conn` to
+`SO_RCVBUF`/`SO_SNDBUF` for wrapped UDP connections. The effective size still
+depends on `net.core.rmem_max`/`wmem_max`; the code logs and continues when a
+host refuses the hint rather than treating a performance hint as a startup
+failure.
