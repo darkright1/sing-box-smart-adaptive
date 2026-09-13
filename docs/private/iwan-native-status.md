@@ -4,7 +4,9 @@
 dataplane. It currently provides a C ABI for bounded single-frame and batch
 DATA framing with the frozen iWAN header and 8-byte XOR wire transform. The
 Rust code retains no caller pointers after an ABI call and returns explicit
-negative validation errors.
+negative validation errors. It also exposes read-only Linux capability probes
+for TUN VNET/multi-queue and UDP GRO/SEGMENT state; probes never enable or
+mutate an offload.
 
 This is a foundation layer, not yet the production native dataplane. The Go
 path remains authoritative until the following are integrated and verified on

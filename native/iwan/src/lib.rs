@@ -2,6 +2,11 @@
 
 pub const IWAN_HEADER_LEN: usize = 8;
 
+pub const IWAN_CAP_TUN_VNET_HDR: u32 = 1 << 0;
+pub const IWAN_CAP_TUN_MULTI_QUEUE: u32 = 1 << 1;
+pub const IWAN_CAP_UDP_GRO: u32 = 1 << 2;
+pub const IWAN_CAP_UDP_SEGMENT: u32 = 1 << 3;
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct IwanHeader {
@@ -71,7 +76,14 @@ pub unsafe extern "C" fn iwan_native_build_data(
         return -3;
     }
     let header = unsafe { *header };
-    let payload = unsafe { std::slice::from_raw_parts(payload, payload_len) };
+    // A zero-length C buffer may be represented by a null pointer. Rust still
+    // requires a non-null, aligned pointer for `from_raw_parts`, even when the
+    // length is zero, so use a canonical empty slice in that case.
+    let payload = if payload_len == 0 {
+        &[]
+    } else {
+        unsafe { std::slice::from_raw_parts(payload, payload_len) }
+    };
     let output = unsafe { std::slice::from_raw_parts_mut(output, required) };
     write_header(&mut output[..IWAN_HEADER_LEN], header);
     if header.encrypt != 0 {
@@ -92,6 +104,9 @@ pub unsafe extern "C" fn iwan_native_build_batch(
 ) -> isize {
     if count != 0 && packets.is_null() {
         return -1;
+    }
+    if count == 0 {
+        return 0;
     }
     let packets = unsafe { std::slice::from_raw_parts(packets, count) };
     for packet in packets {
@@ -117,6 +132,106 @@ pub extern "C" fn iwan_native_abi_version() -> u32 {
     1
 }
 
+// Linux ioctl values are stable across the supported architectures. The
+// probe is deliberately read-only: it never enables an offload or changes a
+// socket, so a failed probe is safe to treat as a compatibility fallback.
+#[cfg(target_os = "linux")]
+const TUNGETIFF: LibcUlong = 0x8004_54d2;
+#[cfg(target_os = "linux")]
+const TUNGETVNETHDRSZ: LibcUlong = 0x4004_54d7;
+#[cfg(target_os = "linux")]
+const IFF_MULTI_QUEUE: u16 = 0x0100;
+#[cfg(target_os = "linux")]
+const IFF_VNET_HDR: u16 = 0x4000;
+#[cfg(target_os = "linux")]
+type LibcUlong = usize;
+
+#[cfg(target_os = "linux")]
+unsafe extern "C" {
+    fn ioctl(fd: i32, request: LibcUlong, ...) -> i32;
+    fn getsockopt(
+        fd: i32,
+        level: i32,
+        name: i32,
+        value: *mut core::ffi::c_void,
+        length: *mut u32,
+    ) -> i32;
+}
+
+/// Probe read-only features of an already opened Linux TUN fd. Returns zero
+/// on non-Linux, invalid fd, or an ioctl failure.
+#[no_mangle]
+pub unsafe extern "C" fn iwan_native_probe_tun(fd: i32) -> u32 {
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = fd;
+        return 0;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let mut ifr = [0u8; 40];
+        if unsafe { ioctl(fd, TUNGETIFF, ifr.as_mut_ptr()) } < 0 {
+            return 0;
+        }
+        let flags = u16::from_ne_bytes([ifr[16], ifr[17]]);
+        let mut result = 0;
+        if flags & IFF_VNET_HDR != 0 {
+            let mut header_size = 0i32;
+            if unsafe { ioctl(fd, TUNGETVNETHDRSZ, &mut header_size) } == 0 && header_size >= 10 {
+                result |= IWAN_CAP_TUN_VNET_HDR;
+            }
+        }
+        if flags & IFF_MULTI_QUEUE != 0 {
+            result |= IWAN_CAP_TUN_MULTI_QUEUE;
+        }
+        result
+    }
+}
+
+/// Probe the current read-only UDP offload settings on a socket. A zero
+/// result means unavailable or disabled; callers may still use the ordinary
+/// batched send/receive path.
+#[no_mangle]
+pub unsafe extern "C" fn iwan_native_probe_udp(fd: i32) -> u32 {
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = fd;
+        return 0;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        const SOL_UDP: i32 = 17;
+        const UDP_GRO: i32 = 104;
+        const UDP_SEGMENT: i32 = 103;
+        let mut result = 0;
+        for (name, capability) in [
+            (UDP_GRO, IWAN_CAP_UDP_GRO),
+            (UDP_SEGMENT, IWAN_CAP_UDP_SEGMENT),
+        ] {
+            // Both options are exposed as an int. Passing a one-byte buffer
+            // with a four-byte length would let the kernel overwrite memory,
+            // so keep the value and socklen_t-sized length explicit.
+            let mut value = 0i32;
+            let mut length = std::mem::size_of::<i32>() as u32;
+            if unsafe {
+                getsockopt(
+                    fd,
+                    SOL_UDP,
+                    name,
+                    (&mut value as *mut i32).cast(),
+                    &mut length,
+                )
+            } == 0
+                && length >= std::mem::size_of::<i32>() as u32
+                && value != 0
+            {
+                result |= capability;
+            }
+        }
+        result
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -127,6 +242,52 @@ mod tests {
         assert_eq!(std::mem::size_of::<IwanHeader>(), 8);
         assert_eq!(std::mem::align_of::<IwanHeader>(), 4);
         assert_eq!(std::mem::size_of::<IwanPacketDesc>(), 48);
+    }
+
+    #[test]
+    fn capability_bits_are_disjoint() {
+        let all = [
+            IWAN_CAP_TUN_VNET_HDR,
+            IWAN_CAP_TUN_MULTI_QUEUE,
+            IWAN_CAP_UDP_GRO,
+            IWAN_CAP_UDP_SEGMENT,
+        ];
+        for (index, bit) in all.iter().enumerate() {
+            assert_eq!(bit.count_ones(), 1);
+            for other in &all[index + 1..] {
+                assert_eq!(bit & other, 0);
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn capability_probes_fail_closed_for_invalid_fds() {
+        assert_eq!(unsafe { iwan_native_probe_tun(-1) }, 0);
+        assert_eq!(unsafe { iwan_native_probe_udp(-1) }, 0);
+    }
+
+    #[test]
+    fn empty_c_buffers_and_batches_are_safe() {
+        let header = IwanHeader {
+            kind: 0x14,
+            encrypt: 0,
+            sid_be: 0,
+            token_be: 0,
+        };
+        let mut output = [0u8; IWAN_HEADER_LEN];
+        let written = unsafe {
+            iwan_native_build_data(
+                &header,
+                ptr::null(),
+                0,
+                ptr::null(),
+                output.as_mut_ptr(),
+                output.len(),
+            )
+        };
+        assert_eq!(written, IWAN_HEADER_LEN as isize);
+        assert_eq!(unsafe { iwan_native_build_batch(ptr::null(), 0) }, 0);
     }
 
     #[test]
