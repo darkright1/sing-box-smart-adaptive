@@ -8,7 +8,9 @@ import (
 	"io"
 	"net"
 	"sync"
+	"time"
 
+	transport "github.com/sagernet/sing-box/transport/iwan"
 	"github.com/sagernet/sing/common/buf"
 	"golang.org/x/net/ipv4"
 )
@@ -129,9 +131,12 @@ func (e *Endpoint) readLoopBatch() bool {
 	}
 	packetConn := ipv4.NewPacketConn(conn)
 	messages := make([]ipv4.Message, iwanClientReadBatchSize)
+	backings := make([][]byte, iwanClientReadBatchSize)
 	for i := range messages {
-		messages[i].Buffers = [][]byte{make([]byte, 64*1024)}
+		backings[i] = make([]byte, transport.PacketHeadroom+64*1024)
+		messages[i].Buffers = [][]byte{backings[i][transport.PacketHeadroom:]}
 	}
+	inboundBatch := make([]*buf.Buffer, iwanClientReadBatchSize)
 	for e.started.Load() && !e.suspended.Load() {
 		n, err := packetConn.ReadBatch(messages, 0)
 		if err != nil {
@@ -148,11 +153,33 @@ func (e *Endpoint) readLoopBatch() bool {
 			}
 			return true
 		}
+		inboundBatch = inboundBatch[:0]
+		batchReceived := false
 		for i := 0; i < n; i++ {
 			if messages[i].N <= 0 {
 				continue
 			}
-			if !e.processIncomingPacket(messages[i].Buffers[0][:messages[i].N]) {
+			batchReceived = true
+			inbound, ok := e.decodeIncomingPacket(messages[i].Buffers[0][:messages[i].N], backings[i])
+			if inbound != nil {
+				inboundBatch = append(inboundBatch, inbound)
+			}
+			if !ok {
+				buf.ReleaseMulti(inboundBatch)
+				return true
+			}
+		}
+		if batchReceived {
+			e.lastRx.Store(time.Now().UnixNano())
+		}
+		if len(inboundBatch) > 0 {
+			err := e.device.WriteInboundBuffers(inboundBatch)
+			buf.ReleaseMulti(inboundBatch)
+			if err != nil {
+				select {
+				case e.readErr <- err:
+				default:
+				}
 				return true
 			}
 		}

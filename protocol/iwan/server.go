@@ -27,7 +27,7 @@ type serverRuntime struct {
 	device  transport.Device
 	pool    netip.Prefix
 	next    atomic.Uint32
-	access  sync.Mutex
+	access  sync.RWMutex
 	allocMu sync.Mutex
 	peers   map[string]*serverPeer
 	byAddr  map[netip.Addr]*serverPeer
@@ -48,8 +48,28 @@ type serverPeer struct {
 	address  netip.Addr
 	lastSeen atomic.Int64
 	writeMu  sync.Mutex
+	fragMu   sync.Mutex
 	frags    *FragReassembler
 }
+
+type sharedPeerBatch struct {
+	peer    *serverPeer
+	packets []*buf.Buffer
+}
+
+type sharedWriteWorkspace struct {
+	valid      []*buf.Buffer
+	validPeers []*serverPeer
+	groups     []sharedPeerBatch
+}
+
+var sharedWriteWorkspacePool = sync.Pool{New: func() any {
+	return &sharedWriteWorkspace{
+		valid:      make([]*buf.Buffer, 0, 64),
+		validPeers: make([]*serverPeer, 0, 64),
+		groups:     make([]sharedPeerBatch, 0, 4),
+	}
+}}
 
 func newServerRuntime(endpoint *Endpoint) *serverRuntime {
 	return &serverRuntime{endpoint: endpoint, peers: make(map[string]*serverPeer), byAddr: make(map[netip.Addr]*serverPeer), done: make(chan struct{})}
@@ -140,28 +160,41 @@ func (s *serverRuntime) readLoopSingle() {
 			}
 			return
 		}
-		s.handle(packet[:n], remote)
+		peer, inbound := s.handle(packet[:n], remote)
+		if inbound != nil {
+			peer.lastSeen.Store(time.Now().UnixNano())
+			peer.device.WriteInboundBuffers([]*buf.Buffer{inbound})
+			inbound.Release()
+		}
 	}
 }
 
-func (s *serverRuntime) handle(packet []byte, remote *net.UDPAddr) {
+func (s *serverRuntime) handle(packet []byte, remote *net.UDPAddr) (*serverPeer, *buf.Buffer) {
+	return s.handleWithBacking(packet, remote, nil)
+}
+
+func (s *serverRuntime) handleWithBacking(packet []byte, remote *net.UDPAddr, backing []byte) (*serverPeer, *buf.Buffer) {
+	viewBacking := backing
 	key := remote.String()
-	s.access.Lock()
+	s.access.RLock()
 	peer := s.peers[key]
-	s.access.Unlock()
+	s.access.RUnlock()
 	if len(packet) > 0 && packet[0] == PTSegRT {
 		if peer == nil || len(peer.links) == 0 || peer.srPass == "" {
-			return
+			return nil, nil
 		}
 		var err error
 		packet, err = UnwrapSR(packet, peer.links, peer.srPass)
 		if err != nil {
-			return
+			return nil, nil
 		}
+		// UnwrapSR returns a transformed allocation, not a view into the
+		// recvmmsg slot, so it cannot be exposed as a zero-copy TUN buffer.
+		viewBacking = nil
 	}
 	h, err := ParseHeader(packet)
 	if err != nil {
-		return
+		return nil, nil
 	}
 	switch h.Type {
 	case PTOpen:
@@ -170,7 +203,7 @@ func (s *serverRuntime) handle(packet []byte, remote *net.UDPAddr) {
 		if peer != nil && h.SID == peer.header.SID && h.Token == peer.header.Token {
 			_, payload, verifyErr := VerifySigned(packet)
 			if verifyErr != nil {
-				return
+				return nil, nil
 			}
 			peer.lastSeen.Store(time.Now().UnixNano())
 			s.write(peer, BuildEchoResponse(h, payload))
@@ -178,47 +211,43 @@ func (s *serverRuntime) handle(packet []byte, remote *net.UDPAddr) {
 	case PTEchoResp:
 		if peer != nil && h.SID == peer.header.SID && h.Token == peer.header.Token {
 			if _, _, verifyErr := VerifySigned(packet); verifyErr != nil {
-				return
+				return nil, nil
 			}
 			peer.lastSeen.Store(time.Now().UnixNano())
 		}
 	case PTData, PTDataEnc:
 		if peer == nil || h.SID != peer.header.SID || h.Token != peer.header.Token {
-			return
+			return nil, nil
 		}
-		peer.lastSeen.Store(time.Now().UnixNano())
-		_, payload, err := parseDataView(packet)
-		if err != nil {
-			return
+		if len(packet) == HeaderLen {
+			return nil, nil
 		}
+		payload := packet[HeaderLen:]
 		if h.Type == PTDataEnc {
 			if !peer.encrypt {
-				return
+				return nil, nil
 			}
 			xorInPlace(peer.key, payload, payload)
 		}
-		inbound := buf.NewSize(len(payload))
-		_, _ = inbound.Write(payload)
-		if err = peer.device.WriteInboundBuffers([]*buf.Buffer{inbound}); err != nil {
-			inbound.Release()
+		if viewBacking != nil {
+			return peer, newInboundPacketView(viewBacking, HeaderLen, len(payload))
 		}
+		return peer, newInboundPacketBuffer(payload)
 	case PTIPFrag:
 		if peer == nil || h.SID != peer.header.SID || h.Token != peer.header.Token {
-			return
+			return nil, nil
 		}
 		fragment, fragmentErr := ParseFrag(packet)
 		if fragmentErr != nil {
-			return
+			return nil, nil
 		}
+		peer.fragMu.Lock()
 		payload, fragmentErr := peer.frags.Add(fragment, time.Now().UnixNano())
+		peer.fragMu.Unlock()
 		if fragmentErr != nil || len(payload) == 0 {
-			return
+			return nil, nil
 		}
-		inbound := buf.NewSize(len(payload))
-		_, _ = inbound.Write(payload)
-		if err = peer.device.WriteInboundBuffers([]*buf.Buffer{inbound}); err != nil {
-			inbound.Release()
-		}
+		return peer, newInboundPacketBuffer(payload)
 	case PTClose:
 		if peer != nil && h.SID == peer.header.SID && h.Token == peer.header.Token {
 			if _, _, verifyErr := VerifySigned(packet); verifyErr == nil {
@@ -226,6 +255,7 @@ func (s *serverRuntime) handle(packet []byte, remote *net.UDPAddr) {
 			}
 		}
 	}
+	return nil, nil
 }
 
 func (s *serverRuntime) handleOpen(packet []byte, remote *net.UDPAddr, old *serverPeer) {
@@ -292,7 +322,24 @@ func (s *serverRuntime) createPeer(h Header, fields OpenFields, remote *net.UDPA
 // destination is the virtual address assigned to the client.  Route it back
 // through exactly that client's authenticated iWAN session.
 func (s *serverRuntime) writeSharedDevice(packets []*buf.Buffer) error {
+	workspace := sharedWriteWorkspacePool.Get().(*sharedWriteWorkspace)
+	valid := workspace.valid[:0]
+	validPeers := workspace.validPeers[:0]
+	groups := workspace.groups[:0]
+	defer func() {
+		clear(valid)
+		clear(validPeers)
+		for i := range groups {
+			clear(groups[i].packets)
+		}
+		workspace.valid = valid[:0]
+		workspace.validPeers = validPeers[:0]
+		workspace.groups = workspace.groups[:0]
+		sharedWriteWorkspacePool.Put(workspace)
+	}()
+	var commonPeer *serverPeer
 	var firstErr error
+	allSame := true
 	for _, packet := range packets {
 		address, ok := packetDestination(packet.Bytes())
 		if !ok {
@@ -302,16 +349,51 @@ func (s *serverRuntime) writeSharedDevice(packets []*buf.Buffer) error {
 			}
 			continue
 		}
-		s.access.Lock()
+		s.access.RLock()
 		peer := s.byAddr[address]
-		s.access.Unlock()
+		s.access.RUnlock()
 		if peer == nil {
 			// No peer owns this destination anymore (for example after a
 			// timeout). Drop it instead of sending it to an unrelated session.
 			packet.Release()
 			continue
 		}
-		if err := s.writePeer(peer, []*buf.Buffer{packet}); err != nil && firstErr == nil {
+		if commonPeer == nil {
+			commonPeer = peer
+		}
+		if commonPeer != peer {
+			allSame = false
+		}
+		valid = append(valid, packet)
+		validPeers = append(validPeers, peer)
+	}
+	if commonPeer == nil || len(valid) == 0 {
+		return nil
+	}
+	if allSame {
+		if err := s.writePeer(commonPeer, valid); err != nil && firstErr == nil {
+			firstErr = err
+		}
+		return firstErr
+	}
+	// A mixed-destination batch is uncommon. Group it without returning early
+	// so every accepted buffer is released even if one peer's socket fails.
+	for i, packet := range valid {
+		peer := validPeers[i]
+		found := false
+		for i := range groups {
+			if groups[i].peer == peer {
+				groups[i].packets = append(groups[i].packets, packet)
+				found = true
+				break
+			}
+		}
+		if !found {
+			groups = append(groups, sharedPeerBatch{peer: peer, packets: []*buf.Buffer{packet}})
+		}
+	}
+	for _, group := range groups {
+		if err := s.writePeer(group.peer, group.packets); err != nil && firstErr == nil {
 			firstErr = err
 		}
 	}
@@ -429,14 +511,14 @@ func (s *serverRuntime) allocate() (netip.Addr, bool) {
 		}
 		address := netip.AddrFrom4([4]byte{byte(candidate >> 24), byte(candidate >> 16), byte(candidate >> 8), byte(candidate)})
 		used := false
-		s.access.Lock()
+		s.access.RLock()
 		for _, peer := range s.peers {
 			if peer.address == address {
 				used = true
 				break
 			}
 		}
-		s.access.Unlock()
+		s.access.RUnlock()
 		if !used {
 			return address, true
 		}
@@ -459,14 +541,14 @@ func (s *serverRuntime) remove(key string) {
 
 func (s *serverRuntime) reap(now time.Time) {
 	var expired []string
-	s.access.Lock()
+	s.access.RLock()
 	for key, peer := range s.peers {
 		last := peer.lastSeen.Load()
 		if last == 0 || now.Sub(time.Unix(0, last)) > 45*time.Second {
 			expired = append(expired, key)
 		}
 	}
-	s.access.Unlock()
+	s.access.RUnlock()
 	for _, key := range expired {
 		s.remove(key)
 	}

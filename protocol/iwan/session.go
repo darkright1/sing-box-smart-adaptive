@@ -133,10 +133,10 @@ func (s *Session) Handle(packet []byte) (payload []byte, control Header, err err
 		if control.SID != state.header.SID || control.Token != state.header.Token {
 			return nil, control, errors.New("iWAN session identity mismatch")
 		}
-		_, payload, err = parseDataView(packet)
-		if err != nil {
-			return nil, control, err
+		if len(packet) == HeaderLen {
+			return nil, control, errors.New("empty DATA")
 		}
+		payload = packet[HeaderLen:]
 		if control.Type == PTDataEnc {
 			if !state.encrypted {
 				return nil, control, errors.New("unexpected encrypted iWAN data")

@@ -85,6 +85,9 @@ func (d *systemDevice) startLocked() error {
 		tunInterface.Close()
 		return err
 	}
+	if queueErr := tuneSystemTunQueue(d.options.Name); queueErr != nil {
+		d.options.Logger.Debug("iWAN TUN queue tuning unavailable: ", queueErr)
+	}
 	d.device = tunInterface
 	d.options.Logger.Info("started at ", d.options.Name)
 	go d.readLoop(tunInterface, int(d.options.MTU))

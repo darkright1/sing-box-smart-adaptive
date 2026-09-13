@@ -3,9 +3,12 @@
 package iwan
 
 import (
+	"bytes"
 	"fmt"
 	"net/netip"
 	"testing"
+
+	transport "github.com/sagernet/sing-box/transport/iwan"
 )
 
 func TestPacketDestination(t *testing.T) {
@@ -25,6 +28,20 @@ func TestPacketDestination(t *testing.T) {
 		if got, ok := packetDestination(packet); ok || got.IsValid() {
 			t.Fatalf("malformed packet accepted: %x -> %v, %v", packet, got, ok)
 		}
+	}
+}
+
+func TestInboundPacketView(t *testing.T) {
+	payload := []byte{0x45, 1, 2, 3, 4, 5}
+	backing := make([]byte, transport.PacketHeadroom+HeaderLen+len(payload))
+	copy(backing[transport.PacketHeadroom+HeaderLen:], payload)
+	view := newInboundPacketView(backing, HeaderLen, len(payload))
+	defer view.Release()
+	if view.Start() != transport.PacketHeadroom+HeaderLen {
+		t.Fatalf("unexpected view start: %d", view.Start())
+	}
+	if !bytes.Equal(view.Bytes(), payload) {
+		t.Fatalf("unexpected view payload: %x", view.Bytes())
 	}
 }
 

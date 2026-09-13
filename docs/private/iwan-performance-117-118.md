@@ -70,3 +70,24 @@ rejects the current Go/native-TUN path for the 1 Gbit/s zero-loss target. The
 remaining bottleneck is packet-rate processing and framing in the Go endpoint;
 the native Rust dataplane and multiqueue harness described above remain
 required before any production performance claim.
+
+## 2026-09-13 native-path optimization pass
+
+The integrated path was then changed to batch decoded packets into one TUN
+write, reuse Linux recvmmsg backing slots as headroom-aware views (avoiding a
+second payload allocation/copy), release every inbound buffer after device
+submission, avoid duplicate DATA header parsing, and raise the bounded native
+TUN transmit queue to 10,000 packets. The queue increase is applied only when
+a system TUN is created.
+
+On the same two-vCPU guests, post-change smoke results were:
+
+| Offer | Receiver | Loss |
+| ---: | ---: | ---: |
+| UDP 400 Mbit/s | 385 Mbit/s | 3.8% |
+| UDP 1 Gbit/s | 486 Mbit/s | 49% |
+| TCP 5 s | 205 Mbit/s | 110 retransmits |
+
+The zero-copy and queue changes reduce the earlier 64% UDP loss, but the
+native Go endpoint still does not meet the 1 Gbit/s loss-free gate. These are
+lab measurements only; no production VM was changed.

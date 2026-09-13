@@ -65,6 +65,7 @@ type Endpoint struct {
 	lastRx      atomic.Int64
 	fragID      atomic.Uint32
 	writeMu     sync.Mutex
+	fragMu      sync.Mutex
 	frags       *FragReassembler
 }
 
@@ -349,45 +350,62 @@ func (e *Endpoint) readLoopSingle() {
 // not reuse the receive buffer until this function returns.
 func (e *Endpoint) processIncomingPacket(packet []byte) bool {
 	e.lastRx.Store(time.Now().UnixNano())
+	inbound, ok := e.decodeIncomingPacket(packet, nil)
+	if inbound == nil {
+		return ok
+	}
+	err := e.device.WriteInboundBuffers([]*buf.Buffer{inbound})
+	inbound.Release()
+	if err != nil {
+		select {
+		case e.readErr <- err:
+		default:
+		}
+		return false
+	}
+	return ok
+}
+
+// decodeIncomingPacket validates and unwraps one datagram.  Data packets are
+// returned as owned buffers so Linux recvmmsg callers can submit a whole
+// batch to the TUN device with one write operation.
+func (e *Endpoint) decodeIncomingPacket(packet []byte, backing []byte) (*buf.Buffer, bool) {
+	viewBacking := backing
 	wire, err := e.session.Unwrap(packet)
 	if err != nil {
 		e.logger.Debug("iWAN source-routing packet rejected: ", err)
-		return true
+		return nil, true
+	}
+	if len(packet) > 0 && packet[0] == PTSegRT {
+		viewBacking = nil
 	}
 	payload, control, err := e.session.Handle(wire)
 	if err != nil {
 		e.logger.Debug("iWAN packet rejected: ", err)
-		return true
+		return nil, true
 	}
 	switch control.Type {
 	case PTData, PTDataEnc:
 		if len(payload) == 0 {
-			return true
+			return nil, true
 		}
-		inbound := buf.NewSize(len(payload))
-		_, _ = inbound.Write(payload)
-		if err = e.device.WriteInboundBuffers([]*buf.Buffer{inbound}); err != nil {
-			inbound.Release()
-			select {
-			case e.readErr <- err:
-			default:
-			}
-			return false
+		if viewBacking != nil {
+			return newInboundPacketView(viewBacking, HeaderLen, len(payload)), true
 		}
+		return newInboundPacketBuffer(payload), true
 	case PTEchoReq:
 		e.writeControl(BuildEchoResponse(control, payload))
 	case PTIPFrag:
 		fragment, fragmentErr := ParseFrag(wire)
 		if fragmentErr != nil {
-			return true
+			return nil, true
 		}
+		e.fragMu.Lock()
 		if payload, fragmentErr = e.frags.Add(fragment, time.Now().UnixNano()); fragmentErr == nil && len(payload) != 0 {
-			inbound := buf.NewSize(len(payload))
-			_, _ = inbound.Write(payload)
-			if fragmentErr = e.device.WriteInboundBuffers([]*buf.Buffer{inbound}); fragmentErr != nil {
-				inbound.Release()
-			}
+			e.fragMu.Unlock()
+			return newInboundPacketBuffer(payload), true
 		}
+		e.fragMu.Unlock()
 	case PTClose:
 		e.ready.Store(false)
 		e.started.Store(false)
@@ -395,9 +413,31 @@ func (e *Endpoint) processIncomingPacket(packet []byte) bool {
 		case e.readErr <- errors.New("iWAN peer closed session"):
 		default:
 		}
-		return false
+		return nil, false
 	}
-	return true
+	return nil, true
+}
+
+// newInboundPacketBuffer reserves the headroom required by native TUN
+// BatchWrite up front.  Allocating only len(payload) forces systemDevice to
+// allocate and copy every packet a second time before it can prepend the
+// Linux TUN/VNET header.
+func newInboundPacketBuffer(payload []byte) *buf.Buffer {
+	packetBuffer := buf.NewSize(transport.PacketHeadroom + len(payload))
+	packetBuffer.Resize(transport.PacketHeadroom, 0)
+	_, _ = packetBuffer.Write(payload)
+	return packetBuffer
+}
+
+// newInboundPacketView exposes an already received Linux batch slot as a
+// buffer with the headroom expected by native TUN. The caller must keep the
+// backing slot untouched until WriteInboundBuffers returns; all current
+// batch writers are synchronous, so the next recvmmsg call can safely reuse it.
+func newInboundPacketView(backing []byte, payloadOffset, payloadLen int) *buf.Buffer {
+	end := transport.PacketHeadroom + payloadOffset + payloadLen
+	packetBuffer := buf.As(backing[:end])
+	packetBuffer.Advance(transport.PacketHeadroom + payloadOffset)
+	return packetBuffer
 }
 
 func (e *Endpoint) writeControl(packet []byte) {
