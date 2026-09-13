@@ -118,3 +118,7 @@ Socket tuning now requests 16 MiB and falls back through `syscall.Conn` to
 depends on `net.core.rmem_max`/`wmem_max`; the code logs and continues when a
 host refuses the hint rather than treating a performance hint as a startup
 failure.
+
+The tuning walk now follows bounded `Upstream()` wrappers (connection-manager
+and accounting layers) before giving up. This closes the common case where a
+wrapped native UDP connection otherwise retained the host default buffer.

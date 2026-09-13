@@ -21,8 +21,34 @@ type packetSocketBufferSetter interface {
 
 func tunePacketSocket(conn net.Conn) error {
 	var firstErr error
-	fallbackOK := false
+	for depth := 0; conn != nil && depth < 8; depth++ {
+		supported, err := tunePacketSocketOne(conn)
+		if supported {
+			if err == nil {
+				return nil
+			}
+			if firstErr == nil {
+				firstErr = err
+			}
+		}
+		upstreamer, ok := conn.(interface{ Upstream() any })
+		if !ok {
+			break
+		}
+		upstream, ok := upstreamer.Upstream().(net.Conn)
+		if !ok {
+			break
+		}
+		conn = upstream
+	}
+	return firstErr
+}
+
+func tunePacketSocketOne(conn net.Conn) (bool, error) {
+	var firstErr error
+	supported := false
 	if setter, ok := conn.(packetSocketBufferSetter); ok {
+		supported = true
 		if err := setter.SetReadBuffer(iwanSocketBufferSize); err != nil {
 			firstErr = err
 		}
@@ -37,6 +63,7 @@ func tunePacketSocket(conn net.Conn) error {
 	// compatibility fallback so wrapped native UDP sockets do not silently
 	// retain the 212 KiB default queue.
 	if syscallConn, ok := conn.(syscall.Conn); ok {
+		supported = true
 		raw, err := syscallConn.SyscallConn()
 		if err != nil {
 			if firstErr == nil {
@@ -54,13 +81,8 @@ func tunePacketSocket(conn net.Conn) error {
 				firstErr = controlErr
 			} else if socketErr != nil && firstErr == nil {
 				firstErr = socketErr
-			} else if controlErr == nil && socketErr == nil {
-				fallbackOK = true
 			}
 		}
 	}
-	if fallbackOK {
-		return nil
-	}
-	return firstErr
+	return supported, firstErr
 }
