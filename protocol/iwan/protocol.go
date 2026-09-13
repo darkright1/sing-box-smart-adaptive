@@ -559,6 +559,21 @@ func marshalFragInto(b []byte, f Frag) error {
 	return nil
 }
 func ParseFrag(b []byte) (Frag, error) {
+	f, err := ParseFragView(b)
+	if err != nil {
+		return Frag{}, err
+	}
+	// ParseFrag is the public owning form. Keep its historical contract even
+	// though the packet path below uses the zero-copy view variant.
+	f.Payload = append([]byte(nil), f.Payload...)
+	return f, nil
+}
+
+// ParseFragView validates an IPFRAG envelope and borrows its payload from b.
+// The view must not outlive the receive buffer. FragReassembler.Add copies
+// only when it stores or completes a reassembled packet, so callers can use
+// this form directly in recvmmsg loops without a transient payload copy.
+func ParseFragView(b []byte) (Frag, error) {
 	if len(b) < 16 {
 		return Frag{}, errors.New("short fragment")
 	}
@@ -574,7 +589,7 @@ func ParseFrag(b []byte) (Frag, error) {
 	if len(b) != 16+int(l) {
 		return Frag{}, fmt.Errorf("fragment length mismatch")
 	}
-	return Frag{h, binary.LittleEndian.Uint32(b[8:]), v&1 != 0, uint16(v >> 2 & 8191), l, append([]byte{}, b[16:]...)}, nil
+	return Frag{h, binary.LittleEndian.Uint32(b[8:]), v&1 != 0, uint16(v >> 2 & 8191), l, b[16:]}, nil
 }
 
 type Echo struct {

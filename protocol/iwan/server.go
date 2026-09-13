@@ -308,7 +308,7 @@ func (s *serverRuntime) handleWithBacking(packet []byte, remote *net.UDPAddr, ba
 		if peer == nil || h.SID != peer.header.SID || h.Token != peer.header.Token {
 			return nil, nil
 		}
-		fragment, fragmentErr := ParseFrag(packet)
+		fragment, fragmentErr := ParseFragView(packet)
 		if fragmentErr != nil {
 			return nil, nil
 		}

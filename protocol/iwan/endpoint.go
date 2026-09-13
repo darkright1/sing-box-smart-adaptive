@@ -419,7 +419,7 @@ func (e *Endpoint) decodeIncomingPacket(packet []byte, backing []byte) (*buf.Buf
 	case PTEchoReq:
 		e.writeControl(BuildEchoResponse(control, payload))
 	case PTIPFrag:
-		fragment, fragmentErr := ParseFrag(wire)
+		fragment, fragmentErr := ParseFragView(wire)
 		if fragmentErr != nil {
 			return nil, true
 		}

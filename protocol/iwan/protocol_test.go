@@ -31,6 +31,10 @@ func TestProtocolVectors(t *testing.T) {
 		if e != nil || q.Length != uint16(v) {
 			t.Fatal(e)
 		}
+		view, e := ParseFragView(x)
+		if e != nil || !bytes.Equal(view.Payload, q.Payload) {
+			t.Fatal(e)
+		}
 	}
 	p := PasswordCipher("u", "secret")
 	s, _ := PasswordDecrypt("u", p)
