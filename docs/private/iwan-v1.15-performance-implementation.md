@@ -13,7 +13,8 @@ but it is not eligible for the line-rate performance claim.
 
 Current implementation status: the Go Linux path has bounded multi-queue TUN
  dispatch, batched IPv4/IPv6 UDP I/O, pooled DATA/IPFRAG frames, borrowed fragment
-views, and bounded reassembly state. The private Rust native dataplane,
+views, bounded reassembly state, and explicit multi-queue VNET capability
+rejection are implemented. The private Rust native dataplane,
 GSO/GRO conversion, and native-L3 server path are not implemented in this
 branch and must not be implied by a Go build or by the microbenchmarks below.
 
