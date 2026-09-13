@@ -37,10 +37,10 @@ jobs:
       - name: Verify Rust ABI and build static library
         run: make -C native/iwan test && make -C native/iwan build TARGET=x86_64-unknown-linux-gnu
       - name: Go fallback tests
-        run: GOPROXY=off go test -tags with_iwan ./protocol/iwan ./transport/iwan
+        run: go test -tags with_iwan ./protocol/iwan ./transport/iwan
       - name: Go native tests and race checks
         run: |
-          GOPROXY=off CGO_ENABLED=1 go test -tags 'with_iwan,with_iwan_native' ./protocol/iwan ./transport/iwan
-          GOPROXY=off go test -race -tags with_iwan ./protocol/iwan ./transport/iwan
+          CGO_ENABLED=1 go test -tags 'with_iwan,with_iwan_native' ./protocol/iwan ./transport/iwan
+          go test -race -tags with_iwan ./protocol/iwan ./transport/iwan
       - name: Build private native binary
         run: make build_iwan_native IWAN_NATIVE_TARGET=x86_64-unknown-linux-gnu
