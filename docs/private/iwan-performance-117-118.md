@@ -107,3 +107,8 @@ still required before changing the 1 Gbit/s acceptance status.
 The Linux server recvmmsg loop also reuses its peer-batch map from a bounded
 workspace pool. This removes one map allocation per receive batch while
 retaining release-on-all-paths behavior for decoded TUN buffers.
+
+The Linux IPv4 batch writers now reuse one fixed one-buffer slot per message
+instead of allocating `[][]byte{packet}` for each datagram. The slots are
+cleared when the workspace returns to the pool, and partial `WriteBatch`
+progress still drains before slots are reused.

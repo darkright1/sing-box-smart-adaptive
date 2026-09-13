@@ -21,6 +21,7 @@ const iwanClientWriteBatchSize = 64
 type iwanWriteBatchWorkspace struct {
 	messages []ipv4.Message
 	pooled   []pooledWirePacket
+	buffers  [iwanClientWriteBatchSize][1][]byte
 }
 
 var iwanWriteBatchWorkspacePool = sync.Pool{New: func() any {
@@ -45,6 +46,9 @@ func (e *Endpoint) writeOutboundBatch(packetBuffers []*buf.Buffer) (bool, error)
 	defer func() {
 		clear(workspace.messages[:cap(workspace.messages)])
 		clear(workspace.pooled[:cap(workspace.pooled)])
+		for i := range workspace.buffers {
+			workspace.buffers[i][0] = nil
+		}
 		workspace.messages = messages[:0]
 		workspace.pooled = pooled[:0]
 		iwanWriteBatchWorkspacePool.Put(workspace)
@@ -72,7 +76,9 @@ func (e *Endpoint) writeOutboundBatch(packetBuffers []*buf.Buffer) (bool, error)
 	}
 	defer releasePooled()
 	appendMessage := func(packet []byte, releasePacket []byte, pool *wirePacket) error {
-		messages = append(messages, ipv4.Message{Buffers: [][]byte{packet}})
+		slot := len(messages)
+		workspace.buffers[slot][0] = packet
+		messages = append(messages, ipv4.Message{Buffers: workspace.buffers[slot][:]})
 		pooled = append(pooled, pooledWirePacket{packet: releasePacket, pool: pool})
 		if len(messages) == cap(messages) {
 			if err := flush(); err != nil {

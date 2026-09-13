@@ -19,6 +19,7 @@ const iwanWriteBatchSize = 64
 type iwanPeerWriteBatchWorkspace struct {
 	messages []ipv4.Message
 	pooled   []pooledWirePacket
+	buffers  [iwanWriteBatchSize][1][]byte
 }
 
 type serverInboundWorkspace struct {
@@ -50,6 +51,9 @@ func (s *serverRuntime) writePeerBatch(peer *serverPeer, packets []*buf.Buffer) 
 	defer func() {
 		clear(workspace.messages[:cap(workspace.messages)])
 		clear(workspace.pooled[:cap(workspace.pooled)])
+		for i := range workspace.buffers {
+			workspace.buffers[i][0] = nil
+		}
 		workspace.messages = messages[:0]
 		workspace.pooled = pooled[:0]
 		iwanPeerWriteBatchWorkspacePool.Put(workspace)
@@ -77,7 +81,9 @@ func (s *serverRuntime) writePeerBatch(peer *serverPeer, packets []*buf.Buffer) 
 	}
 	defer releasePooled()
 	appendMessage := func(wire []byte, releasePacket []byte, pool *wirePacket) error {
-		messages = append(messages, ipv4.Message{Buffers: [][]byte{wire}, Addr: peer.remote})
+		slot := len(messages)
+		workspace.buffers[slot][0] = wire
+		messages = append(messages, ipv4.Message{Buffers: workspace.buffers[slot][:], Addr: peer.remote})
 		pooled = append(pooled, pooledWirePacket{packet: releasePacket, pool: pool})
 		if len(messages) == cap(messages) {
 			if err := flush(); err != nil {
