@@ -103,3 +103,7 @@ longer takes the server `RWMutex`. Linux TUN batch writes also reuse their
 peer create/remove remains serialized and publishes a fresh snapshot only on
 membership changes. Unit and race tests pass; a new Linux throughput result is
 still required before changing the 1 Gbit/s acceptance status.
+
+The Linux server recvmmsg loop also reuses its peer-batch map from a bounded
+workspace pool. This removes one map allocation per receive batch while
+retaining release-on-all-paths behavior for decoded TUN buffers.

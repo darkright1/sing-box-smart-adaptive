@@ -21,6 +21,14 @@ type iwanPeerWriteBatchWorkspace struct {
 	pooled   []pooledWirePacket
 }
 
+type serverInboundWorkspace struct {
+	batches map[*serverPeer][]*buf.Buffer
+}
+
+var serverInboundWorkspacePool = sync.Pool{New: func() any {
+	return &serverInboundWorkspace{batches: make(map[*serverPeer][]*buf.Buffer, 2)}
+}}
+
 var iwanPeerWriteBatchWorkspacePool = sync.Pool{New: func() any {
 	return &iwanPeerWriteBatchWorkspace{
 		messages: make([]ipv4.Message, 0, iwanWriteBatchSize),
@@ -135,7 +143,8 @@ func (s *serverRuntime) readLoopBatch() bool {
 			}
 			return true
 		}
-		inboundBatches := make(map[*serverPeer][]*buf.Buffer, 2)
+		workspace := serverInboundWorkspacePool.Get().(*serverInboundWorkspace)
+		inboundBatches := workspace.batches
 		for i := 0; i < n; i++ {
 			if messages[i].N <= 0 {
 				continue
@@ -157,5 +166,7 @@ func (s *serverRuntime) readLoopBatch() bool {
 			_ = peer.device.WriteInboundBuffers(inbound)
 			buf.ReleaseMulti(inbound)
 		}
+		clear(inboundBatches)
+		serverInboundWorkspacePool.Put(workspace)
 	}
 }
