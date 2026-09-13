@@ -51,6 +51,34 @@ fn xor_payload_in_place(dst: &mut [u8], key: &[u8]) {
     }
 }
 
+#[inline]
+unsafe fn validate_data_inputs(
+    header: *const IwanHeader,
+    payload: *const u8,
+    payload_len: usize,
+    key: *const u8,
+    output: *mut u8,
+    output_cap: usize,
+) -> Result<(IwanHeader, usize), isize> {
+    if header.is_null() || output.is_null() || (payload_len != 0 && payload.is_null()) {
+        return Err(-1);
+    }
+    // The ABI is byte-oriented and may be called by a packed C consumer. Read
+    // the small header without imposing a Rust alignment requirement.
+    let header_value = unsafe { std::ptr::read_unaligned(header) };
+    let required = match IWAN_HEADER_LEN.checked_add(payload_len) {
+        Some(value) => value,
+        None => return Err(-2),
+    };
+    if output_cap < required {
+        return Err(-2);
+    }
+    if header_value.encrypt != 0 && key.is_null() {
+        return Err(-3);
+    }
+    Ok((header_value, required))
+}
+
 /// Build one DATA frame. Returns the encoded length, or a negative error:
 /// -1 invalid pointers, -2 output too small, -3 encrypted frame without key.
 #[no_mangle]
@@ -62,20 +90,12 @@ pub unsafe extern "C" fn iwan_native_build_data(
     output: *mut u8,
     output_cap: usize,
 ) -> isize {
-    if header.is_null() || output.is_null() || (payload_len != 0 && payload.is_null()) {
-        return -1;
-    }
-    let required = match IWAN_HEADER_LEN.checked_add(payload_len) {
-        Some(value) => value,
-        None => return -2,
+    let (header, required) = match unsafe {
+        validate_data_inputs(header, payload, payload_len, key, output, output_cap)
+    } {
+        Ok(value) => value,
+        Err(error) => return error,
     };
-    if output_cap < required {
-        return -2;
-    }
-    if unsafe { (*header).encrypt } != 0 && key.is_null() {
-        return -3;
-    }
-    let header = unsafe { *header };
     // Copy the key before touching output. Apart from avoiding an aliasing
     // hazard, this lets callers keep key material in the same slab as input.
     let key_copy = if header.encrypt != 0 {
@@ -105,8 +125,9 @@ pub unsafe extern "C" fn iwan_native_build_data(
     required as isize
 }
 
-/// Build a batch without retaining any caller pointers after the call.
-/// Returns the number of successful frames, or a negative validation error.
+/// Build a batch without retaining any caller pointers after the call. The
+/// descriptor array is preflighted before any output is touched, so a negative
+/// result leaves every output buffer unchanged.
 #[no_mangle]
 pub unsafe extern "C" fn iwan_native_build_batch(
     packets: *const IwanPacketDesc,
@@ -119,6 +140,20 @@ pub unsafe extern "C" fn iwan_native_build_batch(
         return 0;
     }
     let packets = unsafe { std::slice::from_raw_parts(packets, count) };
+    for packet in packets {
+        if let Err(error) = unsafe {
+            validate_data_inputs(
+                &packet.header,
+                packet.payload,
+                packet.payload_len,
+                packet.key,
+                packet.output,
+                packet.output_cap,
+            )
+        } {
+            return error;
+        }
+    }
     for packet in packets {
         let result = unsafe {
             iwan_native_build_data(
@@ -366,6 +401,34 @@ mod tests {
     }
 
     #[test]
+    fn packed_header_pointer_is_accepted() {
+        let header = IwanHeader {
+            kind: 0x14,
+            encrypt: 0,
+            sid_be: 9,
+            token_be: 13,
+        };
+        let mut encoded = [0u8; 9];
+        encoded[1] = header.kind;
+        encoded[2] = header.encrypt;
+        encoded[3..5].copy_from_slice(&header.sid_be.to_ne_bytes());
+        encoded[5..9].copy_from_slice(&header.token_be.to_ne_bytes());
+        let mut output = [0u8; IWAN_HEADER_LEN];
+        let written = unsafe {
+            iwan_native_build_data(
+                encoded.as_ptr().add(1).cast(),
+                ptr::null(),
+                0,
+                ptr::null(),
+                output.as_mut_ptr(),
+                output.len(),
+            )
+        };
+        assert_eq!(written, IWAN_HEADER_LEN as isize);
+        assert_eq!(output, [0x14, 0, 0, 9, 0, 0, 0, 13]);
+    }
+
+    #[test]
     fn builds_plain_and_encrypted_frames() {
         let header = IwanHeader { kind: 0x14, encrypt: 0, sid_be: 7u16.to_be(), token_be: 11u32.to_be() };
         let payload = b"native iwan";
@@ -384,7 +447,7 @@ mod tests {
     }
 
     #[test]
-    fn batch_rejects_short_output_without_claiming_success() {
+    fn batch_preflight_rejects_short_output_without_partial_writes() {
         let header = IwanHeader { kind: 0x14, encrypt: 0, sid_be: 1, token_be: 2 };
         let payload = [1u8, 2, 3];
         let mut first = [0u8; 16];
@@ -395,9 +458,8 @@ mod tests {
         ];
         let result = unsafe { iwan_native_build_batch(packets.as_ptr(), packets.len()) };
         assert_eq!(result, -2);
-        // The ABI reports failure for the whole batch; callers must discard
-        // any frames built before the failing descriptor.
-        assert_eq!(&first[..8], &[0x14, 0, 0, 1, 0, 0, 0, 2]);
+        // Preflight happens before the first descriptor is touched.
+        assert_eq!(&first[..], &[0; 16]);
         assert_eq!(&second[..8], &[0; 8]);
     }
 }
