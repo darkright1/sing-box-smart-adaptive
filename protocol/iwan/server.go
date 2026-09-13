@@ -14,18 +14,25 @@ import (
 	C "github.com/sagernet/sing-box/constant"
 	transport "github.com/sagernet/sing-box/transport/iwan"
 	"github.com/sagernet/sing/common/buf"
+	E "github.com/sagernet/sing/common/exceptions"
 )
 
 type serverRuntime struct {
 	endpoint *Endpoint
 	conn     *net.UDPConn
-	pool     netip.Prefix
-	next     atomic.Uint32
-	access   sync.Mutex
-	allocMu  sync.Mutex
-	peers    map[string]*serverPeer
-	done     chan struct{}
-	fragID   atomic.Uint32
+	// systemDevice is one shared native TUN for the whole server endpoint.
+	// A per-peer TUN cannot provide a stable kernel route once more than one
+	// peer is online; responses are demultiplexed by the assigned destination
+	// address in writeSharedDevice.
+	device  transport.Device
+	pool    netip.Prefix
+	next    atomic.Uint32
+	access  sync.Mutex
+	allocMu sync.Mutex
+	peers   map[string]*serverPeer
+	byAddr  map[netip.Addr]*serverPeer
+	done    chan struct{}
+	fragID  atomic.Uint32
 }
 
 type serverPeer struct {
@@ -45,7 +52,7 @@ type serverPeer struct {
 }
 
 func newServerRuntime(endpoint *Endpoint) *serverRuntime {
-	return &serverRuntime{endpoint: endpoint, peers: make(map[string]*serverPeer), done: make(chan struct{})}
+	return &serverRuntime{endpoint: endpoint, peers: make(map[string]*serverPeer), byAddr: make(map[netip.Addr]*serverPeer), done: make(chan struct{})}
 }
 
 func (s *serverRuntime) start() error {
@@ -80,6 +87,34 @@ func (s *serverRuntime) start() error {
 	if s.pool.Bits() >= 31 {
 		_ = conn.Close()
 		return errors.New("iWAN pool must contain at least two IPv4 addresses")
+	}
+	if s.endpoint.options.System {
+		// Put the gateway address and the complete pool prefix on one native
+		// TUN.  Linux then installs one connected route for every allocated
+		// peer address, while the read side can route replies by destination.
+		gatewayPrefix := netip.PrefixFrom(s.pool.Addr().Next(), s.pool.Bits())
+		device, deviceErr := transport.NewDevice(transport.DeviceOptions{
+			Context: s.endpoint.ctx,
+			Logger:  s.endpoint.logger,
+			System:  true,
+			Name:    s.endpoint.options.Name,
+			MTU:     s.endpoint.options.MTU,
+			Configuration: transport.Configuration{
+				MTU:     s.endpoint.options.MTU,
+				Address: []netip.Prefix{gatewayPrefix},
+			},
+		})
+		if deviceErr != nil {
+			_ = conn.Close()
+			return E.Cause(deviceErr, "iWAN shared native device")
+		}
+		device.SetPacketWriter(s.writeSharedDevice)
+		if deviceErr = device.Start(); deviceErr != nil {
+			_ = device.Close()
+			_ = conn.Close()
+			return E.Cause(deviceErr, "iWAN shared native device start")
+		}
+		s.device = device
 	}
 	go s.readLoop()
 	return nil
@@ -221,27 +256,89 @@ func (s *serverRuntime) createPeer(h Header, fields OpenFields, remote *net.UDPA
 		return
 	}
 	peer := &serverPeer{remote: remote, header: Header{Type: PTData, Encrypt: boolByte(fields.Encrypt), SID: h.SID, Token: h.Token}, user: fields.User, password: fields.Password, key: xorCredentialKey(fields.User, fields.Password), encrypt: fields.Encrypt, links: append([]uint32(nil), fields.Links...), srPass: s.endpoint.options.SRPassword, address: address, frags: NewFragReassembler()}
-	device, err := transport.NewDevice(transport.DeviceOptions{Context: s.endpoint.ctx, Logger: s.endpoint.logger, System: s.endpoint.options.System, Handler: s.endpoint, UDPTimeout: C.UDPTimeout, Name: s.endpoint.options.Name, MTU: uint32(fields.MTU), Configuration: transport.Configuration{MTU: uint32(fields.MTU), Address: []netip.Prefix{netip.PrefixFrom(address, 32)}}})
-	if err != nil {
-		s.endpoint.logger.Error("iWAN peer device unavailable: ", err)
-		s.writeRaw(remote, BuildOpenReject(h, []byte("device unavailable")))
-		return
-	}
-	peer.device = device
-	device.SetPacketWriter(func(packets []*buf.Buffer) error { return s.writePeer(peer, packets) })
-	if err = device.Start(); err != nil {
-		s.endpoint.logger.Error("iWAN peer device start failed: ", err)
-		_ = device.Close()
-		s.writeRaw(remote, BuildOpenReject(h, []byte("device start failed")))
-		return
+	if s.device != nil {
+		// Native system mode uses one shared TUN.  The server-level writer
+		// demultiplexes packets by their destination address.
+		peer.device = s.device
+	} else {
+		device, deviceErr := transport.NewDevice(transport.DeviceOptions{Context: s.endpoint.ctx, Logger: s.endpoint.logger, System: false, Handler: s.endpoint, UDPTimeout: C.UDPTimeout, Name: s.endpoint.options.Name, MTU: uint32(fields.MTU), Configuration: transport.Configuration{MTU: uint32(fields.MTU), Address: []netip.Prefix{netip.PrefixFrom(address, 32)}}})
+		if deviceErr != nil {
+			s.endpoint.logger.Error("iWAN peer device unavailable: ", deviceErr)
+			s.writeRaw(remote, BuildOpenReject(h, []byte("device unavailable")))
+			return
+		}
+		peer.device = device
+		device.SetPacketWriter(func(packets []*buf.Buffer) error { return s.writePeer(peer, packets) })
+		if deviceErr = device.Start(); deviceErr != nil {
+			s.endpoint.logger.Error("iWAN peer device start failed: ", deviceErr)
+			_ = device.Close()
+			s.writeRaw(remote, BuildOpenReject(h, []byte("device start failed")))
+			return
+		}
 	}
 	s.access.Lock()
 	s.peers[remote.String()] = peer
+	s.byAddr[address] = peer
 	s.access.Unlock()
 	peer.lastSeen.Store(time.Now().UnixNano())
 	ack, ackErr := BuildOpenAck(h, AckFields{MTU: fields.MTU, IP: addr4(address), Gateway: addr4(s.pool.Addr().Next()), Encrypt: fields.Encrypt})
 	if ackErr == nil {
 		s.write(peer, ack)
+	}
+}
+
+// writeSharedDevice is the native server TUN egress callback.  A packet read
+// from the shared TUN is a response generated by the host network stack; its
+// destination is the virtual address assigned to the client.  Route it back
+// through exactly that client's authenticated iWAN session.
+func (s *serverRuntime) writeSharedDevice(packets []*buf.Buffer) error {
+	var firstErr error
+	for _, packet := range packets {
+		address, ok := packetDestination(packet.Bytes())
+		if !ok {
+			packet.Release()
+			if firstErr == nil {
+				firstErr = errors.New("iWAN shared device emitted invalid IP packet")
+			}
+			continue
+		}
+		s.access.Lock()
+		peer := s.byAddr[address]
+		s.access.Unlock()
+		if peer == nil {
+			// No peer owns this destination anymore (for example after a
+			// timeout). Drop it instead of sending it to an unrelated session.
+			packet.Release()
+			continue
+		}
+		if err := s.writePeer(peer, []*buf.Buffer{packet}); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
+}
+
+func packetDestination(packet []byte) (netip.Addr, bool) {
+	if len(packet) < 1 {
+		return netip.Addr{}, false
+	}
+	switch packet[0] >> 4 {
+	case 4:
+		if len(packet) < 20 || int(packet[0]&0x0f) < 5 || len(packet) < int(packet[0]&0x0f)*4 {
+			return netip.Addr{}, false
+		}
+		var address [4]byte
+		copy(address[:], packet[16:20])
+		return netip.AddrFrom4(address), true
+	case 6:
+		if len(packet) < 40 {
+			return netip.Addr{}, false
+		}
+		var address [16]byte
+		copy(address[:], packet[24:40])
+		return netip.AddrFrom16(address), true
+	default:
+		return netip.Addr{}, false
 	}
 }
 
@@ -351,8 +448,11 @@ func (s *serverRuntime) remove(key string) {
 	s.access.Lock()
 	peer := s.peers[key]
 	delete(s.peers, key)
+	if peer != nil {
+		delete(s.byAddr, peer.address)
+	}
 	s.access.Unlock()
-	if peer != nil && peer.device != nil {
+	if peer != nil && peer.device != nil && s.device == nil {
 		_ = peer.device.Close()
 	}
 }
@@ -377,6 +477,9 @@ func (s *serverRuntime) close() error {
 		return nil
 	}
 	err := s.conn.Close()
+	if s.device != nil {
+		_ = s.device.Close()
+	}
 	<-s.done
 	s.access.Lock()
 	peers := make([]*serverPeer, 0, len(s.peers))
@@ -386,7 +489,9 @@ func (s *serverRuntime) close() error {
 	}
 	s.access.Unlock()
 	for _, peer := range peers {
-		_ = peer.device.Close()
+		if s.device == nil {
+			_ = peer.device.Close()
+		}
 	}
 	return err
 }
