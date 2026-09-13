@@ -32,13 +32,16 @@ The current integrated endpoint has several packet-rate ceilings:
 1. `writeOutbound` and `writePeer` call `UDPConn.Write`/`WriteToUDP` once per
    packet under shared locks; receive batching therefore loses most of its
    benefit on egress.
-2. Client and server data packets are copied into new `buf.Buffer` objects,
+2. MTU fragmentation still creates temporary payload copies and slices unless
+   it uses the pooled two-piece builder; this is a high-PPS allocation spike
+   on reduced-MTU links.
+3. Client and server data packets are copied into new `buf.Buffer` objects,
    followed by another gVisor buffer copy. Packet ownership is not carried
    across the whole receive-decode-forward-write transaction.
-3. One UDP socket, one receive loop, and global/session write mutexes serialize
+4. One UDP socket, one receive loop, and global/session write mutexes serialize
    independent queues and peers.
-4. Control traffic and bulk DATA share the same writer lock and socket path.
-5. The gVisor server path converts every inner flow into a sing-box connection.
+5. Control traffic and bulk DATA share the same writer lock and socket path.
+6. The gVisor server path converts every inner flow into a sing-box connection.
    This is necessary for Router policy, but it is the wrong path for a native
    L3 VPN throughput claim.
 6. The endpoint has no complete Linux UDP GSO/GRO, TUN VNET header, multiqueue,
@@ -129,8 +132,11 @@ detect host contention. Five 60-second trials follow a 10-second warm-up; a
 Replace per-packet UDP writes with persistent `sendmmsg` batches. Carry packet
 storage from TUN/UDP receive through protocol processing to the final syscall,
 returning it to the original slab only after completion. Separate control and
-DATA writers. Add partial-send retry and failure-injection tests for every
-ownership transition.
+DATA writers. The current Go implementation now uses persistent IPv4 batch
+workspaces, pooled DATA frames, and pooled two-piece IPFRAG frames; it also
+reuses the cached packet socket wrapper. Add partial-send retry and
+failure-injection tests for every ownership transition before moving the same
+ownership contract into a native library.
 
 ### Phase 2 — GSO/GRO and multiqueue
 
