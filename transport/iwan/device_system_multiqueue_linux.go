@@ -199,6 +199,15 @@ func newMultiQueueLinuxTun(options tun.Options, queueCount int) (*multiQueueLinu
 			}
 			return nil, fmt.Errorf("open queue %d: %w", index, err)
 		}
+		if options.GSO {
+			if err = verifyVNETHeader(fd, name); err != nil {
+				_ = unix.Close(fd)
+				for _, queue := range queues {
+					_ = queue.Close()
+				}
+				return nil, fmt.Errorf("verify queue %d VNET header: %w", index, err)
+			}
+		}
 		if index == 0 {
 			actualName = name
 		}
@@ -245,6 +254,23 @@ func newMultiQueueLinuxTun(options tun.Options, queueCount int) (*multiQueueLinu
 			return &multiQueueWriteWorkspace{buffers: buffers}
 		}},
 	}, nil
+}
+
+// verifyVNETHeader makes the multi-queue capability decision explicit.  The
+// underlying sing-tun package can keep operating after a best-effort GSO
+// warning, but native iWAN must not advertise a partially enabled queue set.
+func verifyVNETHeader(fd int, name string) error {
+	ifr, err := unix.NewIfreq(name)
+	if err != nil {
+		return err
+	}
+	if err = unix.IoctlIfreq(fd, unix.TUNGETIFF, ifr); err != nil {
+		return err
+	}
+	if ifr.Uint16()&unix.IFF_VNET_HDR == 0 {
+		return errors.New("IFF_VNET_HDR is not enabled")
+	}
+	return nil
 }
 
 func openMultiQueueFD(path, name string, flags uint16) (int, string, error) {
